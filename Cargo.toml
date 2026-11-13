@@ -1,0 +1,10 @@
+[package]
+name = "rustdb"
+version = "0.1.0"
+edition = "2024"
+description = "A small in-memory relational SQL engine"
+readme = "README.md"
+publish = false
+
+[dependencies]
+sqlparser = "0.64.0"
