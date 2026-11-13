@@ -9,6 +9,8 @@ pub fn render_result(result: &StatementResult) -> String {
     match result {
         StatementResult::Ok => "OK".to_string(),
         StatementResult::Insert { count } => row_phrase(*count, "inserted"),
+        StatementResult::Update { count } => row_phrase(*count, "updated"),
+        StatementResult::Delete { count } => row_phrase(*count, "deleted"),
         StatementResult::Query(query) => {
             let mut rendered = render_table(&query.columns, &query.rows);
             rendered.push('\n');
@@ -150,6 +152,28 @@ mod tests {
         assert_eq!(
             render_result(&StatementResult::Insert { count: 2 }),
             "2 rows inserted"
+        );
+        assert_eq!(
+            render_result(&StatementResult::Update { count: 1 }),
+            "1 row updated"
+        );
+        assert_eq!(
+            render_result(&StatementResult::Delete { count: 0 }),
+            "0 rows deleted"
+        );
+        assert_eq!(
+            render_result(&StatementResult::Query(QueryResult {
+                columns: vec!["age".to_string()],
+                rows: vec![vec![Value::Null], vec![Value::Integer(3)]],
+            })),
+            "\
++------+
+| age  |
++------+
+| NULL |
+| 3    |
++------+
+2 rows returned"
         );
         assert_eq!(
             render_result(&StatementResult::Query(QueryResult {

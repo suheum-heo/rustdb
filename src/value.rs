@@ -29,10 +29,13 @@ impl fmt::Display for DataType {
 
 /// One scalar cell.
 ///
-/// `NULL` is intentionally absent. Milestone 1 rejects null literals instead of
-/// inventing a third state that later statements could not update or filter.
+/// `Null` is a value in every column. It has no runtime type of its own: a
+/// null literal may be stored in an integer, text, or boolean column, and a
+/// stored null still occupies that column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
+    /// SQL `NULL`.
+    Null,
     /// Signed 64-bit integer.
     Integer(i64),
     /// Text.
@@ -42,20 +45,32 @@ pub enum Value {
 }
 
 impl Value {
-    /// The runtime type of this value.
+    /// The runtime type of a non-null value.
+    ///
+    /// `NULL` returns [`None`] because a null literal is compatible with every
+    /// column type. A column reference still has the column's declared type
+    /// even when the stored cell is null.
     #[must_use]
-    pub fn data_type(&self) -> DataType {
+    pub fn data_type(&self) -> Option<DataType> {
         match self {
-            Self::Integer(_) => DataType::Integer,
-            Self::Text(_) => DataType::Text,
-            Self::Boolean(_) => DataType::Boolean,
+            Self::Null => None,
+            Self::Integer(_) => Some(DataType::Integer),
+            Self::Text(_) => Some(DataType::Text),
+            Self::Boolean(_) => Some(DataType::Boolean),
         }
+    }
+
+    /// Whether this cell is SQL `NULL`.
+    #[must_use]
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
     }
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Null => f.write_str("NULL"),
             Self::Integer(value) => write!(f, "{value}"),
             Self::Text(value) => write!(f, "{value}"),
             Self::Boolean(value) => write!(f, "{value}"),
@@ -69,6 +84,7 @@ mod tests {
 
     #[test]
     fn displays_scalars_without_quotes() {
+        assert_eq!(Value::Null.to_string(), "NULL");
         assert_eq!(Value::Integer(-12).to_string(), "-12");
         assert_eq!(Value::Text("Bob".to_string()).to_string(), "Bob");
         assert_eq!(Value::Boolean(true).to_string(), "true");
@@ -77,9 +93,11 @@ mod tests {
 
     #[test]
     fn reports_runtime_types() {
-        assert_eq!(Value::Integer(1).data_type(), DataType::Integer);
-        assert_eq!(Value::Text(String::new()).data_type(), DataType::Text);
-        assert_eq!(Value::Boolean(false).data_type(), DataType::Boolean);
+        assert_eq!(Value::Null.data_type(), None);
+        assert!(Value::Null.is_null());
+        assert_eq!(Value::Integer(1).data_type(), Some(DataType::Integer));
+        assert_eq!(Value::Text(String::new()).data_type(), Some(DataType::Text));
+        assert_eq!(Value::Boolean(false).data_type(), Some(DataType::Boolean));
         assert_eq!(DataType::Boolean.to_string(), "BOOLEAN");
     }
 }

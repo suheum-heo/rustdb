@@ -311,10 +311,22 @@ fn rejects_unsupported_sql_instead_of_ignoring_it() {
     let mut db = Database::new();
     one(&mut db, "CREATE TABLE t (id INT, name TEXT);");
     let messages = [
-        ("UPDATE t SET name = 'x';", "UPDATE is not supported"),
-        ("DELETE FROM t;", "DELETE is not supported"),
-        ("SELECT * FROM t ORDER BY id;", "ORDER BY is not supported"),
-        ("SELECT * FROM t LIMIT 1;", "LIMIT is not supported"),
+        (
+            "SELECT * FROM t ORDER BY 1;",
+            "ORDER BY expressions are not supported",
+        ),
+        (
+            "SELECT * FROM t LIMIT 1 OFFSET 2;",
+            "OFFSET is not supported",
+        ),
+        (
+            "UPDATE t SET id = 1 LIMIT 1;",
+            "UPDATE LIMIT is not supported",
+        ),
+        (
+            "DELETE FROM t ORDER BY id;",
+            "DELETE ORDER BY is not supported",
+        ),
         (
             "SELECT * FROM t JOIN t u ON t.id = u.id;",
             "JOIN is not supported",
@@ -327,7 +339,6 @@ fn rejects_unsupported_sql_instead_of_ignoring_it() {
             "CREATE TABLE IF NOT EXISTS u (id INT);",
             "CREATE TABLE IF NOT EXISTS is not supported",
         ),
-        ("INSERT INTO t VALUES (NULL);", "NULL is not supported"),
         (
             "INSERT INTO t VALUES (1.5, 'x');",
             "floating-point literals are not supported",
@@ -344,7 +355,6 @@ fn rejects_unsupported_sql_instead_of_ignoring_it() {
             "SELECT * FROM t WHERE name AND id = 1;",
             "operator 'AND' requires BOOLEAN operands, got TEXT",
         ),
-        ("SELECT * FROM t WHERE NOT id = 1;", "NOT is not supported"),
         ("SELECT id + 1 FROM t;", "operator + is not supported"),
         (
             "SELECT * FROM schema.t;",
