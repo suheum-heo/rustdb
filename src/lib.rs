@@ -1,7 +1,7 @@
 //! RustDB is a small in-memory relational SQL engine.
 //!
-//! Milestone 1 parses a limited SQL subset, stores typed tables in memory, and
-//! runs them from a REPL. It does not persist data, lock rows, or build indexes.
+//! It parses a limited SQL subset, stores typed tables in memory, and runs
+//! them from a REPL. It does not persist data, lock rows, or build indexes.
 //!
 //! # Example
 //!
@@ -21,6 +21,7 @@ mod ast;
 mod database;
 mod error;
 mod executor;
+mod expr;
 mod format;
 mod parser;
 mod repl;

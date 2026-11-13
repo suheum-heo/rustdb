@@ -1,16 +1,24 @@
 //! Execute parsed statements against an in-memory database.
 //!
-//! Filters are bound to column indexes and type-checked before any row is
-//! read. A query against an empty table still reports a missing column or a
-//! comparison between different types.
+//! Filters are bound and type-checked before any row is read. `UPDATE` and
+//! `DELETE` build a replacement row list and install it only after every row
+//! has been planned, so a failure leaves the table unchanged.
+//!
+//! `SELECT` applies `WHERE`, then `ORDER BY`, then `LIMIT`, then projection.
+//! Sort keys may name columns that are not in the select list. Equal keys keep
+//! insertion order because the sort is stable. NULL is greater than every
+//! non-NULL value unless the query overrides that with `NULLS FIRST` or
+//! `NULLS LAST`.
 
-use crate::ast::{BinOp, Expr, Projection, SelectColumn, Statement};
+use std::cmp::Ordering;
+
+use crate::ast::{Assignment, Expr, OrderKey, Projection, Statement};
 use crate::database::Database;
 use crate::error::DbError;
+use crate::expr::{self, BoundExpr};
 use crate::parser;
-use crate::schema::Schema;
 use crate::table::Table;
-use crate::value::{DataType, Value};
+use crate::value::Value;
 
 /// The outcome of one statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +30,18 @@ pub enum StatementResult {
         /// Number of rows stored.
         count: usize,
     },
+    /// `UPDATE` matched this many rows.
+    ///
+    /// A row counts even when the assigned values equal the old ones.
+    Update {
+        /// Number of rows matched by `WHERE`.
+        count: usize,
+    },
+    /// `DELETE` removed this many rows.
+    Delete {
+        /// Number of rows removed.
+        count: usize,
+    },
     /// `SELECT` produced these columns and rows.
     Query(QueryResult),
 }
@@ -31,27 +51,27 @@ pub enum StatementResult {
 pub struct QueryResult {
     /// Output column names, in schema order for `SELECT *`.
     pub columns: Vec<String>,
-    /// Output rows, in insertion order.
+    /// Output rows, in the order produced by the query.
     pub rows: Vec<Vec<Value>>,
 }
 
-/// An expression whose columns are schema indexes and whose types check out.
-#[derive(Debug)]
-enum BoundExpr {
-    Literal(Value),
-    Column(usize),
-    Binary {
-        left: Box<BoundExpr>,
-        op: BinOp,
-        right: Box<BoundExpr>,
-    },
+struct BoundAssignment {
+    index: usize,
+    value: BoundExpr,
+}
+
+struct SortKey {
+    index: usize,
+    ascending: bool,
+    nulls_first: bool,
 }
 
 impl Database {
     /// Parse `sql` and run every statement in order.
     ///
     /// Statements are autocommitted one by one. If a later statement fails,
-    /// earlier statements in the same string stay applied.
+    /// earlier statements in the same string stay applied. Each individual
+    /// `INSERT`, `UPDATE`, or `DELETE` is atomic.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>, DbError> {
         let statements = parser::parse(sql)?;
         let mut results = Vec::with_capacity(statements.len());
@@ -79,11 +99,19 @@ impl Database {
                 let count = self.table_mut(&table)?.insert(&columns, rows)?;
                 Ok(StatementResult::Insert { count })
             }
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+            } => self.update(&table, &assignments, selection.as_ref()),
+            Statement::Delete { table, selection } => self.delete(&table, selection.as_ref()),
             Statement::Select {
                 table,
                 projection,
                 selection,
-            } => self.query(&table, &projection, selection.as_ref()),
+                order_by,
+                limit,
+            } => self.query(&table, &projection, selection.as_ref(), &order_by, limit),
         }
     }
 
@@ -92,43 +120,98 @@ impl Database {
         table_name: &str,
         projection: &Projection,
         selection: Option<&Expr>,
+        order_by: &[OrderKey],
+        limit: Option<u64>,
     ) -> Result<StatementResult, DbError> {
         let table = self.table(table_name)?;
         let output_indexes = output_columns(table, projection)?;
-        let filter = selection.map(|expr| bind_expr(expr, table)).transpose()?;
-        if let Some(expr) = &filter {
-            let data_type = bound_type(expr, table.schema())?;
-            if data_type != DataType::Boolean {
-                return Err(DbError::TypeError(format!(
-                    "WHERE clause must evaluate to BOOLEAN, got {data_type}"
-                )));
-            }
-        }
+        let filter = bind_optional_where(selection, table)?;
+        let sort_keys = bind_order(table, order_by)?;
 
-        let mut rows = Vec::new();
+        let mut rows: Vec<&[Value]> = Vec::new();
         for row in table.rows() {
-            let keep = match &filter {
-                Some(expr) => eval_bool(expr, row)?,
-                None => true,
-            };
-            if keep {
-                rows.push(project_row(row, &output_indexes)?);
+            if expr::row_matches(filter.as_ref(), row)? {
+                rows.push(row.as_slice());
+            }
+        }
+        if !sort_keys.is_empty() {
+            rows.sort_by(|left, right| compare_rows(left, right, &sort_keys));
+        }
+        if let Some(limit) = limit {
+            let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+            if rows.len() > limit {
+                rows.truncate(limit);
             }
         }
 
-        let mut columns = Vec::with_capacity(output_indexes.len());
-        for index in output_indexes {
-            let Some(column) = table.schema().column(index) else {
-                return Err(DbError::Internal(format!(
-                    "output column index {index} is outside table '{}'",
-                    table.name()
-                )));
-            };
-            columns.push(column.name().to_string());
+        let mut projected = Vec::with_capacity(rows.len());
+        for row in rows {
+            projected.push(project_row(row, &output_indexes)?);
         }
-
-        Ok(StatementResult::Query(QueryResult { columns, rows }))
+        let columns = column_names(table, &output_indexes)?;
+        Ok(StatementResult::Query(QueryResult {
+            columns,
+            rows: projected,
+        }))
     }
+
+    fn update(
+        &mut self,
+        table_name: &str,
+        assignments: &[Assignment],
+        selection: Option<&Expr>,
+    ) -> Result<StatementResult, DbError> {
+        let (new_rows, count) = {
+            let table = self.table(table_name)?;
+            let filter = bind_optional_where(selection, table)?;
+            let assignments = bind_assignments(table, assignments)?;
+            let mut new_rows = Vec::with_capacity(table.rows().len());
+            let mut count = 0usize;
+            for row in table.rows() {
+                if !expr::row_matches(filter.as_ref(), row)? {
+                    new_rows.push(row.clone());
+                    continue;
+                }
+                new_rows.push(assign_row(row, &assignments)?);
+                count += 1;
+            }
+            (new_rows, count)
+        };
+        self.table_mut(table_name)?.replace_rows(new_rows)?;
+        Ok(StatementResult::Update { count })
+    }
+
+    fn delete(
+        &mut self,
+        table_name: &str,
+        selection: Option<&Expr>,
+    ) -> Result<StatementResult, DbError> {
+        let (kept, deleted) = {
+            let table = self.table(table_name)?;
+            let filter = bind_optional_where(selection, table)?;
+            let mut kept = Vec::with_capacity(table.rows().len());
+            let mut deleted = 0usize;
+            for row in table.rows() {
+                if expr::row_matches(filter.as_ref(), row)? {
+                    deleted += 1;
+                } else {
+                    kept.push(row.clone());
+                }
+            }
+            (kept, deleted)
+        };
+        self.table_mut(table_name)?.replace_rows(kept)?;
+        Ok(StatementResult::Delete { count: deleted })
+    }
+}
+
+fn bind_optional_where(
+    selection: Option<&Expr>,
+    table: &Table,
+) -> Result<Option<BoundExpr>, DbError> {
+    selection
+        .map(|expr| expr::bind_where(expr, table))
+        .transpose()
 }
 
 fn output_columns(table: &Table, projection: &Projection) -> Result<Vec<usize>, DbError> {
@@ -136,27 +219,23 @@ fn output_columns(table: &Table, projection: &Projection) -> Result<Vec<usize>, 
         Projection::All => Ok((0..table.schema().len()).collect()),
         Projection::Columns(columns) => columns
             .iter()
-            .map(|column| resolve_column(table, column))
+            .map(|column| expr::resolve_column(table, column))
             .collect(),
     }
 }
 
-fn resolve_column(table: &Table, column: &SelectColumn) -> Result<usize, DbError> {
-    if let Some(qualifier) = &column.qualifier
-        && qualifier != table.name()
-    {
-        return Err(DbError::invalid(format!(
-            "table qualifier '{qualifier}' does not match '{}'",
-            table.name()
-        )));
+fn column_names(table: &Table, indexes: &[usize]) -> Result<Vec<String>, DbError> {
+    let mut names = Vec::with_capacity(indexes.len());
+    for index in indexes {
+        let Some(column) = table.schema().column(*index) else {
+            return Err(DbError::Internal(format!(
+                "output column index {index} is outside table '{}'",
+                table.name()
+            )));
+        };
+        names.push(column.name().to_string());
     }
-    table
-        .schema()
-        .index_of(&column.name)
-        .ok_or_else(|| DbError::ColumnNotFound {
-            table: table.name().to_string(),
-            column: column.name.clone(),
-        })
+    Ok(names)
 }
 
 fn project_row(row: &[Value], indexes: &[usize]) -> Result<Vec<Value>, DbError> {
@@ -172,172 +251,127 @@ fn project_row(row: &[Value], indexes: &[usize]) -> Result<Vec<Value>, DbError> 
     Ok(projected)
 }
 
-fn bind_expr(expr: &Expr, table: &Table) -> Result<BoundExpr, DbError> {
-    match expr {
-        Expr::Literal(value) => Ok(BoundExpr::Literal(value.clone())),
-        Expr::Column { name, qualifier } => {
-            let index = resolve_column(
-                table,
-                &SelectColumn {
-                    name: name.clone(),
-                    qualifier: qualifier.clone(),
-                },
-            )?;
-            Ok(BoundExpr::Column(index))
+fn bind_assignments(
+    table: &Table,
+    assignments: &[Assignment],
+) -> Result<Vec<BoundAssignment>, DbError> {
+    if assignments.is_empty() {
+        return Err(DbError::invalid("UPDATE requires at least one assignment"));
+    }
+    let mut bound = Vec::with_capacity(assignments.len());
+    let mut seen = vec![false; table.schema().len()];
+    for assignment in assignments {
+        let index = expr::resolve_column(table, &assignment.column)?;
+        if seen[index] {
+            return Err(DbError::invalid(format!(
+                "column '{}' is assigned more than once in table '{}'",
+                assignment.column.name,
+                table.name()
+            )));
         }
-        Expr::Binary { left, op, right } => {
-            let left = bind_expr(left, table)?;
-            let right = bind_expr(right, table)?;
-            check_binary(*op, &left, &right, table.schema())?;
-            Ok(BoundExpr::Binary {
-                left: Box::new(left),
-                op: *op,
-                right: Box::new(right),
-            })
-        }
-    }
-}
-
-fn check_binary(
-    op: BinOp,
-    left: &BoundExpr,
-    right: &BoundExpr,
-    schema: &Schema,
-) -> Result<(), DbError> {
-    let left_type = bound_type(left, schema)?;
-    let right_type = bound_type(right, schema)?;
-    if op.is_logical() {
-        if left_type != DataType::Boolean {
-            return Err(logical_operand(op, left_type));
-        }
-        if right_type != DataType::Boolean {
-            return Err(logical_operand(op, right_type));
-        }
-        return Ok(());
-    }
-    if left_type != right_type {
-        return Err(DbError::TypeError(format!(
-            "cannot apply operator '{op}' to {left_type} and {right_type}",
-            op = op.as_str()
-        )));
-    }
-    if op.is_ordering() && !matches!(left_type, DataType::Integer | DataType::Text) {
-        return Err(DbError::TypeError(format!(
-            "operator '{}' is not supported for {left_type}",
-            op.as_str()
-        )));
-    }
-    Ok(())
-}
-
-fn logical_operand(op: BinOp, found: DataType) -> DbError {
-    DbError::TypeError(format!(
-        "operator '{}' requires BOOLEAN operands, got {found}",
-        op.as_str()
-    ))
-}
-
-fn bound_type(expr: &BoundExpr, schema: &Schema) -> Result<DataType, DbError> {
-    match expr {
-        BoundExpr::Literal(value) => Ok(value.data_type()),
-        BoundExpr::Column(index) => {
-            let Some(column) = schema.column(*index) else {
-                return Err(DbError::Internal(format!(
-                    "bound column index {index} is outside the schema"
-                )));
-            };
-            Ok(column.data_type())
-        }
-        BoundExpr::Binary { .. } => Ok(DataType::Boolean),
-    }
-}
-
-fn eval(expr: &BoundExpr, row: &[Value]) -> Result<Value, DbError> {
-    match expr {
-        BoundExpr::Literal(value) => Ok(value.clone()),
-        BoundExpr::Column(index) => row.get(*index).cloned().ok_or_else(|| {
-            DbError::Internal(format!(
-                "evaluation column index {index} is outside the row"
-            ))
-        }),
-        BoundExpr::Binary { left, op, right } => {
-            let left = eval(left, row)?;
-            let right = eval(right, row)?;
-            eval_binary(*op, &left, &right)
-        }
-    }
-}
-
-fn eval_bool(expr: &BoundExpr, row: &[Value]) -> Result<bool, DbError> {
-    match eval(expr, row)? {
-        Value::Boolean(value) => Ok(value),
-        other => Err(DbError::TypeError(format!(
-            "WHERE clause must evaluate to BOOLEAN, got {}",
-            other.data_type()
-        ))),
-    }
-}
-
-fn eval_binary(op: BinOp, left: &Value, right: &Value) -> Result<Value, DbError> {
-    if op.is_logical() {
-        let (Value::Boolean(left), Value::Boolean(right)) = (left, right) else {
-            return Err(DbError::Internal(
-                "logical operator evaluated non-boolean values".to_string(),
-            ));
+        seen[index] = true;
+        let Some(column) = table.schema().column(index) else {
+            return Err(DbError::Internal(format!(
+                "assignment index {index} is outside table '{}'",
+                table.name()
+            )));
         };
-        let result = match op {
-            BinOp::And => *left && *right,
-            BinOp::Or => *left || *right,
-            _ => {
-                return Err(DbError::Internal(
-                    "comparison operator reached logical evaluation".to_string(),
-                ));
+        let value =
+            expr::bind_assignment(&assignment.value, table, column.name(), column.data_type())?;
+        bound.push(BoundAssignment { index, value });
+    }
+    Ok(bound)
+}
+
+/// Evaluate every right-hand side against `row`, then write them.
+fn assign_row(row: &[Value], assignments: &[BoundAssignment]) -> Result<Vec<Value>, DbError> {
+    let mut values = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        values.push((assignment.index, expr::eval(&assignment.value, row)?));
+    }
+    let mut updated = row.to_vec();
+    for (index, value) in values {
+        let Some(slot) = updated.get_mut(index) else {
+            return Err(DbError::Internal(format!(
+                "assignment index {index} is outside the row"
+            )));
+        };
+        *slot = value;
+    }
+    Ok(updated)
+}
+
+fn bind_order(table: &Table, keys: &[OrderKey]) -> Result<Vec<SortKey>, DbError> {
+    let mut bound = Vec::with_capacity(keys.len());
+    for key in keys {
+        let index = expr::resolve_column(table, &key.column)?;
+        bound.push(SortKey {
+            index,
+            ascending: key.ascending,
+            nulls_first: key.nulls_first.unwrap_or(!key.ascending),
+        });
+    }
+    Ok(bound)
+}
+
+fn compare_rows(left: &[Value], right: &[Value], keys: &[SortKey]) -> Ordering {
+    for key in keys {
+        let ordering = compare_key(
+            left.get(key.index),
+            right.get(key.index),
+            key.ascending,
+            key.nulls_first,
+        );
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+fn compare_key(
+    left: Option<&Value>,
+    right: Option<&Value>,
+    ascending: bool,
+    nulls_first: bool,
+) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => compare_values(left, right, ascending, nulls_first),
+        _ => Ordering::Equal,
+    }
+}
+
+fn compare_values(left: &Value, right: &Value, ascending: bool, nulls_first: bool) -> Ordering {
+    match (left.is_null(), right.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
             }
-        };
-        return Ok(Value::Boolean(result));
-    }
-
-    if left.data_type() != right.data_type() {
-        return Err(DbError::TypeError(format!(
-            "cannot apply operator '{}' to {} and {}",
-            op.as_str(),
-            left.data_type(),
-            right.data_type()
-        )));
-    }
-
-    let ordering = match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
-        (Value::Text(left), Value::Text(right)) => left.cmp(right),
-        (Value::Boolean(left), Value::Boolean(right)) => left.cmp(right),
-        _ => {
-            return Err(DbError::Internal(
-                "comparison values changed type".to_string(),
-            ));
         }
-    };
-
-    if op.is_ordering() && matches!(left, Value::Boolean(_)) {
-        return Err(DbError::TypeError(format!(
-            "operator '{}' is not supported for BOOLEAN",
-            op.as_str()
-        )));
-    }
-
-    let result = match op {
-        BinOp::Eq => ordering.is_eq(),
-        BinOp::NotEq => ordering.is_ne(),
-        BinOp::Lt => ordering.is_lt(),
-        BinOp::Gt => ordering.is_gt(),
-        BinOp::LtEq => ordering.is_le(),
-        BinOp::GtEq => ordering.is_ge(),
-        BinOp::And | BinOp::Or => {
-            return Err(DbError::Internal(
-                "logical operator reached comparison evaluation".to_string(),
-            ));
+        (false, true) => {
+            if nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
         }
-    };
-    Ok(Value::Boolean(result))
+        (false, false) => {
+            let ordering = match (left, right) {
+                (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
+                (Value::Text(left), Value::Text(right)) => left.cmp(right),
+                (Value::Boolean(left), Value::Boolean(right)) => left.cmp(right),
+                _ => Ordering::Equal,
+            };
+            if ascending {
+                ordering
+            } else {
+                ordering.reverse()
+            }
+        }
+    }
 }
 
 #[cfg(test)]

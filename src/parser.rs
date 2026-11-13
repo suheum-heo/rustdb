@@ -6,14 +6,16 @@
 //! silently ignore `ORDER BY`, constraints, or joins.
 
 use sqlparser::ast::{
-    BinaryOperator, CreateTable, CreateTableOptions, DataType as SqlDataType, Expr as SqlExpr,
-    GroupByExpr, HiveDistributionStyle, Ident, ObjectName, ObjectType, Query, Select, SelectFlavor,
-    SelectItem, SetExpr, Statement as SqlStatement, TableFactor, UnaryOperator, Value as SqlValue,
+    AssignmentTarget, BinaryOperator, CreateTable, CreateTableOptions, DataType as SqlDataType,
+    Delete as SqlDelete, Expr as SqlExpr, FromTable, GroupByExpr, HiveDistributionStyle, Ident,
+    LimitClause, ObjectName, ObjectType, OrderBy, OrderByKind, OrderBySort, Query, Select,
+    SelectFlavor, SelectItem, SetExpr, Statement as SqlStatement, TableFactor, UnaryOperator,
+    Update as SqlUpdate, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::ast::{BinOp, Expr, Projection, SelectColumn, Statement};
+use crate::ast::{Assignment, BinOp, Expr, OrderKey, Projection, SelectColumn, Statement};
 use crate::error::DbError;
 use crate::schema::Column;
 use crate::value::{DataType, Value};
@@ -34,6 +36,8 @@ fn convert_statement(statement: SqlStatement) -> Result<Statement, DbError> {
     match statement {
         SqlStatement::CreateTable(create) => convert_create(create),
         SqlStatement::Insert(insert) => convert_insert(insert),
+        SqlStatement::Update(update) => convert_update(update),
+        SqlStatement::Delete(delete) => convert_delete(delete),
         SqlStatement::Query(query) => convert_query(*query),
         SqlStatement::Drop {
             object_type,
@@ -329,7 +333,13 @@ fn reject_extended_insert(insert: &sqlparser::ast::Insert) -> Result<(), DbError
 }
 
 fn convert_values(query: &Query) -> Result<Vec<Vec<Value>>, DbError> {
-    reject_query_clauses(query)?;
+    reject_common_query_clauses(query)?;
+    if query.order_by.is_some() {
+        return Err(DbError::unsupported("ORDER BY on INSERT is not supported"));
+    }
+    if query.limit_clause.is_some() || query.fetch.is_some() {
+        return Err(DbError::unsupported("LIMIT on INSERT is not supported"));
+    }
     let SetExpr::Values(values) = query.body.as_ref() else {
         return Err(DbError::unsupported("INSERT ... SELECT is not supported"));
     };
@@ -358,9 +368,14 @@ fn expect_literal(expr: Expr) -> Result<Value, DbError> {
 }
 
 fn convert_query(query: Query) -> Result<Statement, DbError> {
-    reject_query_clauses(&query)?;
+    reject_common_query_clauses(&query)?;
+    if query.fetch.is_some() {
+        return Err(DbError::unsupported("FETCH is not supported"));
+    }
+    let order_by = convert_order_by(query.order_by.as_ref())?;
+    let limit = convert_limit(query.limit_clause.as_ref())?;
     match *query.body {
-        SetExpr::Select(select) => convert_select(*select),
+        SetExpr::Select(select) => convert_select(*select, order_by, limit),
         SetExpr::SetOperation { .. } => Err(DbError::unsupported(
             "UNION, EXCEPT, and INTERSECT are not supported",
         )),
@@ -369,15 +384,9 @@ fn convert_query(query: Query) -> Result<Statement, DbError> {
     }
 }
 
-fn reject_query_clauses(query: &Query) -> Result<(), DbError> {
+fn reject_common_query_clauses(query: &Query) -> Result<(), DbError> {
     if query.with.is_some() {
         return Err(DbError::unsupported("WITH is not supported"));
-    }
-    if query.order_by.is_some() {
-        return Err(DbError::unsupported("ORDER BY is not supported"));
-    }
-    if query.limit_clause.is_some() || query.fetch.is_some() {
-        return Err(DbError::unsupported("LIMIT is not supported"));
     }
     if !query.locks.is_empty() || query.for_clause.is_some() {
         return Err(DbError::unsupported("row locking is not supported"));
@@ -389,7 +398,11 @@ fn reject_query_clauses(query: &Query) -> Result<(), DbError> {
     Ok(())
 }
 
-fn convert_select(select: Select) -> Result<Statement, DbError> {
+fn convert_select(
+    select: Select,
+    order_by: Vec<OrderKey>,
+    limit: Option<u64>,
+) -> Result<Statement, DbError> {
     reject_select_clauses(&select)?;
     let table = convert_from(&select)?;
     let projection = convert_projection(&select.projection)?;
@@ -398,6 +411,8 @@ fn convert_select(select: Select) -> Result<Statement, DbError> {
         table,
         projection,
         selection,
+        order_by,
+        limit,
     })
 }
 
@@ -552,9 +567,8 @@ fn convert_expr(expr: &SqlExpr) -> Result<Expr, DbError> {
             op: convert_operator(op)?,
             right: Box::new(convert_expr(right)?),
         }),
-        SqlExpr::IsNull(_) | SqlExpr::IsNotNull(_) => {
-            Err(DbError::unsupported("IS NULL is not supported"))
-        }
+        SqlExpr::IsNull(inner) => Ok(Expr::IsNull(Box::new(convert_expr(inner)?))),
+        SqlExpr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(convert_expr(inner)?))),
         SqlExpr::Between { .. } => Err(DbError::unsupported("BETWEEN is not supported")),
         SqlExpr::Like { .. } | SqlExpr::ILike { .. } => {
             Err(DbError::unsupported("LIKE is not supported"))
@@ -607,7 +621,7 @@ fn convert_unary(op: UnaryOperator, expr: &SqlExpr) -> Result<Expr, DbError> {
                 "unary operators are only supported on integer literals",
             ))
         }
-        UnaryOperator::Not => Err(DbError::unsupported("NOT is not supported")),
+        UnaryOperator::Not => Ok(Expr::Not(Box::new(convert_expr(expr)?))),
         _ => Err(DbError::unsupported("this unary operator is not supported")),
     }
 }
@@ -620,7 +634,7 @@ fn convert_literal(value: &SqlValue) -> Result<Expr, DbError> {
         | SqlValue::EscapedStringLiteral(text)
         | SqlValue::NationalStringLiteral(text) => Ok(Expr::Literal(Value::Text(text.clone()))),
         SqlValue::DollarQuotedString(text) => Ok(Expr::Literal(Value::Text(text.value.clone()))),
-        SqlValue::Null => Err(DbError::unsupported("NULL is not supported")),
+        SqlValue::Null => Ok(Expr::Literal(Value::Null)),
         SqlValue::Placeholder(_) => Err(DbError::unsupported("placeholders are not supported")),
         _ => Err(DbError::unsupported("this literal is not supported")),
     }
@@ -652,6 +666,212 @@ fn parse_integer(text: &str, negate: bool) -> Result<i64, DbError> {
         })
     } else {
         Ok(value)
+    }
+}
+
+fn convert_update(update: SqlUpdate) -> Result<Statement, DbError> {
+    if !update.optimizer_hints.is_empty() || update.on_cluster.is_some() {
+        return Err(DbError::unsupported("this UPDATE clause is not supported"));
+    }
+    if update.from.is_some() {
+        return Err(DbError::unsupported("UPDATE FROM is not supported"));
+    }
+    if update.returning.is_some() || update.output.is_some() {
+        return Err(DbError::unsupported(
+            "UPDATE ... RETURNING is not supported",
+        ));
+    }
+    if update.or.is_some() {
+        return Err(DbError::unsupported("UPDATE OR is not supported"));
+    }
+    if !update.order_by.is_empty() {
+        return Err(DbError::unsupported("UPDATE ORDER BY is not supported"));
+    }
+    if update.limit.is_some() {
+        return Err(DbError::unsupported("UPDATE LIMIT is not supported"));
+    }
+    if update.settings.is_some() {
+        return Err(DbError::unsupported("this UPDATE clause is not supported"));
+    }
+    if !update.table.joins.is_empty() {
+        return Err(DbError::unsupported("JOIN is not supported"));
+    }
+    if update.assignments.is_empty() {
+        return Err(DbError::invalid("UPDATE requires at least one assignment"));
+    }
+
+    let table = table_name(&update.table.relation)?;
+    let mut assignments = Vec::with_capacity(update.assignments.len());
+    for assignment in &update.assignments {
+        let AssignmentTarget::ColumnName(name) = &assignment.target else {
+            return Err(DbError::unsupported("tuple assignments are not supported"));
+        };
+        assignments.push(Assignment {
+            column: column_name(name)?,
+            value: convert_expr(&assignment.value)?,
+        });
+    }
+    let selection = update.selection.as_ref().map(convert_expr).transpose()?;
+    Ok(Statement::Update {
+        table,
+        assignments,
+        selection,
+    })
+}
+
+fn convert_delete(delete: SqlDelete) -> Result<Statement, DbError> {
+    if !delete.optimizer_hints.is_empty()
+        || delete.on_cluster.is_some()
+        || delete.using.is_some()
+        || delete.returning.is_some()
+        || delete.output.is_some()
+        || delete.settings.is_some()
+    {
+        return Err(DbError::unsupported("this DELETE clause is not supported"));
+    }
+    if !delete.tables.is_empty() {
+        return Err(DbError::unsupported("multi-table DELETE is not supported"));
+    }
+    if !delete.order_by.is_empty() {
+        return Err(DbError::unsupported("DELETE ORDER BY is not supported"));
+    }
+    if delete.limit.is_some() {
+        return Err(DbError::unsupported("DELETE LIMIT is not supported"));
+    }
+
+    let tables = match &delete.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+    };
+    if tables.len() != 1 {
+        return Err(DbError::invalid("DELETE requires exactly one table"));
+    }
+    if !tables[0].joins.is_empty() {
+        return Err(DbError::unsupported("JOIN is not supported"));
+    }
+    let table = table_name(&tables[0].relation)?;
+    let selection = delete.selection.as_ref().map(convert_expr).transpose()?;
+    Ok(Statement::Delete { table, selection })
+}
+
+fn convert_order_by(order_by: Option<&OrderBy>) -> Result<Vec<OrderKey>, DbError> {
+    let Some(order_by) = order_by else {
+        return Ok(Vec::new());
+    };
+    if order_by.interpolate.is_some() {
+        return Err(DbError::unsupported(
+            "ORDER BY INTERPOLATE is not supported",
+        ));
+    }
+    let OrderByKind::Expressions(exprs) = &order_by.kind else {
+        return Err(DbError::unsupported("ORDER BY ALL is not supported"));
+    };
+    exprs.iter().map(convert_order_key).collect()
+}
+
+fn convert_order_key(key: &sqlparser::ast::OrderByExpr) -> Result<OrderKey, DbError> {
+    if key.with_fill.is_some() {
+        return Err(DbError::unsupported("WITH FILL is not supported"));
+    }
+    if matches!(key.options.sort, Some(OrderBySort::Using(_))) {
+        return Err(DbError::unsupported("ORDER BY USING is not supported"));
+    }
+    let column = match convert_expr(&key.expr)? {
+        Expr::Column { name, qualifier } => SelectColumn { name, qualifier },
+        _ => {
+            return Err(DbError::unsupported(
+                "ORDER BY expressions are not supported",
+            ));
+        }
+    };
+    let ascending = match key.options.sort {
+        None | Some(OrderBySort::Asc) => true,
+        Some(OrderBySort::Desc) => false,
+        Some(OrderBySort::Using(_)) => {
+            return Err(DbError::unsupported("ORDER BY USING is not supported"));
+        }
+    };
+    Ok(OrderKey {
+        column,
+        ascending,
+        nulls_first: key.options.nulls_first,
+    })
+}
+
+fn convert_limit(limit: Option<&LimitClause>) -> Result<Option<u64>, DbError> {
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    match limit {
+        LimitClause::OffsetCommaLimit { .. } => {
+            Err(DbError::unsupported("LIMIT offset, count is not supported"))
+        }
+        LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            if offset.is_some() {
+                return Err(DbError::unsupported("OFFSET is not supported"));
+            }
+            if !limit_by.is_empty() {
+                return Err(DbError::unsupported("LIMIT BY is not supported"));
+            }
+            let Some(limit) = limit else {
+                return Err(DbError::invalid("LIMIT requires a nonnegative integer"));
+            };
+            Ok(Some(nonnegative_integer(limit)?))
+        }
+    }
+}
+
+fn nonnegative_integer(expr: &SqlExpr) -> Result<u64, DbError> {
+    match expr {
+        SqlExpr::Nested(inner) => nonnegative_integer(inner),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => nonnegative_integer(expr),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Minus,
+            ..
+        } => Err(DbError::invalid("LIMIT requires a nonnegative integer")),
+        SqlExpr::Value(value) => match &value.value {
+            SqlValue::Number(text, _) => {
+                if text
+                    .bytes()
+                    .any(|byte| matches!(byte, b'.' | b'e' | b'E' | b'+' | b'-'))
+                {
+                    return Err(DbError::invalid("LIMIT requires a nonnegative integer"));
+                }
+                text.parse::<u64>()
+                    .map_err(|_| DbError::invalid("LIMIT requires a nonnegative integer"))
+            }
+            _ => Err(DbError::invalid("LIMIT requires a nonnegative integer")),
+        },
+        _ => Err(DbError::unsupported("LIMIT expressions are not supported")),
+    }
+}
+
+fn column_name(name: &ObjectName) -> Result<SelectColumn, DbError> {
+    let mut idents = Vec::with_capacity(name.0.len());
+    for part in &name.0 {
+        let Some(ident) = part.as_ident() else {
+            return Err(DbError::unsupported("function names are not supported"));
+        };
+        idents.push(normalize_ident(ident));
+    }
+    match idents.as_slice() {
+        [column] => Ok(SelectColumn {
+            name: column.clone(),
+            qualifier: None,
+        }),
+        [qualifier, column] => Ok(SelectColumn {
+            name: column.clone(),
+            qualifier: Some(qualifier.clone()),
+        }),
+        _ => Err(DbError::unsupported(
+            "qualified names with more than two parts are not supported",
+        )),
     }
 }
 
@@ -691,6 +911,7 @@ mod tests {
                 table,
                 projection,
                 selection,
+                ..
             } => {
                 assert_eq!(table, "users");
                 assert_eq!(
@@ -731,8 +952,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_order_by_instead_of_ignoring_it() {
-        let error = parse("SELECT * FROM users ORDER BY name;").unwrap_err();
-        assert_eq!(error.to_string(), "ORDER BY is not supported");
+    fn parses_order_by_and_limit() {
+        let statements =
+            parse("SELECT name FROM users ORDER BY age DESC, name ASC LIMIT 5;").unwrap();
+        match &statements[0] {
+            Statement::Select {
+                order_by, limit, ..
+            } => {
+                assert_eq!(order_by.len(), 2);
+                assert_eq!(order_by[0].column.name, "age");
+                assert!(!order_by[0].ascending);
+                assert!(order_by[1].ascending);
+                assert_eq!(order_by[0].nulls_first, None);
+                assert_eq!(*limit, Some(5));
+            }
+            other => panic!("expected select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_order_by_expressions() {
+        let error = parse("SELECT * FROM users ORDER BY 1;").unwrap_err();
+        assert_eq!(error.to_string(), "ORDER BY expressions are not supported");
     }
 }

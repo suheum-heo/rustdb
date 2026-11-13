@@ -82,11 +82,13 @@ impl Table {
                     self.name
                 )));
             };
-            if value.data_type() != column.data_type() {
+            if let Some(actual) = value.data_type()
+                && actual != column.data_type()
+            {
                 return Err(DbError::TypeMismatch {
                     column: column.name().to_string(),
                     expected: column.data_type(),
-                    actual: value.data_type(),
+                    actual,
                 });
             }
             aligned[index] = Some(value);
@@ -105,6 +107,25 @@ impl Table {
             }
         }
         Ok(stored)
+    }
+
+    /// Replace every row after a successful `UPDATE` or `DELETE` plan.
+    ///
+    /// The caller builds `rows` without touching this table. A width mismatch
+    /// leaves the current rows in place.
+    pub(crate) fn replace_rows(&mut self, rows: Vec<Vec<Value>>) -> Result<(), DbError> {
+        for (index, row) in rows.iter().enumerate() {
+            if row.len() != self.schema.len() {
+                return Err(DbError::Internal(format!(
+                    "replacement row {index} in '{}' has {} values, expected {}",
+                    self.name,
+                    row.len(),
+                    self.schema.len()
+                )));
+            }
+        }
+        self.rows = rows;
+        Ok(())
     }
 }
 
