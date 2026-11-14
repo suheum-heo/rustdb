@@ -259,6 +259,39 @@ impl Pager {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn cached_page_mut(&mut self, id: u32) -> Result<&mut Page, DbError> {
+        self.load(id)?;
+        let index = usize::try_from(id)
+            .map_err(|_| DbError::Storage(format!("database page {id} is outside the file")))?;
+        self.cache
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| DbError::Internal(format!("page {id} is missing from the cache")))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_cache_for_test(&mut self) {
+        self.cache.clear();
+    }
+
+    /// Replace a cached page's type bytes without writing the file.
+    ///
+    /// The next read of this page uses the cache and does not check the
+    /// checksum again. Callers use it to make an index lookup fail.
+    #[cfg(test)]
+    pub(crate) fn corrupt_cached_type(&mut self, id: u32) -> Result<(), DbError> {
+        self.load(id)?;
+        let index = usize::try_from(id)
+            .map_err(|_| DbError::Storage(format!("database page {id} is outside the file")))?;
+        let page = self.cache[index]
+            .as_mut()
+            .ok_or_else(|| DbError::Internal(format!("page {id} is missing from the cache")))?;
+        page.as_mut_slice()[0] = 0xFF;
+        page.as_mut_slice()[1] = 0xFF;
+        Ok(())
+    }
+
     fn load(&mut self, id: u32) -> Result<(), DbError> {
         if id >= self.page_count {
             return Err(DbError::Storage(format!(

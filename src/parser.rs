@@ -7,10 +7,10 @@
 
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CreateTable, CreateTableOptions, DataType as SqlDataType,
-    Delete as SqlDelete, Expr as SqlExpr, FromTable, GroupByExpr, HiveDistributionStyle, Ident,
-    LimitClause, ObjectName, ObjectType, OrderBy, OrderByKind, OrderBySort, Query, Select,
-    SelectFlavor, SelectItem, SetExpr, Statement as SqlStatement, TableFactor, UnaryOperator,
-    Update as SqlUpdate, Value as SqlValue,
+    Delete as SqlDelete, DescribeAlias, Expr as SqlExpr, FromTable, GroupByExpr,
+    HiveDistributionStyle, Ident, LimitClause, ObjectName, ObjectType, OrderBy, OrderByKind,
+    OrderBySort, Query, Select, SelectFlavor, SelectItem, SetExpr, Statement as SqlStatement,
+    TableFactor, UnaryOperator, Update as SqlUpdate, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -40,6 +40,25 @@ fn convert_statement(statement: SqlStatement) -> Result<Statement, DbError> {
         SqlStatement::Update(update) => convert_update(update),
         SqlStatement::Delete(delete) => convert_delete(delete),
         SqlStatement::Query(query) => convert_query(*query),
+        SqlStatement::Explain {
+            describe_alias,
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+        } => convert_explain(ExplainInput {
+            describe_alias,
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+        }),
         SqlStatement::Drop {
             object_type,
             if_exists,
@@ -80,6 +99,37 @@ fn statement_label(statement: &SqlStatement) -> &'static str {
         SqlStatement::Truncate(_) => "TRUNCATE",
         _ => "this statement",
     }
+}
+
+struct ExplainInput {
+    describe_alias: DescribeAlias,
+    analyze: bool,
+    verbose: bool,
+    query_plan: bool,
+    estimate: bool,
+    statement: Box<SqlStatement>,
+    format: Option<sqlparser::ast::AnalyzeFormatKind>,
+    options: Option<Vec<sqlparser::ast::UtilityOption>>,
+}
+
+fn convert_explain(input: ExplainInput) -> Result<Statement, DbError> {
+    if input.describe_alias != DescribeAlias::Explain {
+        return Err(DbError::unsupported("only EXPLAIN SELECT is supported"));
+    }
+    if input.analyze
+        || input.verbose
+        || input.query_plan
+        || input.estimate
+        || input.format.is_some()
+        || input.options.is_some()
+    {
+        return Err(DbError::unsupported("EXPLAIN options are not supported"));
+    }
+    let inner = convert_statement(*input.statement)?;
+    if !matches!(inner, Statement::Select { .. }) {
+        return Err(DbError::unsupported("EXPLAIN is only supported for SELECT"));
+    }
+    Ok(Statement::Explain(Box::new(inner)))
 }
 
 fn convert_create(create: CreateTable) -> Result<Statement, DbError> {

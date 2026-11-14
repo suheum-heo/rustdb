@@ -133,9 +133,86 @@ impl Store {
             .collect()
     }
 
+    pub(crate) fn index_root(&self, name: &str) -> Result<u32, DbError> {
+        self.state
+            .indexes
+            .iter()
+            .find(|index| index.name == name)
+            .map(|index| index.root)
+            .ok_or_else(|| DbError::Storage("database file is corrupt".to_string()))
+    }
+
+    pub(crate) fn read_index_equal(
+        &mut self,
+        root: u32,
+        key: i64,
+    ) -> Result<Vec<(i64, u64)>, DbError> {
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let mut nodes = PagerNodes {
+            pager: &mut self.pager,
+        };
+        let ids = btree::find_equal(&mut nodes, root, key)?;
+        Ok(ids.into_iter().map(|id| (key, id)).collect())
+    }
+
+    pub(crate) fn index_key_span(&mut self, name: &str) -> Result<Option<(i64, i64)>, DbError> {
+        let root = self.index_root(name)?;
+        if root == 0 {
+            return Ok(None);
+        }
+        let mut nodes = PagerNodes {
+            pager: &mut self.pager,
+        };
+        btree::stored_key_span(&mut nodes, root)
+    }
+
+    pub(crate) fn read_index_range(
+        &mut self,
+        root: u32,
+        low: Option<i64>,
+        high: Option<i64>,
+    ) -> Result<Vec<(i64, u64)>, DbError> {
+        if root == 0 {
+            return Ok(Vec::new());
+        }
+        let mut nodes = PagerNodes {
+            pager: &mut self.pager,
+        };
+        btree::find_range(&mut nodes, root, low, high)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_inject(&mut self, inject: Inject) {
         self.inject = Some(inject);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn patch_root_leaf_entry(
+        &mut self,
+        name: &str,
+        slot: usize,
+        key: Option<i64>,
+        row_id: Option<u64>,
+    ) -> Result<(), DbError> {
+        let root = self.index_root(name)?;
+        let page = self.pager.cached_page_mut(root)?;
+        btree::patch_leaf_entry(page, slot, key, row_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_page_cache(&mut self) {
+        self.pager.clear_cache_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_index_root_type(&mut self, name: &str) -> Result<(), DbError> {
+        let root = self.index_root(name)?;
+        if root == 0 {
+            return Err(DbError::Storage("database file is corrupt".to_string()));
+        }
+        self.pager.corrupt_cached_type(root)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
