@@ -328,8 +328,8 @@ fn rejects_unsupported_sql_instead_of_ignoring_it() {
             "DELETE ORDER BY is not supported",
         ),
         (
-            "SELECT * FROM t JOIN t u ON t.id = u.id;",
-            "JOIN is not supported",
+            "SELECT * FROM t LEFT JOIN t u ON t.id = u.id;",
+            "LEFT JOIN is not supported",
         ),
         (
             "CREATE TABLE u (id INT PRIMARY KEY);",

@@ -30,8 +30,8 @@ SQL text
 | `ast` | Statements and expressions the executor understands |
 | `parser` | `sqlparser` boundary and identifier normalization |
 | `expr` | Bind columns, check types, and evaluate three-valued logic |
-| `plan` | Choose a sequential scan or one integer index scan |
-| `executor` | `CREATE`, `DROP`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `EXPLAIN`, and integer indexes |
+| `plan` | Choose a sequential scan or one integer index scan for a single table |
+| `executor` | `CREATE`, `DROP`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `EXPLAIN`, integer indexes, and a two-table nested-loop `INNER JOIN` |
 | `format` | ASCII result tables |
 | `repl` | Interactive session |
 | `error` | Parse, schema, type, and storage errors |
@@ -48,7 +48,11 @@ Unquoted identifiers are folded to lowercase. Quoted identifiers keep their case
 
 A query keeps a row only when `WHERE` evaluates to TRUE. FALSE and UNKNOWN both drop the row.
 
-`SELECT` then sorts, then applies `LIMIT`, then projects. `ORDER BY` can name a column that is absent from the select list. The sort is stable, so equal keys stay in insertion order. When the filter is an equality or a bounded range on one indexed `INTEGER` column, file mode reads candidate row ids from that B+ tree and then evaluates the original `WHERE`. Candidates are put back into insertion order before that filter, so a query without `ORDER BY` stays in insertion order. `SELECT` does not rewrite the file.
+`SELECT` then sorts, then applies `LIMIT`, then projects. `ORDER BY` can name a column that is absent from the select list. The sort is stable, so equal keys stay in the order the scan produced. When the filter is an equality or a bounded range on one indexed `INTEGER` column of a single table, file mode reads candidate row ids from that B+ tree and then evaluates the original `WHERE`. Candidates are put back into insertion order before that filter, so a query without `ORDER BY` stays in insertion order. `SELECT` does not rewrite the file.
+
+An `INNER JOIN` of two tables is a nested loop. The outer table is the left input. For each of its rows, in insertion order, the inner table is read in insertion order. A pair is kept only when `ON` evaluates to TRUE. `WHERE` runs after that, then `ORDER BY`, `LIMIT`, and projection. NULL never equals NULL, so a NULL join key matches no row. `IS NULL` can match. Duplicate keys produce one output row per matching pair. Pairs that fail `ON` or `WHERE` are not stored. Without `ORDER BY`, `LIMIT` keeps the first matches in that nested-loop order and still evaluates the remaining pairs. The join copies the smaller input, borrows the other, does not consult an index, and does not write the file. `LEFT JOIN`, `RIGHT JOIN`, `FULL JOIN`, a third table, `USING`, and `NATURAL JOIN` are rejected.
+
+A qualifier is the alias when the query wrote one, and the table name otherwise. The catalog name is not visible beside its alias. An unqualified column must match exactly one input. `SELECT *` lists the outer columns and then the inner columns, using each column's declared name, so the same name can appear twice. `SELECT alias.*` lists one input. `ON` accepts the same comparisons, `AND`, `OR`, `NOT`, `IS NULL`, and `IS NOT NULL` as `WHERE`.
 
 ## Durability
 
@@ -104,11 +108,16 @@ DROP TABLE table_name [, table_name, ...];
 INSERT INTO table_name [(column_name, ...)] VALUES (expr, ...), ...;
 UPDATE table_name SET column_name = expr [, column_name = expr, ...] [WHERE condition];
 DELETE FROM table_name [WHERE condition];
-SELECT * FROM table_name [WHERE condition]
+SELECT * FROM table_name [[AS] alias] [WHERE condition]
     [ORDER BY column_name [ASC | DESC] [NULLS FIRST | NULLS LAST]
         [, column_name [ASC | DESC] [NULLS FIRST | NULLS LAST], ...]]
     [LIMIT count];
-SELECT column_name [, column_name, ...] FROM table_name [WHERE condition]
+SELECT column_name [, column_name, ...] FROM table_name [[AS] alias] [WHERE condition]
+    [ORDER BY ...] [LIMIT count];
+SELECT select_list
+    FROM table_name [[AS] alias]
+    [INNER] JOIN table_name [[AS] alias] ON condition
+    [WHERE condition]
     [ORDER BY ...] [LIMIT count];
 EXPLAIN SELECT ...;
 ```
@@ -182,7 +191,7 @@ DROP INDEX idx_users_age;
 
 An index names one `INTEGER` column. Duplicate keys are stored. `NULL` is left out of the tree. The index name is separate from table names, so an index may share a name with a table. `CREATE INDEX` reads the rows already in the table and builds the tree in that statement's commit. Later `INSERT`, `UPDATE`, and `DELETE` statements update every index on the table in the same commit as the heap. `DROP TABLE` removes the table's indexes. `UNIQUE`, more than one column, `DESC`, and `IF NOT EXISTS` are rejected.
 
-`SELECT` uses an index for `column = integer`, `column < integer`, `column <= integer`, `column > integer`, `column >= integer`, and the same shapes with the integer on the left. An `AND` of those comparisons on one indexed column is one range. The scan bounds are inclusive: `age < 25` is `age <= 24`, and `25 < age` is `age >= 26`. The original `WHERE` still runs on each candidate, so an extra predicate such as `name = 'Ada'` is applied after the index lookup. `EXPLAIN SELECT` prints the path the query will use. It reads an index's minimum and maximum key when a range needs that fact, and it does not read the matching rows or estimate a cost.
+`SELECT` uses an index for `column = integer`, `column < integer`, `column <= integer`, `column > integer`, `column >= integer`, and the same shapes with the integer on the left, when the query reads one table. An `AND` of those comparisons on one indexed column is one range. The scan bounds are inclusive: `age < 25` is `age <= 24`, and `25 < age` is `age >= 26`. The original `WHERE` still runs on each candidate, so an extra predicate such as `name = 'Ada'` is applied after the index lookup. `EXPLAIN SELECT` prints the path the query will use. For one table the columns are `access`, `index`, and `bounds`. It reads an index's minimum and maximum key when a range needs that fact, and it does not read the matching rows or estimate a cost. A join's `EXPLAIN` instead names `NestedLoopJoin`, the outer table, the inner table, the `ON` condition, and the `WHERE` filter when there is one. An alias is shown as `alias (table)` when it differs from the catalog name.
 
 A range that includes every `i64` value, such as `age >= -9223372036854775808`, is a sequential scan. A range that includes every key currently stored in the index is also a sequential scan. `age >= 0` is one of those ranges only when every stored key is at least 0. The `INTEGER` type does not imply that. Equality stays an index lookup. A one-sided range that still excludes some stored key, such as `age >= 50` when smaller keys exist, stays an index scan. There is no histogram and no assumption that keys are spread uniformly.
 
@@ -276,12 +285,12 @@ rustdb> exit
 - File mode checkpoints the pages a statement changes. It is not a power-loss proof. Fault-injection tests stop the process between the log sync, the page writes, the database sync, and clearing the log. They do not show what a filesystem does when power is lost during `sync_all`. Network filesystems are not supported. A checksum or audit failure is reported and not repaired.
 - A row cannot exceed 4068 bytes. Rows do not overflow onto a second page.
 - One writer. A second process cannot open a database this process already has open. There are no concurrent readers and no multi-writer mode.
-- No `JOIN`, `GROUP BY`, `DISTINCT`, aggregates, subqueries, `LIKE`, `IN`, `BETWEEN`, or arithmetic.
+- No `LEFT JOIN`, `RIGHT JOIN`, `FULL JOIN`, join of more than two tables, `GROUP BY`, `DISTINCT`, aggregates, subqueries, `LIKE`, `IN`, `BETWEEN`, or arithmetic.
 - No primary keys, unique constraints, defaults, or column constraints. `NOT NULL` is rejected with the other constraints, so the engine does not yet enforce it.
 - No `UPDATE` or `DELETE` with `ORDER BY`, `LIMIT`, `RETURNING`, or a second table.
 - No `OFFSET`, `FETCH`, `LIMIT ALL`, or `ORDER BY` expressions.
 - No transactions beyond a single statement. A multi-statement string is not atomic.
-- `SELECT` can use one single-column integer index for an equality or a range that does not cover every stored key. A range over every `i64`, or over every key in the index, scans the table. `OR`, `IS NULL`, `IS NOT NULL`, `!=`, and any predicate that contains `OR` scan the table. `UPDATE` and `DELETE` scan the table. There is no cost-based optimizer, histogram, composite index, or join. A range such as `age >= 50` can still be slower than a table scan when it matches a large share of the rows.
+- `SELECT` from one table can use one single-column integer index for an equality or a range that does not cover every stored key. A range over every `i64`, or over every key in the index, scans the table. `OR`, `IS NULL`, `IS NOT NULL`, `!=`, and any predicate that contains `OR` scan the table. `UPDATE` and `DELETE` scan the table. An `INNER JOIN` always reads both tables. There is no cost-based optimizer, histogram, composite index, hash join, or merge join. A range such as `age >= 50` can still be slower than a table scan when it matches a large share of the rows.
 - Integer type names are aliases of `i64`. `SMALLINT` does not reject values outside the 16-bit range.
 - Floating-point literals and function calls are rejected.
 - The REPL is single-threaded. Prompts are always printed, including when input is piped.
@@ -289,4 +298,4 @@ rustdb> exit
 
 ## Next milestone
 
-Milestone 7 should add a nested-loop `INNER JOIN`. The inner side can reuse the index scan from Milestone 6 when its predicate is an equality or a range on one indexed integer column. Aggregates, composite indexes, and a cost-based optimizer are still out of scope.
+Milestone 8 should teach the nested-loop join to probe an integer index on the inner table when `ON` is an equality on one indexed column. Hash join, merge join, outer joins, and aggregates stay out of scope.

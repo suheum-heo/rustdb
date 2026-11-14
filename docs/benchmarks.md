@@ -214,6 +214,34 @@ The checksums of the returned ids matched across the two files. For equality the
 
 The same checksums matched again. Warm equality is 2.0x, 6.9x, and 12.8x. The warm 10% range is 1.8x to 3.0x. The warm 50% range remains slower, at 0.35x for 100,000 rows.
 
+## Milestone 7 nested-loop join
+
+Measured on 14 November 2026. The database is in memory. Each input is `lhs (id INT, note INT)` and `rhs (id INT, note INT)`. Identity rows use `id = note = 0..N-1` on both sides, so an equality join examines `N × N` pairs and returns `N` rows. The duplicate shape uses the same left ids and sets each right id to `id % 50`, which still returns 1,000 rows: keys `0..49` match 20 times each, and keys `50..999` match nothing. The timed statement is `SELECT lhs.id, rhs.note FROM lhs JOIN rhs ON lhs.id = rhs.id`. Load time is not included. The checksum is the sum of the returned left ids, and the run checks it. `std::hint::black_box` consumes that sum and the row count.
+
+```bash
+cargo test --release --test milestone7 profile_nested_loop_join -- --ignored --nocapture
+```
+
+| Item | Value |
+| --- | --- |
+| Machine | Apple M5, 16 GiB RAM (`hw.memsize` 17,179,869,184), `arm64` |
+| Compiler | `rustc 1.100.0 (0ef1bc386 2026-11-09)` |
+| Build | `cargo test --release --offline --test milestone7 profile_nested_loop_join -- --ignored --nocapture` |
+| Algorithm | Nested loop. Every pair is tested. No index is read. |
+
+`Value` and `Vec<Value>` were each 24 bytes. A returned row is two integers, so the result byte count is `matches × 72`. The copy byte count is one input: `N × 72` after the review, and both inputs (`(N + M) × 72`) before it. These counts are the row vectors, not process RSS. A failed pair is not stored. With no `ORDER BY`, a match is projected immediately, so this statement does not keep a wider joined row. `ORDER BY` still does.
+
+The same harness was run immediately before and after that copy change. The tables have equal size, so the change copies one input instead of two. The warm time is the median of five repeats. The cold time is the first sample.
+
+| Shape | N | Pairs | Matches | Before cold | Before warm | After cold | After warm | Copied bytes before | Copied bytes after |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| identity | 100 | 10,000 | 100 | 596 µs | 69 µs | 315 µs | 98 µs | 14,400 | 7,200 |
+| identity | 1,000 | 1,000,000 | 1,000 | 5,626 µs | 5,774 µs | 8,248 µs | 6,673 µs | 144,000 | 72,000 |
+| identity | 4,000 | 16,000,000 | 4,000 | 90,260 µs | 90,669 µs | 94,148 µs | 93,058 µs | 576,000 | 288,000 |
+| duplicate | 1,000 | 1,000,000 | 1,000 | 5,734 µs | 5,735 µs | 5,980 µs | 5,957 µs | 144,000 | 72,000 |
+
+The 4,000-row identity still copies 288,000 bytes after the change because only one of the two equal inputs is copied; before the change that case copied 576,000 bytes. Result bytes stayed 7,200, 72,000, and 288,000. From 1,000 to 4,000 rows the pair count grows by 16× and the later warm time grows from 6,673 µs to 93,058 µs, about 14×. That is the `N × M` term. Halving the copied input does not move the time in a consistent direction: the 4,000-row warm sample went from 90,669 µs to 93,058 µs. Pair evaluation dominates the copy. Nothing in these numbers is an index lookup.
+
 ## Limitations
 
 - One machine and one load per size in each session. The five scan, update, and insert samples are repeats on that same file, so they share cache and allocator state.
@@ -226,3 +254,4 @@ The same checksums matched again. Warm equality is 2.0x, 6.9x, and 12.8x. The wa
 - The Milestone 5 disk times are one sample each. The difference between a plain statement and an indexed statement is smaller than the spread of `fsync`, so it is not a stable overhead measurement.
 - The standalone tree times use an in-memory page map. They do not include the pager, the redo log, or `fsync`.
 - The Milestone 6 tables are one release run each. The warm time is the median of nine repeats on one open file. The cold time is one sample after clearing the pager cache. A sequential `SELECT` does not read heap pages, because open has already loaded the heap into memory. The later `all` plan still reads the index endpoints on the cold sample before scanning memory.
+- The Milestone 7 rows are two release runs on one in-memory database, taken immediately before and after the scan stopped copying both inputs. The warm time is the median of five repeats. The cold time is the first sample. The copied-byte column counts the row vectors that the scan clones. It is not process RSS. The join does not read an index, so the pair count is `N × M` for every shape. The 4,000-row times differ by a few percent between the runs; that spread is larger than the cost of the removed copy.
