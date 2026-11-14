@@ -103,10 +103,13 @@ impl Pager {
             return Err(page::migration_required(path));
         }
         if allow_v1 {
-            return Err(DbError::Storage(
-                "database file is already format version 2".to_string(),
-            ));
+            return Err(DbError::Storage(format!(
+                "database file is already format version {}",
+                meta.version
+            )));
         }
+        // `read_meta` already accepted this version. Recovery does not run for
+        // any other version, and it does not run before this point.
         wal::recover(&mut pager.file, &wal::path_for(path))?;
         pager.cache.clear();
         let length = pager
@@ -162,6 +165,12 @@ impl Pager {
         base_commit: u64,
         inject: Option<Inject>,
     ) -> Result<(), StepError> {
+        if pages.len() > page::commit_frame_limit() || pages.iter().any(|(id, _)| *id >= page_count)
+        {
+            return Err(StepError::BeforeCommit(DbError::Storage(
+                "statement changes more pages than one commit can record".to_string(),
+            )));
+        }
         let wal_path = wal::path_for(&self.path);
         let plan = wal::Plan {
             nonce,
@@ -409,6 +418,7 @@ fn initial_pages_with(nonce: u64) -> Result<Vec<Page>, DbError> {
             nonce,
             commit_id: 0,
             next_table_id: 1,
+            index_catalog_root: 0,
         },
         &[],
     )?;

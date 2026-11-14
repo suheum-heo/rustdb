@@ -25,11 +25,11 @@ SQL text
 | `schema` | Column names, types, and insert column mapping |
 | `table` | One table: schema, insertion-ordered rows, and stable row ids |
 | `database` | Catalog of named tables, in memory or backed by a file |
-| `storage` | Pager, slotted pages, redo log, and incremental page edits |
+| `storage` | Pager, slotted pages, B+ tree indexes, redo log, and incremental page edits |
 | `ast` | Statements and expressions the executor understands |
 | `parser` | `sqlparser` boundary and identifier normalization |
 | `expr` | Bind columns, check types, and evaluate three-valued logic |
-| `executor` | `CREATE`, `DROP`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE` |
+| `executor` | `CREATE`, `DROP`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, and integer indexes |
 | `format` | ASCII result tables |
 | `repl` | Interactive session |
 | `error` | Parse, schema, type, and storage errors |
@@ -50,11 +50,11 @@ A query keeps a row only when `WHERE` evaluates to TRUE. FALSE and UNKNOWN both 
 
 ## Durability
 
-Each successful `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, or `DELETE` writes the pages that statement changed into `PATH.wal`, syncs that same file, writes those pages into the database, syncs the database, and only then truncates the log. A successful sync of the log is the commit point. A failed sync is not treated as a rollback. `SELECT` does not write the log. Unchanged pages stay as they are, including other tables' heap pages.
+Each successful `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `INSERT`, `UPDATE`, or `DELETE` writes the pages that statement changed into `PATH.wal`, syncs that same file, writes those pages into the database, syncs the database, and only then truncates the log. A successful sync of the log is the commit point. A failed sync is not treated as a rollback. `SELECT` does not write the log. Unchanged pages stay as they are, including other tables' heap pages.
 
 The process holds an advisory `flock` on `PATH.lock` and on the database file for as long as it has the database open. The lock file stays after unlock. A second open of the same path fails, including a second open in this process. Renaming the database file does not release the inode lock held by the process that already has it open. `flock` is advisory: a process that does not take it is not stopped. A forked child inherits the lock until it closes that descriptor or starts a new program. The descriptor is close-on-exec.
 
-A crash before the commit record is durable leaves the previous database, and an incomplete log that belongs to the file is discarded on open. A crash after the commit record is durable and before the log is cleared is repaired on the next open by writing the logged pages again. That replay is safe to repeat. A version 1 file is not migrated on open. `rustdb --migrate PATH` rewrites it as version 2 and keeps row ids and table ids.
+A crash before the commit record is durable leaves the previous database, and an incomplete log that belongs to the file is discarded on open. A crash after the commit record is durable and before the log is cleared is repaired on the next open by writing the logged pages again. That replay is safe to repeat. A version 1 file is not migrated on open. `rustdb --migrate PATH` rewrites version 1 as version 2, or version 2 as version 3, and keeps row ids and table ids. A new database stays version 2 until that command is run. `CREATE INDEX` on version 2 fails and names the command.
 
 This is not a power-loss proof. The tests stop the commit at chosen steps, including a sync that returns an error after the commit record has been written. They do not cut power. RustDB assumes a local filesystem that honors `File::sync_all` and `flock`. The byte layout, the log, and the remaining filesystem assumptions are in [docs/storage-format.md](docs/storage-format.md).
 
@@ -77,7 +77,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-With no arguments the REPL uses an empty in-memory database, and exiting drops every table. `--database PATH` creates a version 2 file when it does not exist and reloads it on the next run. `--migrate PATH` rewrites a version 1 file as version 2 and then exits. It does not start the REPL. A version 2 file is left unchanged and the command fails. The REPL prompts with `rustdb> `. End each statement with `;`. A statement can span lines. `exit` and `quit` close the session. SQL errors are printed and the session continues.
+With no arguments the REPL uses an empty in-memory database, and exiting drops every table. `--database PATH` creates a version 2 file when it does not exist and reloads it on the next run. `--migrate PATH` rewrites a version 1 file as version 2, or a version 2 file as version 3, and then exits. It does not start the REPL. A version 3 file is left unchanged and the command fails. The REPL prompts with `rustdb> `. End each statement with `;`. A statement can span lines. `exit` and `quit` close the session. SQL errors are printed and the session continues.
 
 Library use:
 
@@ -170,6 +170,17 @@ SELECT * FROM users ORDER BY age ASC NULLS FIRST;
 
 `LIMIT` takes one nonnegative integer literal. `LIMIT 0` returns no rows. A limit larger than the row count returns every remaining row. `OFFSET`, `FETCH`, `LIMIT` expressions, and `ORDER BY` expressions (`ORDER BY 1`, `ORDER BY age + 1`) are rejected.
 
+### Indexes
+
+```sql
+CREATE INDEX idx_users_age ON users(age);
+DROP INDEX idx_users_age;
+```
+
+An index names one `INTEGER` column. Duplicate keys are stored. `NULL` is left out of the tree. The index name is separate from table names, so an index may share a name with a table. `CREATE INDEX` reads the rows already in the table and builds the tree in that statement's commit. Later `INSERT`, `UPDATE`, and `DELETE` statements update every index on the table in the same commit as the heap. `DROP TABLE` removes the table's indexes. `UNIQUE`, more than one column, `DESC`, and `IF NOT EXISTS` are rejected.
+
+`SELECT` does not consult the index. A filter still scans the in-memory table. An in-memory database has no file to store the tree, so `CREATE INDEX` and `DROP INDEX` fail there. A version 2 file must be migrated before `CREATE INDEX`.
+
 ## Example
 
 This is a real session from `cargo run`:
@@ -261,7 +272,7 @@ rustdb> exit
 - No `UPDATE` or `DELETE` with `ORDER BY`, `LIMIT`, `RETURNING`, or a second table.
 - No `OFFSET`, `FETCH`, `LIMIT ALL`, or `ORDER BY` expressions.
 - No transactions beyond a single statement. A multi-statement string is not atomic.
-- No indexes. Filtering scans the table from first inserted row to last.
+- Integer indexes are stored, and `SELECT` still scans the in-memory table. A filter does not become an index lookup.
 - Integer type names are aliases of `i64`. `SMALLINT` does not reject values outside the 16-bit range.
 - Floating-point literals and function calls are rejected.
 - The REPL is single-threaded. Prompts are always printed, including when input is piped.
@@ -269,4 +280,4 @@ rustdb> exit
 
 ## Next milestone
 
-Milestone 4 should add a B+ tree for equality and range lookup on one column. The page format is now concrete enough to hold internal index pages. A write-ahead log can wait until rewriting the whole file is the measured cost; it should not arrive disguised as a transaction system.
+Milestone 6 should teach `SELECT` to choose an integer index for an equality or range filter. The trees and the maintenance path are already on disk. Planning is the missing piece, and until it lands a query time is still the in-memory scan.

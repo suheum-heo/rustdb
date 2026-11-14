@@ -7,12 +7,13 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::DbError;
+use crate::storage::btree::{self, Nodes};
 use crate::storage::page::{self, PAGE_SIZE, Page};
 use crate::storage::pager::Pager;
 use crate::storage::profile;
-use crate::storage::record::{self, Link, NULL_LINK, StoredRecord};
-use crate::storage::store::TableImage;
-use crate::value::Value;
+use crate::storage::record::{self, IndexCatalog, Link, NULL_LINK, StoredRecord};
+use crate::storage::store::{IndexImage, TableImage};
+use crate::value::{DataType, Value};
 
 const FREE_DIRECTORY_CAPACITY: usize = (PAGE_SIZE - 28) / 4;
 
@@ -29,17 +30,32 @@ pub(crate) struct LiveTable {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct LiveIndex {
+    pub name: String,
+    pub table_id: u32,
+    pub column_ordinal: u16,
+    pub column_name: String,
+    pub root: u32,
+    pub catalog_page: u32,
+    pub catalog_slot: u16,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
+    pub version: u32,
     pub nonce: u64,
     pub commit_id: u64,
     pub page_count: u32,
     pub catalog_root: u32,
     pub freelist_root: u32,
+    pub index_catalog_root: u32,
     pub inline_free: Vec<u32>,
     pub free_ids: Vec<u32>,
     pub directory_pages: Vec<u32>,
     pub tables: HashMap<String, LiveTable>,
+    pub indexes: Vec<LiveIndex>,
     pub catalog_tail: u32,
+    pub index_catalog_tail: u32,
     /// Next table id to assign. Stored at the end of page 0. It never goes
     /// backward, including across DROP TABLE and restart.
     pub next_table_id: u32,
@@ -75,9 +91,11 @@ impl Editor {
         mut self,
         pager: &mut Pager,
         desired: &[TableImage],
+        indexes: &[IndexImage],
     ) -> Result<Option<Prepared>, DbError> {
         let desired_names: HashSet<&str> =
             desired.iter().map(|table| table.name.as_str()).collect();
+        self.drop_absent_indexes(pager, indexes)?;
         let existing: Vec<String> = self.snapshot.tables.keys().cloned().collect();
         for name in existing {
             if !desired_names.contains(name.as_str()) {
@@ -95,6 +113,7 @@ impl Editor {
                 self.set_next_row_id(pager, &table.name, table.next_row_id)?;
             }
         }
+        self.create_missing_indexes(pager, indexes)?;
         if self.dirty.is_empty() && !self.freelist_dirty {
             return Ok(None);
         }
@@ -140,6 +159,18 @@ impl Editor {
             .get(name)
             .cloned()
             .ok_or_else(|| DbError::Internal(format!("missing table '{name}'")))?;
+        let index_positions: Vec<usize> = self
+            .snapshot
+            .indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, index)| index.table_id == live.table_id)
+            .map(|(position, _)| position)
+            .rev()
+            .collect();
+        for position in index_positions {
+            self.drop_index_at(pager, position)?;
+        }
         while !self
             .snapshot
             .tables
@@ -228,7 +259,7 @@ impl Editor {
         } else {
             self.ensure(pager, tail.page)?;
             let inserted = page::insert_cell(self.pages.get_mut(&tail.page).expect("tail"), &bytes);
-            self.dirty.insert(tail.page);
+            self.touch(tail.page)?;
             match inserted {
                 Ok(slot) => Link {
                     page: tail.page,
@@ -269,7 +300,9 @@ impl Editor {
         live.next_row_id = next_row_id;
         let catalog_page = live.catalog_page;
         let catalog_slot = live.catalog_slot;
+        let table_id = live.table_id;
         self.patch_catalog(pager, catalog_page, catalog_slot, next_row_id, head)?;
+        self.maintain_indexes(pager, table_id, row_id, None, Some(values))?;
         Ok(())
     }
 
@@ -282,6 +315,8 @@ impl Editor {
         values: &[Value],
     ) -> Result<(), DbError> {
         let link = self.snapshot.tables[name].links[index];
+        let table_id = self.snapshot.tables[name].table_id;
+        let old_values = self.row_values(pager, link)?;
         self.ensure(pager, link.page)?;
         let (prev, next) = self.read_links(link)?;
         let bytes = record::encode_record(&StoredRecord {
@@ -298,7 +333,8 @@ impl Editor {
                 link.slot,
                 &bytes,
             )?;
-            self.dirty.insert(link.page);
+            self.touch(link.page)?;
+            self.maintain_indexes(pager, table_id, row_id, Some(&old_values), Some(values))?;
             return Ok(());
         }
         self.delete_cell(pager, link)?;
@@ -306,7 +342,7 @@ impl Editor {
         let relocated =
             match page::insert_cell(self.pages.get_mut(&link.page).expect("page"), &bytes) {
                 Ok(slot) => {
-                    self.dirty.insert(link.page);
+                    self.touch(link.page)?;
                     Link {
                         page: link.page,
                         slot,
@@ -363,11 +399,15 @@ impl Editor {
             )?;
         }
         self.maybe_free_heap(link.page)?;
+        self.maintain_indexes(pager, table_id, row_id, Some(&old_values), Some(values))?;
         Ok(())
     }
 
     fn unlink_row(&mut self, pager: &mut Pager, name: &str, index: usize) -> Result<(), DbError> {
         let link = self.snapshot.tables[name].links[index];
+        let table_id = self.snapshot.tables[name].table_id;
+        let row_id = self.snapshot.tables[name].row_ids[index];
+        let old_values = self.row_values(pager, link)?;
         let prev = if index == 0 {
             NULL_LINK
         } else {
@@ -400,6 +440,7 @@ impl Editor {
         let catalog_slot = live.catalog_slot;
         self.patch_catalog(pager, catalog_page, catalog_slot, next_row_id, head)?;
         self.maybe_free_heap(link.page)?;
+        self.maintain_indexes(pager, table_id, row_id, Some(&old_values), None)?;
         Ok(())
     }
 
@@ -425,7 +466,7 @@ impl Editor {
         self.ensure(pager, tail)?;
         match page::insert_cell(self.pages.get_mut(&tail).expect("catalog"), bytes) {
             Ok(slot) => {
-                self.dirty.insert(tail);
+                self.touch(tail)?;
                 Ok((tail, slot))
             }
             Err(page::InsertError::Full) => {
@@ -442,10 +483,10 @@ impl Editor {
                     }
                 };
                 self.pages.insert(page_id, page);
-                self.dirty.insert(page_id);
+                self.touch(page_id)?;
                 self.ensure(pager, tail)?;
                 page::set_next_page(self.pages.get_mut(&tail).expect("catalog"), page_id);
-                self.dirty.insert(tail);
+                self.touch(tail)?;
                 self.snapshot.catalog_tail = page_id;
                 Ok((page_id, slot))
             }
@@ -493,7 +534,7 @@ impl Editor {
                 }
                 self.ensure(pager, previous)?;
                 page::set_next_page(self.pages.get_mut(&previous).expect("catalog"), next);
-                self.dirty.insert(previous);
+                self.touch(previous)?;
                 if self.snapshot.catalog_tail == page_id {
                     self.snapshot.catalog_tail = previous;
                 }
@@ -518,7 +559,7 @@ impl Editor {
             }
         };
         self.pages.insert(page_id, page);
-        self.dirty.insert(page_id);
+        self.touch(page_id)?;
         Ok(slot)
     }
 
@@ -547,7 +588,7 @@ impl Editor {
         let mut page = Page::new();
         page::write_free_data(&mut page, page_id);
         self.pages.insert(page_id, page);
-        self.dirty.insert(page_id);
+        self.touch(page_id)?;
         self.snapshot.free_ids.push(page_id);
         self.snapshot.free_ids.sort_unstable();
         self.snapshot.free_ids.dedup();
@@ -576,7 +617,7 @@ impl Editor {
     fn delete_cell(&mut self, pager: &mut Pager, link: Link) -> Result<(), DbError> {
         self.ensure(pager, link.page)?;
         page::delete_cell(self.pages.get_mut(&link.page).expect("page"), link.slot)?;
-        self.dirty.insert(link.page);
+        self.touch(link.page)?;
         Ok(())
     }
 
@@ -590,7 +631,7 @@ impl Editor {
         self.ensure(pager, link.page)?;
         let cell = page::cell_mut(self.pages.get_mut(&link.page).expect("page"), link.slot)?;
         record::patch_links(cell, prev, next)?;
-        self.dirty.insert(link.page);
+        self.touch(link.page)?;
         Ok(())
     }
 
@@ -605,7 +646,7 @@ impl Editor {
         self.ensure(pager, page_id)?;
         let cell = page::cell_mut(self.pages.get_mut(&page_id).expect("catalog"), slot)?;
         record::patch_catalog_head(cell, next_row_id, head)?;
-        self.dirty.insert(page_id);
+        self.touch(page_id)?;
         Ok(())
     }
 
@@ -634,7 +675,8 @@ impl Editor {
     }
 
     fn finish(&mut self, pager: &mut Pager) -> Result<(), DbError> {
-        if self.freelist_dirty || self.snapshot.inline_free.len() > page::META_FREE_CAPACITY {
+        let capacity = inline_capacity(self.snapshot.version);
+        if self.freelist_dirty || self.snapshot.inline_free.len() > capacity {
             self.relayout()?;
         }
         self.write_meta(pager)?;
@@ -655,7 +697,7 @@ impl Editor {
         page::write_meta(
             &mut page,
             page::Meta {
-                version: page::FORMAT_VERSION,
+                version: self.snapshot.version,
                 page_count: self.snapshot.page_count,
                 catalog_root: self.snapshot.catalog_root,
                 freelist_root: self.snapshot.freelist_root,
@@ -664,11 +706,12 @@ impl Editor {
                     DbError::Storage("database commit id space is exhausted".to_string())
                 })?,
                 next_table_id: self.snapshot.next_table_id,
+                index_catalog_root: self.snapshot.index_catalog_root,
             },
             &self.snapshot.inline_free,
         )?;
         self.pages.insert(0, page);
-        self.dirty.insert(0);
+        self.touch(0)?;
         self.snapshot.commit_id =
             self.snapshot.commit_id.checked_add(1).ok_or_else(|| {
                 DbError::Storage("database commit id space is exhausted".to_string())
@@ -682,7 +725,8 @@ impl Editor {
         pool.extend(old_directories.iter().copied());
         pool.sort_unstable();
         pool.dedup();
-        let need = directories_needed(pool.len());
+        let capacity = inline_capacity(self.snapshot.version);
+        let need = directories_needed(pool.len(), capacity);
         if need > pool.len() {
             return Err(DbError::Internal(
                 "cannot reserve freelist directory pages".to_string(),
@@ -690,7 +734,8 @@ impl Editor {
         }
         let directories: Vec<u32> = pool.split_off(pool.len() - need);
         let data = pool;
-        let inline_len = data.len().min(page::META_FREE_CAPACITY);
+        let capacity = inline_capacity(self.snapshot.version);
+        let inline_len = data.len().min(capacity);
         self.snapshot.inline_free = data[..inline_len].to_vec();
         let overflow = data[inline_len..].to_vec();
         let chunks: Vec<&[u32]> = overflow.chunks(FREE_DIRECTORY_CAPACITY).collect();
@@ -705,14 +750,14 @@ impl Editor {
             let mut page = Page::new();
             page::write_free_directory(&mut page, directory_id, next, chunk)?;
             self.pages.insert(directory_id, page);
-            self.dirty.insert(directory_id);
+            self.touch(directory_id)?;
         }
         for id in &data {
             if old_directories.contains(id) {
                 let mut page = Page::new();
                 page::write_free_data(&mut page, *id);
                 self.pages.insert(*id, page);
-                self.dirty.insert(*id);
+                self.touch(*id)?;
             }
         }
         self.snapshot.free_ids = data;
@@ -743,13 +788,421 @@ impl Editor {
             .ok_or_else(|| DbError::Storage("table id space is exhausted".to_string()))?;
         Ok(id)
     }
+
+    fn touch(&mut self, id: u32) -> Result<(), DbError> {
+        if self.dirty.contains(&id) {
+            return Ok(());
+        }
+        let reserved = usize::from(id != 0 && !self.dirty.contains(&0));
+        if self.dirty.len() + 1 + reserved > page::commit_frame_limit() {
+            return Err(DbError::Storage(
+                "statement changes more pages than one commit can record".to_string(),
+            ));
+        }
+        self.dirty.insert(id);
+        Ok(())
+    }
+
+    fn drop_absent_indexes(
+        &mut self,
+        pager: &mut Pager,
+        desired: &[IndexImage],
+    ) -> Result<(), DbError> {
+        let names: HashSet<&str> = desired.iter().map(|index| index.name.as_str()).collect();
+        let positions: Vec<usize> = self
+            .snapshot
+            .indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, index)| !names.contains(index.name.as_str()))
+            .map(|(position, _)| position)
+            .rev()
+            .collect();
+        for position in positions {
+            self.drop_index_at(pager, position)?;
+        }
+        Ok(())
+    }
+
+    fn create_missing_indexes(
+        &mut self,
+        pager: &mut Pager,
+        desired: &[IndexImage],
+    ) -> Result<(), DbError> {
+        let mut names = HashSet::new();
+        for index in desired {
+            if !names.insert(index.name.as_str()) {
+                return Err(DbError::invalid(format!(
+                    "index '{}' already exists",
+                    index.name
+                )));
+            }
+            if self
+                .snapshot
+                .indexes
+                .iter()
+                .any(|live| live.name == index.name)
+            {
+                continue;
+            }
+            self.create_index(pager, index)?;
+        }
+        Ok(())
+    }
+
+    fn create_index(&mut self, pager: &mut Pager, index: &IndexImage) -> Result<(), DbError> {
+        if self.snapshot.version < page::FORMAT_VERSION_V3 {
+            return Err(DbError::Storage(
+                "database format version 2 requires an explicit migration before CREATE INDEX"
+                    .to_string(),
+            ));
+        }
+        let table = self
+            .snapshot
+            .tables
+            .get(&index.table)
+            .ok_or_else(|| DbError::TableNotFound(index.table.clone()))?;
+        let catalog_page = table.catalog_page;
+        let catalog_slot = table.catalog_slot;
+        let table_id = table.table_id;
+        self.ensure(pager, catalog_page)?;
+        let bytes = page::cell(&self.pages[&catalog_page], catalog_slot)?.to_vec();
+        let entry = record::decode_catalog(&bytes).map_err(|_| page::corrupt(catalog_page))?;
+        let Some(position) = entry
+            .columns
+            .iter()
+            .position(|column| column.name() == index.column)
+        else {
+            return Err(DbError::ColumnNotFound {
+                table: index.table.clone(),
+                column: index.column.clone(),
+            });
+        };
+        if entry.columns[position].data_type() != DataType::Integer {
+            return Err(DbError::unsupported(format!(
+                "index column '{}' must be INTEGER",
+                index.column
+            )));
+        }
+        let ordinal = u16::try_from(position).map_err(|_| page::corrupt_file())?;
+        let cell = record::encode_index(&IndexCatalog {
+            name: index.name.clone(),
+            table_id,
+            ordinal,
+            column: index.column.clone(),
+            root: 0,
+        })?;
+        let (page_id, slot) = self.insert_index_catalog(pager, &cell)?;
+        self.snapshot.indexes.push(LiveIndex {
+            name: index.name.clone(),
+            table_id,
+            column_ordinal: ordinal,
+            column_name: index.column.clone(),
+            root: 0,
+            catalog_page: page_id,
+            catalog_slot: slot,
+        });
+        let index_pos = self.snapshot.indexes.len() - 1;
+        let row_count = self.snapshot.tables[&index.table].links.len();
+        for row_index in 0..row_count {
+            let row_id = self.snapshot.tables[&index.table].row_ids[row_index];
+            let link = self.snapshot.tables[&index.table].links[row_index];
+            let values = self.row_values(pager, link)?;
+            if let Some(key) = integer_at(&values, ordinal)? {
+                self.mutate_index(pager, index_pos, IndexChange::Insert(key, row_id))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn drop_index_at(&mut self, pager: &mut Pager, position: usize) -> Result<(), DbError> {
+        let index = self.snapshot.indexes[position].clone();
+        let owned = {
+            let mut nodes = EditNodes {
+                editor: self,
+                pager,
+            };
+            btree::owned_pages(&mut nodes, index.root)?
+        };
+        for page_id in owned {
+            self.free_page(page_id)?;
+        }
+        self.delete_index_cell(pager, index.catalog_page, index.catalog_slot)?;
+        self.snapshot.indexes.remove(position);
+        Ok(())
+    }
+
+    fn maintain_indexes(
+        &mut self,
+        pager: &mut Pager,
+        table_id: u32,
+        row_id: u64,
+        old: Option<&[Value]>,
+        new: Option<&[Value]>,
+    ) -> Result<(), DbError> {
+        let positions: Vec<usize> = self
+            .snapshot
+            .indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, index)| index.table_id == table_id)
+            .map(|(position, _)| position)
+            .collect();
+        for position in positions {
+            let ordinal = self.snapshot.indexes[position].column_ordinal;
+            let old_key = old
+                .map(|values| integer_at(values, ordinal))
+                .transpose()?
+                .flatten();
+            let new_key = new
+                .map(|values| integer_at(values, ordinal))
+                .transpose()?
+                .flatten();
+            if old_key == new_key {
+                continue;
+            }
+            if let Some(key) = old_key {
+                self.mutate_index(pager, position, IndexChange::Delete(key, row_id))?;
+            }
+            if let Some(key) = new_key {
+                self.mutate_index(pager, position, IndexChange::Insert(key, row_id))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn mutate_index(
+        &mut self,
+        pager: &mut Pager,
+        position: usize,
+        change: IndexChange,
+    ) -> Result<(), DbError> {
+        let root = self.snapshot.indexes[position].root;
+        let new_root = {
+            let mut nodes = EditNodes {
+                editor: self,
+                pager,
+            };
+            match change {
+                IndexChange::Insert(key, row_id) => {
+                    btree::insert(&mut nodes, root, key, row_id, btree::production())?
+                }
+                IndexChange::Delete(key, row_id) => {
+                    btree::delete(&mut nodes, root, key, row_id, btree::production())?
+                }
+            }
+        };
+        if new_root != root {
+            self.snapshot.indexes[position].root = new_root;
+            self.rewrite_index_cell(pager, position)?;
+        }
+        Ok(())
+    }
+
+    fn rewrite_index_cell(&mut self, pager: &mut Pager, position: usize) -> Result<(), DbError> {
+        let index = self.snapshot.indexes[position].clone();
+        let bytes = record::encode_index(&IndexCatalog {
+            name: index.name,
+            table_id: index.table_id,
+            ordinal: index.column_ordinal,
+            column: index.column_name,
+            root: index.root,
+        })?;
+        self.ensure(pager, index.catalog_page)?;
+        page::overwrite_cell(
+            self.pages
+                .get_mut(&index.catalog_page)
+                .expect("index catalog"),
+            index.catalog_slot,
+            &bytes,
+        )?;
+        self.touch(index.catalog_page)?;
+        Ok(())
+    }
+
+    fn row_values(&mut self, pager: &mut Pager, link: Link) -> Result<Vec<Value>, DbError> {
+        self.ensure(pager, link.page)?;
+        let bytes = page::cell(&self.pages[&link.page], link.slot)?.to_vec();
+        Ok(record::decode_record(&bytes)
+            .map_err(|_| page::corrupt(link.page))?
+            .values)
+    }
+
+    fn insert_index_catalog(
+        &mut self,
+        pager: &mut Pager,
+        bytes: &[u8],
+    ) -> Result<(u32, u16), DbError> {
+        if self.snapshot.index_catalog_root == 0 {
+            let page_id = self.alloc_page()?;
+            if page_id < self.base_count {
+                self.ensure(pager, page_id)?;
+            }
+            let mut page = Page::new();
+            page::init_slotted(&mut page, page::TYPE_INDEX_CATALOG, page_id);
+            let slot = page::insert_cell(&mut page, bytes).map_err(|_| {
+                DbError::Storage(format!(
+                    "index definition exceeds the maximum record size of {} bytes",
+                    page::MAX_RECORD_LEN
+                ))
+            })?;
+            self.pages.insert(page_id, page);
+            self.touch(page_id)?;
+            self.snapshot.index_catalog_root = page_id;
+            self.snapshot.index_catalog_tail = page_id;
+            return Ok((page_id, slot));
+        }
+        let tail = self.snapshot.index_catalog_tail;
+        self.ensure(pager, tail)?;
+        match page::insert_cell(self.pages.get_mut(&tail).expect("index catalog"), bytes) {
+            Ok(slot) => {
+                self.touch(tail)?;
+                Ok((tail, slot))
+            }
+            Err(page::InsertError::Full) => {
+                let page_id = self.alloc_page()?;
+                let mut page = Page::new();
+                page::init_slotted(&mut page, page::TYPE_INDEX_CATALOG, page_id);
+                let slot = page::insert_cell(&mut page, bytes).map_err(|_| {
+                    DbError::Storage(format!(
+                        "index definition exceeds the maximum record size of {} bytes",
+                        page::MAX_RECORD_LEN
+                    ))
+                })?;
+                self.pages.insert(page_id, page);
+                self.touch(page_id)?;
+                self.ensure(pager, tail)?;
+                page::set_next_page(self.pages.get_mut(&tail).expect("index catalog"), page_id);
+                self.touch(tail)?;
+                self.snapshot.index_catalog_tail = page_id;
+                Ok((page_id, slot))
+            }
+            Err(page::InsertError::TooBig) => Err(DbError::Storage(format!(
+                "index definition exceeds the maximum record size of {} bytes",
+                page::MAX_RECORD_LEN
+            ))),
+        }
+    }
+
+    fn delete_index_cell(
+        &mut self,
+        pager: &mut Pager,
+        page_id: u32,
+        slot: u16,
+    ) -> Result<(), DbError> {
+        self.delete_cell(
+            pager,
+            Link {
+                page: page_id,
+                slot,
+            },
+        )?;
+        self.ensure(pager, page_id)?;
+        if page::live_slots(&self.pages[&page_id])?.is_empty() {
+            self.unlink_index_page(pager, page_id)?;
+            self.free_page(page_id)?;
+        }
+        Ok(())
+    }
+
+    fn unlink_index_page(&mut self, pager: &mut Pager, page_id: u32) -> Result<(), DbError> {
+        self.ensure(pager, page_id)?;
+        let next = page::next_page_of(&self.pages[&page_id]);
+        if self.snapshot.index_catalog_root == page_id {
+            self.snapshot.index_catalog_root = next;
+            if self.snapshot.index_catalog_tail == page_id {
+                self.snapshot.index_catalog_tail = next;
+            }
+            return Ok(());
+        }
+        let mut previous = 0;
+        let mut current = self.snapshot.index_catalog_root;
+        while current != 0 {
+            self.ensure(pager, current)?;
+            let following = page::next_page_of(&self.pages[&current]);
+            if current == page_id {
+                self.ensure(pager, previous)?;
+                page::set_next_page(self.pages.get_mut(&previous).expect("index catalog"), next);
+                self.touch(previous)?;
+                if self.snapshot.index_catalog_tail == page_id {
+                    self.snapshot.index_catalog_tail = previous;
+                }
+                return Ok(());
+            }
+            previous = current;
+            current = following;
+        }
+        Err(page::corrupt_file())
+    }
 }
 
-fn directories_needed(unused: usize) -> usize {
-    if unused <= page::META_FREE_CAPACITY {
+enum IndexChange {
+    Insert(i64, u64),
+    Delete(i64, u64),
+}
+
+struct EditNodes<'a> {
+    editor: &'a mut Editor,
+    pager: &'a mut Pager,
+}
+
+impl Nodes for EditNodes<'_> {
+    fn read_node(&mut self, id: u32) -> Result<Page, DbError> {
+        self.editor.ensure(self.pager, id)?;
+        self.editor
+            .pages
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| page::corrupt(id))
+    }
+
+    fn write_node(&mut self, id: u32, page: Page) -> Result<(), DbError> {
+        self.editor.touch(id)?;
+        self.editor.pages.insert(id, page);
+        Ok(())
+    }
+
+    fn alloc_node(&mut self) -> Result<u32, DbError> {
+        let id = self.editor.alloc_page()?;
+        if id < self.editor.base_count {
+            self.editor.ensure(self.pager, id)?;
+        }
+        Ok(id)
+    }
+
+    fn free_node(&mut self, id: u32) -> Result<(), DbError> {
+        self.editor.free_page(id)
+    }
+}
+
+fn integer_at(values: &[Value], ordinal: u16) -> Result<Option<i64>, DbError> {
+    let Some(value) = values.get(usize::from(ordinal)) else {
+        return Err(DbError::Internal(
+            "indexed column is missing from the row".to_string(),
+        ));
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Integer(key) => Ok(Some(*key)),
+        _ => Err(DbError::Internal(
+            "indexed value is not an integer".to_string(),
+        )),
+    }
+}
+
+fn inline_capacity(version: u32) -> usize {
+    if version >= page::FORMAT_VERSION_V3 {
+        page::META_FREE_CAPACITY_V3
+    } else {
+        page::META_FREE_CAPACITY
+    }
+}
+
+fn directories_needed(unused: usize, capacity: usize) -> usize {
+    if unused <= capacity {
         0
     } else {
-        (unused - page::META_FREE_CAPACITY).div_ceil(FREE_DIRECTORY_CAPACITY + 1)
+        (unused - capacity).div_ceil(FREE_DIRECTORY_CAPACITY + 1)
     }
 }
 

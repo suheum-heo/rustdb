@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::error::DbError;
 use crate::schema::Column;
-use crate::storage::{StepError, Store, TableImage};
+use crate::storage::{IndexImage, StepError, Store, TableImage};
 use crate::table::Table;
 
 /// A database holding named tables.
@@ -15,6 +15,7 @@ use crate::table::Table;
 /// file. One process holds an exclusive lock on that file. There is one catalog.
 pub struct Database {
     tables: HashMap<String, Table>,
+    indexes: Vec<IndexImage>,
     store: Option<Store>,
 }
 
@@ -29,18 +30,37 @@ pub(crate) enum DurableChange {
     Drop(Vec<String>),
     /// `INSERT`, `UPDATE`, or `DELETE` changed this table.
     Write(String),
+    /// `CREATE INDEX` or `DROP INDEX` changed the index list.
+    Index,
 }
 
 /// In-memory snapshot restored when a durable publish fails.
 pub(crate) enum Undo {
     /// Nothing was captured because the statement does not mutate storage.
     None,
-    /// Remove a table created by the statement.
-    Remove(String),
-    /// Put dropped tables back.
-    Restore(Vec<Table>),
-    /// Replace one table with the copy taken before the statement.
-    Replace(Table),
+    /// Remove a table created by the statement and restore the index list.
+    Remove {
+        /// Table created by the statement.
+        table: String,
+        /// Index list from before the statement.
+        indexes: Vec<IndexImage>,
+    },
+    /// Put dropped tables and the previous index list back.
+    Restore {
+        /// Tables removed by the statement.
+        tables: Vec<Table>,
+        /// Index list from before the statement.
+        indexes: Vec<IndexImage>,
+    },
+    /// Replace one table and restore the index list.
+    Replace {
+        /// Table from before the statement.
+        table: Table,
+        /// Index list from before the statement.
+        indexes: Vec<IndexImage>,
+    },
+    /// Restore the index list after `CREATE INDEX` or `DROP INDEX`.
+    Indexes(Vec<IndexImage>),
 }
 
 impl Database {
@@ -49,6 +69,7 @@ impl Database {
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
+            indexes: Vec::new(),
             store: None,
         }
     }
@@ -56,6 +77,7 @@ impl Database {
     /// Open a database file, creating it when the path is missing or empty.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
         let (store, images) = Store::open(path.as_ref())?;
+        let indexes = store.indexes();
         let mut tables = HashMap::with_capacity(images.len());
         for image in images {
             let table = Table::from_image(image)?;
@@ -67,12 +89,15 @@ impl Database {
         }
         Ok(Self {
             tables,
+            indexes,
             store: Some(store),
         })
     }
 
-    /// Rewrite a version 1 file as version 2. A version 2 file is left unchanged
-    /// and this returns an error.
+    /// Rewrite a version 1 file as version 2, or a version 2 file as version 3.
+    ///
+    /// A version 3 file is left unchanged and this returns an error. New
+    /// databases stay on version 2 until this is called.
     pub fn migrate(path: impl AsRef<Path>) -> Result<(), DbError> {
         Store::migrate(path.as_ref())
     }
@@ -88,7 +113,10 @@ impl Database {
     pub(crate) fn prepare_durable(&self, change: &DurableChange) -> Undo {
         match change {
             DurableChange::None => Undo::None,
-            DurableChange::Create(name) => Undo::Remove(name.clone()),
+            DurableChange::Create(name) => Undo::Remove {
+                table: name.clone(),
+                indexes: self.indexes.clone(),
+            },
             DurableChange::Drop(names) => {
                 let mut tables = Vec::with_capacity(names.len());
                 for name in names {
@@ -97,28 +125,41 @@ impl Database {
                     };
                     tables.push(table.clone());
                 }
-                Undo::Restore(tables)
+                Undo::Restore {
+                    tables,
+                    indexes: self.indexes.clone(),
+                }
             }
             DurableChange::Write(name) => match self.tables.get(name) {
-                Some(table) => Undo::Replace(table.clone()),
+                Some(table) => Undo::Replace {
+                    table: table.clone(),
+                    indexes: self.indexes.clone(),
+                },
                 None => Undo::None,
             },
+            DurableChange::Index => Undo::Indexes(self.indexes.clone()),
         }
     }
 
     pub(crate) fn rollback(&mut self, undo: Undo) {
         match undo {
             Undo::None => {}
-            Undo::Remove(name) => {
-                self.tables.remove(&name);
+            Undo::Remove { table, indexes } => {
+                self.tables.remove(&table);
+                self.indexes = indexes;
             }
-            Undo::Restore(tables) => {
+            Undo::Restore { tables, indexes } => {
                 for table in tables {
                     self.tables.insert(table.name().to_string(), table);
                 }
+                self.indexes = indexes;
             }
-            Undo::Replace(table) => {
+            Undo::Replace { table, indexes } => {
                 self.tables.insert(table.name().to_string(), table);
+                self.indexes = indexes;
+            }
+            Undo::Indexes(indexes) => {
+                self.indexes = indexes;
             }
         }
     }
@@ -128,7 +169,7 @@ impl Database {
         let Some(store) = self.store.as_mut() else {
             return Ok(());
         };
-        store.publish(&images)
+        store.publish_indexes(&images, &self.indexes)
     }
 
     pub(crate) fn create_table(
@@ -153,6 +194,62 @@ impl Database {
         for name in names {
             self.tables.remove(name);
         }
+        self.indexes
+            .retain(|index| !names.iter().any(|name| name == &index.table));
+        Ok(())
+    }
+
+    pub(crate) fn create_index(
+        &mut self,
+        name: String,
+        table: String,
+        column: String,
+    ) -> Result<(), DbError> {
+        let Some(store) = self.store.as_ref() else {
+            return Err(DbError::unsupported(
+                "CREATE INDEX requires a database file",
+            ));
+        };
+        if store.format_version() < 3 {
+            return Err(DbError::Storage(format!(
+                "database format version 2 requires an explicit migration: rustdb --migrate {}",
+                store.path().display()
+            )));
+        }
+        if self.indexes.iter().any(|index| index.name == name) {
+            return Err(DbError::invalid(format!("index '{name}' already exists")));
+        }
+        let schema = self.table(&table)?.schema();
+        let Some(position) = schema.index_of(&column) else {
+            return Err(DbError::ColumnNotFound { table, column });
+        };
+        let Some(definition) = schema.column(position) else {
+            return Err(DbError::ColumnNotFound { table, column });
+        };
+        if definition.data_type() != crate::value::DataType::Integer {
+            return Err(DbError::unsupported(format!(
+                "index column '{column}' must be INTEGER"
+            )));
+        }
+        self.indexes.push(IndexImage {
+            name,
+            table,
+            column,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn drop_indexes(&mut self, names: &[String]) -> Result<(), DbError> {
+        if self.store.is_none() {
+            return Err(DbError::unsupported("DROP INDEX requires a database file"));
+        }
+        for name in names {
+            if !self.indexes.iter().any(|index| index.name == *name) {
+                return Err(DbError::invalid(format!("index '{name}' does not exist")));
+            }
+        }
+        self.indexes
+            .retain(|index| !names.iter().any(|name| name == &index.name));
         Ok(())
     }
 
@@ -271,5 +368,103 @@ mod tests {
         };
         assert_eq!(query.rows, vec![vec![Value::Text("Ada".to_string())]]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "release profile of index maintenance"]
+    fn profile_index_maintenance() {
+        for size in [100_usize, 1_000] {
+            let plain = index_profile(size, false);
+            let indexed = index_profile(size, true);
+            println!(
+                "size={size} build_ms={:.1} plain_insert_us={} indexed_insert_us={} plain_update_us={} indexed_update_us={} plain_delete_us={} indexed_delete_us={} plain_bytes={} indexed_bytes={} select_rows={}",
+                indexed.build.as_secs_f64() * 1_000.0,
+                plain.insert.as_micros(),
+                indexed.insert.as_micros(),
+                plain.update.as_micros(),
+                indexed.update.as_micros(),
+                plain.delete.as_micros(),
+                indexed.delete.as_micros(),
+                plain.bytes,
+                indexed.bytes,
+                indexed.selected
+            );
+        }
+    }
+
+    struct IndexProfile {
+        build: std::time::Duration,
+        insert: std::time::Duration,
+        update: std::time::Duration,
+        delete: std::time::Duration,
+        bytes: u64,
+        selected: usize,
+    }
+
+    fn index_profile(size: usize, with_index: bool) -> IndexProfile {
+        let dir = std::env::temp_dir().join(format!(
+            "rustdb-index-profile-{}-{}-{}",
+            std::process::id(),
+            size,
+            with_index as u8
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db");
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE TABLE bench (id INT, age INT, email TEXT, note TEXT, active BOOLEAN);")
+            .unwrap();
+        for id in 1..=size {
+            database
+                .execute(&format!(
+                    "INSERT INTO bench VALUES ({id}, {age}, 'user{id}@example.com', 'note', TRUE);",
+                    age = id % 80
+                ))
+                .unwrap();
+        }
+        drop(database);
+        if with_index {
+            Database::migrate(&path).unwrap();
+        }
+        let mut database = Database::open(&path).unwrap();
+        let build_started = std::time::Instant::now();
+        if with_index {
+            database
+                .execute("CREATE INDEX idx_bench_age ON bench(age);")
+                .unwrap();
+        }
+        let build = build_started.elapsed();
+        let insert = std::time::Instant::now();
+        database
+            .execute(&format!(
+                "INSERT INTO bench VALUES ({}, 3, 'extra@example.com', 'note', FALSE);",
+                size + 1
+            ))
+            .unwrap();
+        let insert = insert.elapsed();
+        let update = std::time::Instant::now();
+        database
+            .execute("UPDATE bench SET age = 42 WHERE id = 1;")
+            .unwrap();
+        let update = update.elapsed();
+        let delete = std::time::Instant::now();
+        database.execute("DELETE FROM bench WHERE id = 1;").unwrap();
+        let delete = delete.elapsed();
+        let selected = database.execute("SELECT age FROM bench;").unwrap();
+        let crate::StatementResult::Query(query) = &selected[0] else {
+            panic!("expected a query");
+        };
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        drop(database);
+        let _ = std::fs::remove_dir_all(&dir);
+        IndexProfile {
+            build,
+            insert,
+            update,
+            delete,
+            bytes,
+            selected: query.rows.len(),
+        }
     }
 }

@@ -106,6 +106,40 @@ Editor apply includes the row compare. On the median sample the rest of the edit
 
 The fast sample spent 0.86 ms comparing rows. The other four spent 7.7–7.8 ms. A checkpoint clears the pager cache, so an update after that cache is gone re-reads every heap page while it compares every row. The open that precedes the first update leaves the cache warm, which is why one sample is much faster. The compare is O(N) in the number of rows even when one row changes. On a cold cache that work is real, and it is still smaller than the three syncs together. This run did not change the update algorithm.
 
+## Milestone 5 index measurements
+
+These numbers are from one release run on the same machine. They are not a claim that `SELECT` got faster. `SELECT` still scans the in-memory table. The indexed file was migrated to version 3 before `CREATE INDEX idx_bench_age ON bench(age)`. The plain file stayed version 2 and has no index. Each disk time is one sample and includes `fsync`.
+
+Reproduce the standalone tree with:
+
+```bash
+cargo test --release --lib storage::btree::tests::profile_standalone_tree -- --ignored --nocapture
+```
+
+The tree is an in-memory page store using the production fanout (254 leaf entries, 203 internal separators). Equality is the mean of one lookup per key. The range is the inclusive prefix from `0` through `count / 10`.
+
+| Keys | Height | Build | Equality | Range |
+| --- | --- | --- | --- | --- |
+| 100 | 1 | 181 µs | 778 ns | 1 µs, 11 rows |
+| 1,000 | 2 | 1,476 µs | 1,025 ns | 3 µs, 101 rows |
+| 10,000 | 2 | 15,170 µs | 842 ns | 10 µs, 1,001 rows |
+| 100,000 | 3 | 154,714 µs | 729 ns | 46 µs, 10,001 rows |
+
+Reproduce the file measurements with:
+
+```bash
+cargo test --release --lib database::tests::profile_index_maintenance -- --ignored --nocapture
+```
+
+The schema is `bench (id INT, age INT, email TEXT, note TEXT, active BOOLEAN)`. `N` rows are inserted before the timed statements. Build is `CREATE INDEX` on `age` for the migrated file, and an empty step for the plain file. The timed insert, update, and delete each change one row. The update sets `age` to 42, which is not the value that row already held. `select_rows` was `N` after the extra insert and the delete, which is the full remaining table.
+
+| N | Index build | Insert, plain | Insert, indexed | Update, plain | Update, indexed | Delete, plain | Delete, indexed | Bytes, plain | Bytes, indexed |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100 | 12.2 ms | 12,349 µs | 12,960 µs | 11,785 µs | 12,005 µs | 11,253 µs | 12,983 µs | 16,384 | 24,576 |
+| 1,000 | 17.3 ms | 11,938 µs | 12,303 µs | 13,244 µs | 16,128 µs | 12,029 µs | 12,873 µs | 90,112 | 122,880 |
+
+The extra bytes are 8,192 at 100 rows and 32,768 at 1,000 rows. The statement times are dominated by the three checkpoint syncs. They do not show a query improvement, because nothing in this run asked `SELECT` to walk the tree.
+
 ## Limitations
 
 - One machine and one load per size in each session. The five scan, update, and insert samples are repeats on that same file, so they share cache and allocator state.
@@ -115,3 +149,5 @@ The fast sample spent 0.86 ms comparing rows. The other four spent 7.7–7.8 ms.
 - The temporary directory is on the local system volume. The disk model was not identified separately from the Apple M5.
 - The Milestone 3 table and the Milestone 4 table were collected in different sessions. Comparing them describes the two runs. It is not a controlled before-and-after on one idle machine.
 - The example checks that each statement touches the expected number of rows, so a wrong result fails the run instead of reporting a time.
+- The Milestone 5 disk times are one sample each. The difference between a plain statement and an indexed statement is smaller than the spread of `fsync`, so it is not a stable overhead measurement.
+- The standalone tree times use an in-memory page map. They do not include the pager, the redo log, or `fsync`.

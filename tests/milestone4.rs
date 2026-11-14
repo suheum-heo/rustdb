@@ -135,9 +135,10 @@ fn migration_waits_behind_an_open_database() {
     let error = rustdb::Database::migrate(&path).unwrap_err();
     assert!(error.to_string().contains("is locked"), "{error}");
     drop(database);
+    rustdb::Database::migrate(&path).unwrap();
     let error = rustdb::Database::migrate(&path).unwrap_err();
     assert!(
-        error.to_string().contains("already format version 2"),
+        error.to_string().contains("already format version 3"),
         "{error}"
     );
     let _ = std::fs::remove_dir_all(&dir);

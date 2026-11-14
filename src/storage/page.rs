@@ -22,22 +22,26 @@ pub(crate) const TYPE_META: u16 = 1;
 pub(crate) const TYPE_CATALOG: u16 = 2;
 pub(crate) const TYPE_HEAP: u16 = 3;
 pub(crate) const TYPE_FREE: u16 = 4;
+pub(crate) const TYPE_INDEX_CATALOG: u16 = 5;
+pub(crate) const TYPE_INDEX_INTERNAL: u16 = 6;
+pub(crate) const TYPE_INDEX_LEAF: u16 = 7;
 
 pub(crate) const MAGIC: [u8; 8] = *b"RUSTDB\0\0";
 /// Version written by this process. Version 1 is readable only by migration.
 pub(crate) const FORMAT_VERSION: u32 = 2;
 
 pub(crate) const FORMAT_VERSION_V1: u32 = 1;
+pub(crate) const FORMAT_VERSION_V3: u32 = 3;
 
-const OFF_TYPE: usize = 0;
-const OFF_SLOTS: usize = 2;
-const OFF_ID: usize = 4;
-const OFF_CHECKSUM: usize = 8;
-const OFF_NEXT: usize = 12;
-const OFF_LOWER: usize = 16;
-const OFF_UPPER: usize = 18;
-const OFF_FLAGS: usize = 20;
-const OFF_RESERVED: usize = 22;
+pub(crate) const OFF_TYPE: usize = 0;
+pub(crate) const OFF_SLOTS: usize = 2;
+pub(crate) const OFF_ID: usize = 4;
+pub(crate) const OFF_CHECKSUM: usize = 8;
+pub(crate) const OFF_NEXT: usize = 12;
+pub(crate) const OFF_LOWER: usize = 16;
+pub(crate) const OFF_UPPER: usize = 18;
+pub(crate) const OFF_FLAGS: usize = 20;
+pub(crate) const OFF_RESERVED: usize = 22;
 
 const META_MAGIC: usize = 24;
 const META_VERSION: usize = 32;
@@ -52,6 +56,9 @@ const META_COMMIT_ID: usize = 64;
 const META_FREE_IDS: usize = 72;
 /// Table-id high-water mark. A version 2 writer reserves these four bytes.
 const META_NEXT_TABLE_ID: usize = PAGE_SIZE - 4;
+/// Index-catalog root. Version 3 reserves these four bytes, just before the
+/// table-id mark, so a version 3 meta page holds one fewer inline free id.
+const META_INDEX_ROOT: usize = PAGE_SIZE - 8;
 
 /// Free page ids stored directly in a version 1 meta page.
 pub(crate) const META_FREE_CAPACITY_V1: usize = (PAGE_SIZE - META_FREE_IDS_V1) / 4;
@@ -60,6 +67,28 @@ pub(crate) const META_FREE_CAPACITY_V1: usize = (PAGE_SIZE - META_FREE_IDS_V1) /
 /// are the table-id high-water mark, so this is one id smaller than the
 /// legacy tail.
 pub(crate) const META_FREE_CAPACITY: usize = (META_NEXT_TABLE_ID - META_FREE_IDS) / 4;
+
+/// Inline free ids on a version 3 meta page. Offset 4088 is the index catalog.
+pub(crate) const META_FREE_CAPACITY_V3: usize = (META_INDEX_ROOT - META_FREE_IDS) / 4;
+
+/// One redo-log commit cannot carry more frames than this.
+pub(crate) const MAX_COMMIT_FRAMES: usize = 8192;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_FRAME_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn commit_frame_limit() -> usize {
+    #[cfg(test)]
+    {
+        let custom = TEST_FRAME_CAP.with(std::cell::Cell::get);
+        if custom != 0 {
+            return custom;
+        }
+    }
+    MAX_COMMIT_FRAMES
+}
 
 /// Inline free ids a version 2 reader still accepts. A file written before the
 /// high-water mark used all 1006 slots, and those last four bytes are a page
@@ -102,6 +131,9 @@ pub(crate) struct Meta {
     /// record one, or a version 1 page. A writer stores this at the end of
     /// the meta page. A zero mark has no deleted-id history.
     pub next_table_id: u32,
+    /// Page id of the index catalog, or zero when the database has no indexes.
+    /// Version 1 and 2 pages report zero.
+    pub index_catalog_root: u32,
 }
 
 /// Why a cell could not be placed on this page.
@@ -136,7 +168,16 @@ const FREE_COUNT: usize = 24;
 const FREE_IDS: usize = 28;
 
 pub(crate) fn write_meta(page: &mut Page, meta: Meta, free_ids: &[u32]) -> Result<(), DbError> {
-    if free_ids.len() > META_FREE_CAPACITY {
+    let capacity = match meta.version {
+        FORMAT_VERSION => META_FREE_CAPACITY,
+        FORMAT_VERSION_V3 => META_FREE_CAPACITY_V3,
+        _ => {
+            return Err(DbError::Internal(
+                "meta page version is not writable".to_string(),
+            ));
+        }
+    };
+    if free_ids.len() > capacity {
         return Err(DbError::Internal(
             "meta page cannot store this many free page ids".to_string(),
         ));
@@ -146,7 +187,7 @@ pub(crate) fn write_meta(page: &mut Page, meta: Meta, free_ids: &[u32]) -> Resul
     bytes[META_MAGIC..META_MAGIC + MAGIC.len()].copy_from_slice(&MAGIC);
     if meta.nonce == 0 {
         return Err(DbError::Internal(
-            "version 2 database nonce must be non-zero".to_string(),
+            "database nonce must be non-zero".to_string(),
         ));
     }
     if meta.next_table_id == 0 {
@@ -154,7 +195,7 @@ pub(crate) fn write_meta(page: &mut Page, meta: Meta, free_ids: &[u32]) -> Resul
             "table id counter was not initialized".to_string(),
         ));
     }
-    write_u32(bytes, META_VERSION, FORMAT_VERSION);
+    write_u32(bytes, META_VERSION, meta.version);
     write_u32(bytes, META_PAGE_SIZE, PAGE_SIZE as u32);
     write_u32(bytes, META_PAGE_COUNT, meta.page_count);
     write_u32(bytes, META_CATALOG, meta.catalog_root);
@@ -169,6 +210,9 @@ pub(crate) fn write_meta(page: &mut Page, meta: Meta, free_ids: &[u32]) -> Resul
         write_u32(bytes, META_FREE_IDS + index * 4, id);
     }
     write_u32(bytes, META_NEXT_TABLE_ID, meta.next_table_id);
+    if meta.version == FORMAT_VERSION_V3 {
+        write_u32(bytes, META_INDEX_ROOT, meta.index_catalog_root);
+    }
     Ok(())
 }
 
@@ -184,7 +228,7 @@ pub(crate) fn read_meta(page: &Page) -> Result<Meta, DbError> {
         return Err(DbError::Storage("invalid database header".to_string()));
     }
     let version = read_u32(bytes, META_VERSION);
-    if version != FORMAT_VERSION && version != FORMAT_VERSION_V1 {
+    if version != FORMAT_VERSION && version != FORMAT_VERSION_V1 && version != FORMAT_VERSION_V3 {
         return Err(DbError::Storage(format!(
             "unsupported database format version {version}"
         )));
@@ -196,26 +240,40 @@ pub(crate) fn read_meta(page: &Page) -> Result<Meta, DbError> {
     if page_count < 2 {
         return Err(DbError::Storage("invalid database header".to_string()));
     }
-    let (nonce, commit_id, next_table_id, capacity) = if version == FORMAT_VERSION_V1 {
-        (0, 0, 0, META_FREE_CAPACITY_V1)
-    } else {
-        let nonce = read_u64(bytes, META_NONCE);
-        if nonce == 0 {
-            return Err(corrupt(0));
-        }
-        let free_count = read_u32(bytes, META_FREE_COUNT) as usize;
-        let next_table_id = if free_count >= META_FREE_CAPACITY_LEGACY {
-            0
+    let (nonce, commit_id, next_table_id, index_catalog_root, capacity) =
+        if version == FORMAT_VERSION_V1 {
+            (0, 0, 0, 0, META_FREE_CAPACITY_V1)
+        } else if version == FORMAT_VERSION_V3 {
+            let nonce = read_u64(bytes, META_NONCE);
+            if nonce == 0 {
+                return Err(corrupt(0));
+            }
+            (
+                nonce,
+                read_u64(bytes, META_COMMIT_ID),
+                read_u32(bytes, META_NEXT_TABLE_ID),
+                read_u32(bytes, META_INDEX_ROOT),
+                META_FREE_CAPACITY_V3,
+            )
         } else {
-            read_u32(bytes, META_NEXT_TABLE_ID)
+            let nonce = read_u64(bytes, META_NONCE);
+            if nonce == 0 {
+                return Err(corrupt(0));
+            }
+            let free_count = read_u32(bytes, META_FREE_COUNT) as usize;
+            let next_table_id = if free_count >= META_FREE_CAPACITY_LEGACY {
+                0
+            } else {
+                read_u32(bytes, META_NEXT_TABLE_ID)
+            };
+            (
+                nonce,
+                read_u64(bytes, META_COMMIT_ID),
+                next_table_id,
+                0,
+                META_FREE_CAPACITY_LEGACY,
+            )
         };
-        (
-            nonce,
-            read_u64(bytes, META_COMMIT_ID),
-            next_table_id,
-            META_FREE_CAPACITY_LEGACY,
-        )
-    };
     let free_count = read_u32(bytes, META_FREE_COUNT) as usize;
     if free_count > capacity {
         return Err(corrupt(0));
@@ -228,6 +286,7 @@ pub(crate) fn read_meta(page: &Page) -> Result<Meta, DbError> {
         nonce,
         commit_id,
         next_table_id,
+        index_catalog_root,
     })
 }
 
@@ -238,6 +297,7 @@ pub(crate) fn inline_free_ids(page: &Page) -> Result<Vec<u32>, DbError> {
     let (start, capacity) = match version {
         FORMAT_VERSION_V1 => (META_FREE_IDS_V1, META_FREE_CAPACITY_V1),
         FORMAT_VERSION => (META_FREE_IDS, META_FREE_CAPACITY_LEGACY),
+        FORMAT_VERSION_V3 => (META_FREE_IDS, META_FREE_CAPACITY_V3),
         _ => return Err(corrupt(0)),
     };
     let count = read_u32(bytes, META_FREE_COUNT) as usize;
@@ -477,11 +537,46 @@ pub(crate) fn verify(page: &Page, expected_id: u32) -> Result<(), DbError> {
         return Err(corrupt(expected_id));
     }
     let page_type = read_u16(bytes, OFF_TYPE);
-    if !matches!(page_type, TYPE_META | TYPE_CATALOG | TYPE_HEAP | TYPE_FREE) {
+    if !matches!(
+        page_type,
+        TYPE_META
+            | TYPE_CATALOG
+            | TYPE_HEAP
+            | TYPE_FREE
+            | TYPE_INDEX_CATALOG
+            | TYPE_INDEX_INTERNAL
+            | TYPE_INDEX_LEAF
+    ) {
         return Err(corrupt(expected_id));
     }
-    if matches!(page_type, TYPE_CATALOG | TYPE_HEAP) {
+    if matches!(page_type, TYPE_CATALOG | TYPE_HEAP | TYPE_INDEX_CATALOG) {
         verify_slotted(bytes, expected_id)?;
+    }
+    if matches!(page_type, TYPE_INDEX_INTERNAL | TYPE_INDEX_LEAF) {
+        verify_index_node(bytes, expected_id, page_type)?;
+    }
+    Ok(())
+}
+
+fn verify_index_node(bytes: &[u8], page_id: u32, page_type: u16) -> Result<(), DbError> {
+    if read_u16(bytes, OFF_SLOTS) != 0
+        || read_u16(bytes, OFF_LOWER) != HEADER_LEN as u16
+        || read_u16(bytes, OFF_UPPER) != HEADER_LEN as u16
+        || read_u16(bytes, HEADER_LEN + 2) != 0
+    {
+        return Err(corrupt(page_id));
+    }
+    let count = usize::from(read_u16(bytes, HEADER_LEN));
+    if page_type == TYPE_INDEX_LEAF {
+        if count == 0 || count > 254 || page_id == 0 {
+            return Err(corrupt(page_id));
+        }
+    } else if count == 0
+        || count > 203
+        || read_u32(bytes, OFF_NEXT) != 0
+        || read_u32(bytes, PAGE_SIZE - 4) != 0
+    {
+        return Err(corrupt(page_id));
     }
     Ok(())
 }
@@ -722,6 +817,7 @@ mod tests {
                 nonce: 1,
                 commit_id: 0,
                 next_table_id: 1,
+                index_catalog_root: 0,
             },
             &[],
         )
@@ -748,6 +844,7 @@ mod tests {
                 nonce: 1,
                 commit_id: 0,
                 next_table_id: 9,
+                index_catalog_root: 0,
             },
             &[],
         )

@@ -345,6 +345,87 @@ fn data_type(code: u8) -> Result<DataType, DbError> {
     }
 }
 
+/// One index definition stored in the index catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexCatalog {
+    pub name: String,
+    pub table_id: u32,
+    pub ordinal: u16,
+    pub column: String,
+    pub root: u32,
+}
+
+const INDEX_KEY_INTEGER: u8 = 1;
+const INDEX_FORMAT: u16 = 1;
+
+pub(crate) fn encode_index(entry: &IndexCatalog) -> Result<Vec<u8>, DbError> {
+    let name = entry.name.as_bytes();
+    let column = entry.column.as_bytes();
+    let name_len =
+        u16::try_from(name.len()).map_err(|_| DbError::invalid("index name is too long"))?;
+    let column_len =
+        u16::try_from(column.len()).map_err(|_| DbError::invalid("column name is too long"))?;
+    let mut bytes = Vec::with_capacity(2 + name.len() + 4 + 2 + 2 + column.len() + 4 + 1 + 2);
+    bytes.extend(name_len.to_le_bytes());
+    bytes.extend(name);
+    bytes.extend(entry.table_id.to_le_bytes());
+    bytes.extend(entry.ordinal.to_le_bytes());
+    bytes.extend(column_len.to_le_bytes());
+    bytes.extend(column);
+    bytes.extend(entry.root.to_le_bytes());
+    bytes.push(INDEX_KEY_INTEGER);
+    bytes.extend(INDEX_FORMAT.to_le_bytes());
+    if bytes.len() > MAX_RECORD_LEN {
+        return Err(DbError::Storage(format!(
+            "index definition exceeds the maximum record size of {MAX_RECORD_LEN} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_index(bytes: &[u8]) -> Result<IndexCatalog, DbError> {
+    if bytes.len() < 2 {
+        return Err(corrupt_file());
+    }
+    let name_len = u16::from_le_bytes(copy_array(bytes, 0)?) as usize;
+    let name_end = 2usize.checked_add(name_len).ok_or_else(corrupt_file)?;
+    if bytes.len() < name_end + 4 + 2 + 2 {
+        return Err(corrupt_file());
+    }
+    let name = std::str::from_utf8(&bytes[2..name_end])
+        .map_err(|_| corrupt_file())?
+        .to_string();
+    let table_id = u32::from_le_bytes(copy_array(bytes, name_end)?);
+    let ordinal = u16::from_le_bytes(copy_array(bytes, name_end + 4)?);
+    let column_len_at = name_end + 6;
+    let column_len = u16::from_le_bytes(copy_array(bytes, column_len_at)?) as usize;
+    let column_at = column_len_at + 2;
+    let column_end = column_at.checked_add(column_len).ok_or_else(corrupt_file)?;
+    let tail = column_end.checked_add(4 + 1 + 2).ok_or_else(corrupt_file)?;
+    if bytes.len() != tail {
+        return Err(corrupt_file());
+    }
+    let column = std::str::from_utf8(&bytes[column_at..column_end])
+        .map_err(|_| corrupt_file())?
+        .to_string();
+    let root = u32::from_le_bytes(copy_array(bytes, column_end)?);
+    let key_type = bytes[column_end + 4];
+    let format = u16::from_le_bytes(copy_array(bytes, column_end + 5)?);
+    if key_type != INDEX_KEY_INTEGER || format != INDEX_FORMAT {
+        return Err(DbError::Storage("unsupported index format".to_string()));
+    }
+    if name.is_empty() || column.is_empty() || table_id == 0 {
+        return Err(corrupt_file());
+    }
+    Ok(IndexCatalog {
+        name,
+        table_id,
+        ordinal,
+        column,
+        root,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
