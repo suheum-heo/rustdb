@@ -153,7 +153,6 @@ pub(crate) fn delete(
 }
 
 /// Row ids for one integer key, in row-id order.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn find_equal(store: &mut dyn Nodes, root: u32, key: i64) -> Result<Vec<u64>, DbError> {
     let mut out = Vec::new();
     if root == 0 {
@@ -166,14 +165,17 @@ pub(crate) fn find_equal(store: &mut dyn Nodes, root: u32, key: i64) -> Result<V
             return Err(corrupt(leaf_id));
         }
         let leaf = decode_leaf(&store.read_node(leaf_id)?)?;
+        require_strict_order(&leaf, leaf_id)?;
+        let mut passed = false;
         for entry in &leaf.entries {
             if entry.0 == key {
                 out.push(entry.1);
-            } else if entry.0 > key && !out.is_empty() {
-                return Ok(out);
+            } else if entry.0 > key {
+                passed = true;
+                break;
             }
         }
-        if leaf.right == 0 {
+        if passed || leaf.right == 0 {
             break;
         }
         leaf_id = leaf.right;
@@ -182,7 +184,6 @@ pub(crate) fn find_equal(store: &mut dyn Nodes, root: u32, key: i64) -> Result<V
 }
 
 /// Inclusive integer range in key order, then row id.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn find_range(
     store: &mut dyn Nodes,
     root: u32,
@@ -193,36 +194,59 @@ pub(crate) fn find_range(
     if root == 0 {
         return Ok(out);
     }
-    let start = match low {
-        Some(key) => (key, 0),
-        None => leftmost(store, root)?,
-    };
     let mut leaf_id = match low {
         Some(key) => find_leaf(store, root, (key, 0))?,
         None => leftmost_leaf(store, root)?,
     };
-    let _ = start;
     let mut seen = HashSet::new();
     loop {
         if !seen.insert(leaf_id) {
             return Err(corrupt(leaf_id));
         }
         let leaf = decode_leaf(&store.read_node(leaf_id)?)?;
+        require_strict_order(&leaf, leaf_id)?;
+        let mut passed = false;
         for entry in &leaf.entries {
             if low.is_some_and(|key| entry.0 < key) {
                 continue;
             }
             if high.is_some_and(|key| entry.0 > key) {
-                return Ok(out);
+                passed = true;
+                break;
             }
             out.push(*entry);
         }
-        if leaf.right == 0 {
+        if passed || leaf.right == 0 {
             break;
         }
         leaf_id = leaf.right;
     }
     Ok(out)
+}
+
+/// Minimum and maximum integer keys, or `None` when the tree is empty.
+///
+/// The two lookups follow the edges of the tree. A leaf that is not strictly
+/// ordered is corrupt. This does not count entries or assume how they are
+/// distributed.
+pub(crate) fn stored_key_span(
+    store: &mut dyn Nodes,
+    root: u32,
+) -> Result<Option<(i64, i64)>, DbError> {
+    if root == 0 {
+        return Ok(None);
+    }
+    let min = leftmost(store, root)?.0;
+    let leaf_id = rightmost_leaf(store, root)?;
+    let leaf = decode_leaf(&store.read_node(leaf_id)?)?;
+    require_strict_order(&leaf, leaf_id)?;
+    let Some(max) = leaf.entries.last().map(|entry| entry.0) else {
+        return Err(corrupt(leaf_id));
+    };
+    if min > max {
+        return Err(corrupt(leaf_id));
+    }
+    Ok(Some((min, max)))
 }
 
 /// Every pair in ascending order.
@@ -750,7 +774,6 @@ fn find_leaf(store: &mut dyn Nodes, root: u32, probe: Entry) -> Result<u32, DbEr
     Err(corrupt(root))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rightmost_leaf(store: &mut dyn Nodes, root: u32) -> Result<u32, DbError> {
     let mut id = root;
     for _ in 0..64 {
@@ -774,6 +797,19 @@ fn leftmost_leaf(store: &mut dyn Nodes, root: u32) -> Result<u32, DbError> {
         id = decode_internal(&page)?.children[0];
     }
     Err(corrupt(root))
+}
+
+fn require_strict_order(leaf: &Leaf, leaf_id: u32) -> Result<(), DbError> {
+    let mut previous = None;
+    for entry in &leaf.entries {
+        if let Some(prev) = previous
+            && cmp_entry(*entry, prev) != Ordering::Greater
+        {
+            return Err(corrupt(leaf_id));
+        }
+        previous = Some(*entry);
+    }
+    Ok(())
 }
 
 fn leftmost(store: &mut dyn Nodes, root: u32) -> Result<Entry, DbError> {
@@ -936,6 +972,33 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 
 fn read_i64(bytes: &[u8], offset: usize) -> i64 {
     i64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("i64"))
+}
+
+/// Change one leaf slot in a cached page. The page is not resealed.
+#[cfg(test)]
+pub(crate) fn patch_leaf_entry(
+    page: &mut Page,
+    slot: usize,
+    key: Option<i64>,
+    row_id: Option<u64>,
+) -> Result<(), DbError> {
+    let id = read_u32(page.as_slice(), OFF_ID);
+    if read_u16(page.as_slice(), OFF_TYPE) != TYPE_INDEX_LEAF {
+        return Err(corrupt(id));
+    }
+    let count = usize::from(read_u16(page.as_slice(), LEAF_COUNT));
+    if slot >= count {
+        return Err(corrupt(id));
+    }
+    let offset = LEAF_BODY + slot * ENTRY_LEN;
+    let bytes = page.as_mut_slice();
+    if let Some(key) = key {
+        write_i64(bytes, offset, key);
+    }
+    if let Some(row_id) = row_id {
+        write_u64(bytes, offset + 8, row_id);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

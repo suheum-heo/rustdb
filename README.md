@@ -13,6 +13,7 @@ SQL text
   -> sqlparser
   -> internal statement tree (parser)
   -> expression binder (expr)
+  -> access path (plan)
   -> executor
   -> in-memory catalog
   -> dirty pages, redo log, then checkpoint (file mode)
@@ -29,7 +30,8 @@ SQL text
 | `ast` | Statements and expressions the executor understands |
 | `parser` | `sqlparser` boundary and identifier normalization |
 | `expr` | Bind columns, check types, and evaluate three-valued logic |
-| `executor` | `CREATE`, `DROP`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, and integer indexes |
+| `plan` | Choose a sequential scan or one integer index scan |
+| `executor` | `CREATE`, `DROP`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `EXPLAIN`, and integer indexes |
 | `format` | ASCII result tables |
 | `repl` | Interactive session |
 | `error` | Parse, schema, type, and storage errors |
@@ -46,7 +48,7 @@ Unquoted identifiers are folded to lowercase. Quoted identifiers keep their case
 
 A query keeps a row only when `WHERE` evaluates to TRUE. FALSE and UNKNOWN both drop the row.
 
-`SELECT` then sorts, then applies `LIMIT`, then projects. `ORDER BY` can name a column that is absent from the select list. The sort is stable, so equal keys stay in insertion order. `SELECT` does not rewrite the file.
+`SELECT` then sorts, then applies `LIMIT`, then projects. `ORDER BY` can name a column that is absent from the select list. The sort is stable, so equal keys stay in insertion order. When the filter is an equality or a bounded range on one indexed `INTEGER` column, file mode reads candidate row ids from that B+ tree and then evaluates the original `WHERE`. Candidates are put back into insertion order before that filter, so a query without `ORDER BY` stays in insertion order. `SELECT` does not rewrite the file.
 
 ## Durability
 
@@ -108,6 +110,7 @@ SELECT * FROM table_name [WHERE condition]
     [LIMIT count];
 SELECT column_name [, column_name, ...] FROM table_name [WHERE condition]
     [ORDER BY ...] [LIMIT count];
+EXPLAIN SELECT ...;
 ```
 
 Types:
@@ -179,7 +182,13 @@ DROP INDEX idx_users_age;
 
 An index names one `INTEGER` column. Duplicate keys are stored. `NULL` is left out of the tree. The index name is separate from table names, so an index may share a name with a table. `CREATE INDEX` reads the rows already in the table and builds the tree in that statement's commit. Later `INSERT`, `UPDATE`, and `DELETE` statements update every index on the table in the same commit as the heap. `DROP TABLE` removes the table's indexes. `UNIQUE`, more than one column, `DESC`, and `IF NOT EXISTS` are rejected.
 
-`SELECT` does not consult the index. A filter still scans the in-memory table. An in-memory database has no file to store the tree, so `CREATE INDEX` and `DROP INDEX` fail there. A version 2 file must be migrated before `CREATE INDEX`.
+`SELECT` uses an index for `column = integer`, `column < integer`, `column <= integer`, `column > integer`, `column >= integer`, and the same shapes with the integer on the left. An `AND` of those comparisons on one indexed column is one range. The scan bounds are inclusive: `age < 25` is `age <= 24`, and `25 < age` is `age >= 26`. The original `WHERE` still runs on each candidate, so an extra predicate such as `name = 'Ada'` is applied after the index lookup. `EXPLAIN SELECT` prints the path the query will use. It reads an index's minimum and maximum key when a range needs that fact, and it does not read the matching rows or estimate a cost.
+
+A range that includes every `i64` value, such as `age >= -9223372036854775808`, is a sequential scan. A range that includes every key currently stored in the index is also a sequential scan. `age >= 0` is one of those ranges only when every stored key is at least 0. The `INTEGER` type does not imply that. Equality stays an index lookup. A one-sided range that still excludes some stored key, such as `age >= 50` when smaller keys exist, stays an index scan. There is no histogram and no assumption that keys are spread uniformly.
+
+`OR`, `IS NULL`, `IS NOT NULL`, `!=`, and a predicate that contains `OR` anywhere stay a sequential scan. So does a column with no index, a non-integer comparison, and an in-memory database. `UPDATE` and `DELETE` also scan. If several indexes could apply, an equality is chosen over a range, and otherwise the earliest index in catalog order is used. There is no cost model.
+
+Opening a file checks the whole index: order, siblings, separators, and that every non-NULL heap integer has its leaf entry. A query checks the entries it reads. A missing row id, a duplicate row id, a key that disagrees with the heap, an unsorted visited leaf, or a page that cannot be decoded fails the statement. The query does not repeat the open-time audit, so an entry the scan does not visit is not rechecked until the next open. An in-memory database has no file to store the tree, so `CREATE INDEX` and `DROP INDEX` fail there. A version 2 file must be migrated before `CREATE INDEX`.
 
 ## Example
 
@@ -272,7 +281,7 @@ rustdb> exit
 - No `UPDATE` or `DELETE` with `ORDER BY`, `LIMIT`, `RETURNING`, or a second table.
 - No `OFFSET`, `FETCH`, `LIMIT ALL`, or `ORDER BY` expressions.
 - No transactions beyond a single statement. A multi-statement string is not atomic.
-- Integer indexes are stored, and `SELECT` still scans the in-memory table. A filter does not become an index lookup.
+- `SELECT` can use one single-column integer index for an equality or a range that does not cover every stored key. A range over every `i64`, or over every key in the index, scans the table. `OR`, `IS NULL`, `IS NOT NULL`, `!=`, and any predicate that contains `OR` scan the table. `UPDATE` and `DELETE` scan the table. There is no cost-based optimizer, histogram, composite index, or join. A range such as `age >= 50` can still be slower than a table scan when it matches a large share of the rows.
 - Integer type names are aliases of `i64`. `SMALLINT` does not reject values outside the 16-bit range.
 - Floating-point literals and function calls are rejected.
 - The REPL is single-threaded. Prompts are always printed, including when input is piped.
@@ -280,4 +289,4 @@ rustdb> exit
 
 ## Next milestone
 
-Milestone 6 should teach `SELECT` to choose an integer index for an equality or range filter. The trees and the maintenance path are already on disk. Planning is the missing piece, and until it lands a query time is still the in-memory scan.
+Milestone 7 should add a nested-loop `INNER JOIN`. The inner side can reuse the index scan from Milestone 6 when its predicate is an equality or a range on one indexed integer column. Aggregates, composite indexes, and a cost-based optimizer are still out of scope.

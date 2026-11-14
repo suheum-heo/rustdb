@@ -1,6 +1,6 @@
 # Milestone 5 design: persistent B+ tree indexes
 
-The implementation on `feat/milestone-5` follows this design. `SELECT` still scans the in-memory table. Choosing an index during planning is Milestone 6.
+The implementation on `feat/milestone-5` follows this design. Milestone 6 later plans `SELECT` against these trees. This document describes the storage work, when `SELECT` still scanned memory.
 
 One correction while implementing: an in-memory database rejects `CREATE INDEX` and `DROP INDEX` instead of keeping a second maintenance path. The tree lives in the page file. New files stay version 2 until `rustdb --migrate PATH`. A version 2 `CREATE INDEX` fails before any log write and names that command. Version 2 to version 3 migration copies the nonce and commit id, spills inline free ids that occupied offsets 4088 and 4092, and writes no redo log.
 

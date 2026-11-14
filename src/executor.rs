@@ -6,20 +6,25 @@
 //! database publishes that result only after the statement succeeds.
 //!
 //! `SELECT` applies `WHERE`, then `ORDER BY`, then `LIMIT`, then projection.
-//! Sort keys may name columns that are not in the select list. Equal keys keep
-//! insertion order because the sort is stable. NULL is greater than every
-//! non-NULL value unless the query overrides that with `NULLS FIRST` or
-//! `NULLS LAST`.
+//! An indexed integer comparison may supply candidate rows first. The original
+//! `WHERE` is still applied to those candidates. Sort keys may name columns
+//! that are not in the select list. Equal keys keep insertion order because
+//! the sort is stable. NULL is greater than every non-NULL value unless the
+//! query overrides that with `NULLS FIRST` or `NULLS LAST`. `UPDATE` and
+//! `DELETE` still read every row.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use crate::ast::{Assignment, Expr, OrderKey, Projection, Statement};
 use crate::database::{Database, DurableChange};
 use crate::error::DbError;
 use crate::expr::{self, BoundExpr};
 use crate::parser;
+use crate::plan::{self, AccessPath};
+use crate::storage::IndexImage;
 use crate::table::Table;
-use crate::value::Value;
+use crate::value::{DataType, Value};
 
 /// The outcome of one statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +70,13 @@ struct SortKey {
     index: usize,
     ascending: bool,
     nulls_first: bool,
+}
+
+struct PreparedSelect {
+    output_indexes: Vec<usize>,
+    filter: Option<BoundExpr>,
+    sort_keys: Vec<SortKey>,
+    path: AccessPath,
 }
 
 impl Database {
@@ -153,30 +165,47 @@ impl Database {
                 order_by,
                 limit,
             } => self.query(&table, &projection, selection.as_ref(), &order_by, limit),
+            Statement::Explain(inner) => self.explain(inner.as_ref()),
         }
     }
 
     fn query(
-        &self,
+        &mut self,
         table_name: &str,
         projection: &Projection,
         selection: Option<&Expr>,
         order_by: &[OrderKey],
         limit: Option<u64>,
     ) -> Result<StatementResult, DbError> {
-        let table = self.table(table_name)?;
-        let output_indexes = output_columns(table, projection)?;
-        let filter = bind_optional_where(selection, table)?;
-        let sort_keys = bind_order(table, order_by)?;
+        let mut prepared = self.prepare_select(table_name, projection, selection, order_by)?;
+        prepared.path = self.settle_path(prepared.path)?;
+        let positions = match &prepared.path {
+            AccessPath::SeqScan => None,
+            AccessPath::IndexScan { .. } => Some(self.index_positions(table_name, &prepared.path)?),
+        };
 
+        let table = self.table(table_name)?;
         let mut rows: Vec<&[Value]> = Vec::new();
-        for row in table.rows() {
-            if expr::row_matches(filter.as_ref(), row)? {
-                rows.push(row.as_slice());
+        if let Some(positions) = positions {
+            for position in positions {
+                let Some(row) = table.rows().get(position) else {
+                    return Err(DbError::Internal(format!(
+                        "index position {position} is outside table '{table_name}'"
+                    )));
+                };
+                if expr::row_matches(prepared.filter.as_ref(), row)? {
+                    rows.push(row.as_slice());
+                }
+            }
+        } else {
+            for row in table.rows() {
+                if expr::row_matches(prepared.filter.as_ref(), row)? {
+                    rows.push(row.as_slice());
+                }
             }
         }
-        if !sort_keys.is_empty() {
-            rows.sort_by(|left, right| compare_rows(left, right, &sort_keys));
+        if !prepared.sort_keys.is_empty() {
+            rows.sort_by(|left, right| compare_rows(left, right, &prepared.sort_keys));
         }
         if let Some(limit) = limit {
             let limit = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -187,13 +216,154 @@ impl Database {
 
         let mut projected = Vec::with_capacity(rows.len());
         for row in rows {
-            projected.push(project_row(row, &output_indexes)?);
+            projected.push(project_row(row, &prepared.output_indexes)?);
         }
-        let columns = column_names(table, &output_indexes)?;
+        let columns = column_names(table, &prepared.output_indexes)?;
         Ok(StatementResult::Query(QueryResult {
             columns,
             rows: projected,
         }))
+    }
+
+    fn explain(&mut self, statement: &Statement) -> Result<StatementResult, DbError> {
+        let Statement::Select {
+            table,
+            projection,
+            selection,
+            order_by,
+            ..
+        } = statement
+        else {
+            return Err(DbError::unsupported("EXPLAIN is only supported for SELECT"));
+        };
+        let mut prepared = self.prepare_select(table, projection, selection.as_ref(), order_by)?;
+        prepared.path = self.settle_path(prepared.path)?;
+        let (access, index, bounds) = plan::describe(&prepared.path);
+        Ok(StatementResult::Query(QueryResult {
+            columns: vec![
+                "access".to_string(),
+                "index".to_string(),
+                "bounds".to_string(),
+            ],
+            rows: vec![vec![access, index, bounds]],
+        }))
+    }
+
+    fn prepare_select(
+        &self,
+        table_name: &str,
+        projection: &Projection,
+        selection: Option<&Expr>,
+        order_by: &[OrderKey],
+    ) -> Result<PreparedSelect, DbError> {
+        let indexes = self.index_images().to_vec();
+        let table = self.table(table_name)?;
+        let output_indexes = output_columns(table, projection)?;
+        let filter = bind_optional_where(selection, table)?;
+        let sort_keys = bind_order(table, order_by)?;
+        let choices = index_choices(table, &indexes)?;
+        let path = plan::choose(table_name, selection, &choices);
+        Ok(PreparedSelect {
+            output_indexes,
+            filter,
+            sort_keys,
+            path,
+        })
+    }
+
+    /// Keep an index range only when it might skip stored keys.
+    ///
+    /// Equality stays an index lookup. A range that includes every `i64`, or
+    /// every key stored in that index, is a sequential scan: the tree would
+    /// return every indexed row and the executor would sort those rows back
+    /// into insertion order. A corrupt edge page is returned as an error.
+    /// The sequential choice is not a fallback after a failed lookup.
+    fn settle_path(&mut self, path: AccessPath) -> Result<AccessPath, DbError> {
+        let AccessPath::IndexScan {
+            name,
+            column,
+            ordinal,
+            bounds,
+        } = path
+        else {
+            return Ok(AccessPath::SeqScan);
+        };
+        if plan::range_covers_every_i64(bounds) {
+            return Ok(AccessPath::SeqScan);
+        }
+        if matches!(bounds, plan::Bounds::Range { .. }) {
+            let span = self.index_key_span(&name)?;
+            if plan::range_covers_stored_keys(bounds, span) {
+                return Ok(AccessPath::SeqScan);
+            }
+        }
+        Ok(AccessPath::IndexScan {
+            name,
+            column,
+            ordinal,
+            bounds,
+        })
+    }
+
+    fn index_positions(
+        &mut self,
+        table_name: &str,
+        path: &AccessPath,
+    ) -> Result<Vec<usize>, DbError> {
+        let AccessPath::IndexScan {
+            name,
+            ordinal,
+            bounds,
+            ..
+        } = path
+        else {
+            return Err(DbError::Internal(
+                "sequential scan has no index positions".to_string(),
+            ));
+        };
+        if matches!(bounds, plan::Bounds::Empty) {
+            return Ok(Vec::new());
+        }
+        let ordinal = *ordinal;
+        let index_name = name.clone();
+        let (equal, low, high) = match *bounds {
+            plan::Bounds::Empty => (None, None, None),
+            plan::Bounds::Equal(key) => (Some(key), None, None),
+            plan::Bounds::Range { low, high } => (None, low, high),
+        };
+        let (root, entries) = self.read_indexed_keys(&index_name, equal, low, high)?;
+
+        let table = self.table(table_name)?;
+        if root == 0 {
+            let stored = table
+                .rows()
+                .iter()
+                .any(|row| matches!(row.get(ordinal), Some(Value::Integer(_))));
+            if stored {
+                return Err(corrupt_index(&index_name));
+            }
+            return Ok(Vec::new());
+        }
+
+        let mut positions = Vec::with_capacity(entries.len());
+        let mut seen = HashSet::with_capacity(entries.len());
+        for (key, row_id) in entries {
+            if !seen.insert(row_id) {
+                return Err(corrupt_index(&index_name));
+            }
+            let Some(position) = table.position(row_id) else {
+                return Err(corrupt_index(&index_name));
+            };
+            if table.row_id_at(position) != Some(row_id) {
+                return Err(corrupt_index(&index_name));
+            }
+            match table.rows().get(position).and_then(|row| row.get(ordinal)) {
+                Some(Value::Integer(stored)) if *stored == key => positions.push(position),
+                _ => return Err(corrupt_index(&index_name)),
+            }
+        }
+        positions.sort_unstable();
+        Ok(positions)
     }
 
     fn update(
@@ -254,8 +424,38 @@ fn durable_change(statement: &Statement) -> DurableChange {
         | Statement::Update { table, .. }
         | Statement::Delete { table, .. } => DurableChange::Write(table.clone()),
         Statement::CreateIndex { .. } | Statement::DropIndex { .. } => DurableChange::Index,
-        Statement::Select { .. } => DurableChange::None,
+        Statement::Select { .. } | Statement::Explain(_) => DurableChange::None,
     }
+}
+
+fn index_choices(table: &Table, indexes: &[IndexImage]) -> Result<Vec<plan::IndexChoice>, DbError> {
+    let mut choices = Vec::new();
+    for index in indexes {
+        if index.table != table.name() {
+            continue;
+        }
+        let Some(ordinal) = table.schema().index_of(&index.column) else {
+            return Err(corrupt_index(&index.name));
+        };
+        let Some(column) = table.schema().column(ordinal) else {
+            return Err(corrupt_index(&index.name));
+        };
+        if column.data_type() != DataType::Integer {
+            return Err(corrupt_index(&index.name));
+        }
+        choices.push(plan::IndexChoice {
+            name: index.name.clone(),
+            column: index.column.clone(),
+            ordinal,
+        });
+    }
+    Ok(choices)
+}
+
+fn corrupt_index(name: &str) -> DbError {
+    DbError::Storage(format!(
+        "database file is corrupt: index '{name}' does not match its table"
+    ))
 }
 
 fn bind_optional_where(

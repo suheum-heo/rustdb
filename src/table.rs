@@ -4,6 +4,11 @@
 //! store publishes those rows into slotted heap pages after the statement
 //! succeeds. Each row has an id assigned at insert time. `UPDATE` keeps ids
 //! by position, and `DELETE` keeps the ids of the surviving rows.
+//!
+//! `positions` maps those stable ids to the current vector slot. It is rebuilt
+//! when `DELETE` compacts the vector. It is not written to the file.
+
+use std::collections::HashMap;
 
 use crate::error::DbError;
 use crate::schema::{Column, Schema};
@@ -17,6 +22,8 @@ pub(crate) struct Table {
     schema: Schema,
     rows: Vec<Vec<Value>>,
     row_ids: Vec<u64>,
+    /// Average O(1) lookup from a stable row id to its current vector slot.
+    positions: HashMap<u64, usize>,
     next_row_id: u64,
 }
 
@@ -31,6 +38,7 @@ impl Table {
             schema,
             rows: Vec::new(),
             row_ids: Vec::new(),
+            positions: HashMap::new(),
             next_row_id: 1,
         })
     }
@@ -45,6 +53,18 @@ impl Table {
 
     pub(crate) fn rows(&self) -> &[Vec<Value>] {
         &self.rows
+    }
+
+    /// Current vector slot for a stable row id.
+    ///
+    /// `None` means the id is not in this table. A slot from before a `DELETE`
+    /// is not reused for a different id: compaction rebuilds the map.
+    pub(crate) fn position(&self, row_id: u64) -> Option<usize> {
+        self.positions.get(&row_id).copied()
+    }
+
+    pub(crate) fn row_id_at(&self, position: usize) -> Option<u64> {
+        self.row_ids.get(position).copied()
     }
 
     /// Validate every row, then append them.
@@ -76,9 +96,15 @@ impl Table {
             .next_row_id
             .checked_add(count_u64)
             .ok_or_else(|| DbError::Storage("row id space is exhausted".to_string()))?;
+        let base = self.rows.len();
         self.row_ids.extend(self.next_row_id..end);
         self.next_row_id = end;
         self.rows.extend(prepared);
+        for (offset, row_id) in self.row_ids[base..].iter().copied().enumerate() {
+            if self.positions.insert(row_id, base + offset).is_some() {
+                return Err(DbError::Storage("database file is corrupt".to_string()));
+            }
+        }
         Ok(count)
     }
 
@@ -184,6 +210,17 @@ impl Table {
         }
         self.rows = kept_rows;
         self.row_ids = kept_ids;
+        self.rebuild_positions()?;
+        Ok(())
+    }
+
+    fn rebuild_positions(&mut self) -> Result<(), DbError> {
+        self.positions.clear();
+        for (position, row_id) in self.row_ids.iter().copied().enumerate() {
+            if self.positions.insert(row_id, position).is_some() {
+                return Err(DbError::Storage("database file is corrupt".to_string()));
+            }
+        }
         Ok(())
     }
 
@@ -198,13 +235,31 @@ impl Table {
             row_ids.push(row_id);
             rows.push(row);
         }
-        Ok(Self {
+        let mut table = Self {
             name: image.name,
             schema,
             rows,
             row_ids,
+            positions: HashMap::new(),
             next_row_id: image.next_row_id,
-        })
+        };
+        table.rebuild_positions()?;
+        Ok(table)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overwrite_cell_for_test(
+        &mut self,
+        position: usize,
+        ordinal: usize,
+        value: Value,
+    ) {
+        self.rows[position][ordinal] = value;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forget_position_for_test(&mut self, row_id: u64) {
+        self.positions.remove(&row_id);
     }
 
     pub(crate) fn image(&self) -> TableImage {
@@ -312,6 +367,61 @@ mod tests {
         assert_eq!(error.to_string(), "row id space is exhausted");
         assert!(table.rows().is_empty());
         assert!(table.row_ids.is_empty());
+        assert!(table.positions.is_empty());
         assert_eq!(table.next_row_id, u64::MAX);
+    }
+
+    #[test]
+    fn positions_follow_insert_update_and_compaction() {
+        let mut table = users();
+        table
+            .insert(
+                &[],
+                vec![
+                    vec![Value::Integer(1), Value::Text("a".to_string())],
+                    vec![Value::Integer(2), Value::Text("b".to_string())],
+                    vec![Value::Integer(3), Value::Text("c".to_string())],
+                ],
+            )
+            .unwrap();
+        assert_eq!(table.position(1), Some(0));
+        assert_eq!(table.position(2), Some(1));
+        assert_eq!(table.position(3), Some(2));
+
+        table
+            .rewrite_all(vec![
+                vec![Value::Integer(1), Value::Text("a2".to_string())],
+                vec![Value::Integer(2), Value::Text("b".to_string())],
+                vec![Value::Integer(3), Value::Text("c".to_string())],
+            ])
+            .unwrap();
+        assert_eq!(table.position(1), Some(0));
+        assert_eq!(table.rows()[0][1], Value::Text("a2".to_string()));
+
+        table.retain_indexes(&[0, 2]).unwrap();
+        assert_eq!(table.position(1), Some(0));
+        assert_eq!(table.position(2), None);
+        assert_eq!(table.position(3), Some(1));
+        assert_eq!(table.rows().len(), 2);
+
+        table
+            .insert(
+                &[],
+                vec![vec![Value::Integer(4), Value::Text("d".to_string())]],
+            )
+            .unwrap();
+        assert_eq!(table.position(4), Some(2));
+        assert_eq!(table.position(3), Some(1));
+
+        let loaded = Table::from_image(table.image()).unwrap();
+        assert_eq!(loaded.position(1), Some(0));
+        assert_eq!(loaded.position(3), Some(1));
+        assert_eq!(loaded.position(4), Some(2));
+        assert_eq!(loaded.position(2), None);
+
+        let mut image = table.image();
+        image.rows.push(image.rows[0].clone());
+        let error = Table::from_image(image).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
     }
 }

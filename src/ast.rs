@@ -74,6 +74,8 @@ pub(crate) enum Statement {
         /// Maximum rows after filtering and sorting.
         limit: Option<u64>,
     },
+    /// `EXPLAIN` of one `SELECT`. The query is planned and not executed.
+    Explain(Box<Statement>),
 }
 
 /// One `SET` assignment.
