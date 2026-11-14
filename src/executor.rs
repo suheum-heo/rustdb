@@ -1,8 +1,9 @@
-//! Execute parsed statements against an in-memory database.
+//! Execute parsed statements against the catalog.
 //!
 //! Filters are bound and type-checked before any row is read. `UPDATE` and
-//! `DELETE` build a replacement row list and install it only after every row
-//! has been planned, so a failure leaves the table unchanged.
+//! `DELETE` build the replacement rows and install them only after every row
+//! has been planned, so a failure leaves the table unchanged. A durable
+//! database publishes that result only after the statement succeeds.
 //!
 //! `SELECT` applies `WHERE`, then `ORDER BY`, then `LIMIT`, then projection.
 //! Sort keys may name columns that are not in the select list. Equal keys keep
@@ -13,7 +14,7 @@
 use std::cmp::Ordering;
 
 use crate::ast::{Assignment, Expr, OrderKey, Projection, Statement};
-use crate::database::Database;
+use crate::database::{Database, DurableChange};
 use crate::error::DbError;
 use crate::expr::{self, BoundExpr};
 use crate::parser;
@@ -71,7 +72,10 @@ impl Database {
     ///
     /// Statements are autocommitted one by one. If a later statement fails,
     /// earlier statements in the same string stay applied. Each individual
-    /// `INSERT`, `UPDATE`, or `DELETE` is atomic.
+    /// `INSERT`, `UPDATE`, or `DELETE` is atomic. A durable database publishes
+    /// a statement only after that statement succeeds. A failure before the
+    /// file is replaced restores memory. Once the replacement is visible,
+    /// memory is left in place so it matches the file.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>, DbError> {
         let statements = parser::parse(sql)?;
         let mut results = Vec::with_capacity(statements.len());
@@ -82,6 +86,25 @@ impl Database {
     }
 
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult, DbError> {
+        if !self.stores_on_disk() {
+            return self.apply(statement);
+        }
+        let change = durable_change(&statement);
+        let undo = self.prepare_durable(&change);
+        let result = self.apply(statement)?;
+        if matches!(change, DurableChange::None) {
+            return Ok(result);
+        }
+        if let Err(error) = self.publish() {
+            if !self.publication_visible() {
+                self.rollback(undo);
+            }
+            return Err(error);
+        }
+        Ok(result)
+    }
+
+    fn apply(&mut self, statement: Statement) -> Result<StatementResult, DbError> {
         match statement {
             Statement::CreateTable { name, columns } => {
                 self.create_table(name, columns)?;
@@ -177,7 +200,7 @@ impl Database {
             }
             (new_rows, count)
         };
-        self.table_mut(table_name)?.replace_rows(new_rows)?;
+        self.table_mut(table_name)?.rewrite_all(new_rows)?;
         Ok(StatementResult::Update { count })
     }
 
@@ -186,22 +209,33 @@ impl Database {
         table_name: &str,
         selection: Option<&Expr>,
     ) -> Result<StatementResult, DbError> {
-        let (kept, deleted) = {
+        let (kept_indexes, deleted) = {
             let table = self.table(table_name)?;
             let filter = bind_optional_where(selection, table)?;
-            let mut kept = Vec::with_capacity(table.rows().len());
+            let mut kept_indexes = Vec::new();
             let mut deleted = 0usize;
-            for row in table.rows() {
+            for (index, row) in table.rows().iter().enumerate() {
                 if expr::row_matches(filter.as_ref(), row)? {
                     deleted += 1;
                 } else {
-                    kept.push(row.clone());
+                    kept_indexes.push(index);
                 }
             }
-            (kept, deleted)
+            (kept_indexes, deleted)
         };
-        self.table_mut(table_name)?.replace_rows(kept)?;
+        self.table_mut(table_name)?.retain_indexes(&kept_indexes)?;
         Ok(StatementResult::Delete { count: deleted })
+    }
+}
+
+fn durable_change(statement: &Statement) -> DurableChange {
+    match statement {
+        Statement::CreateTable { name, .. } => DurableChange::Create(name.clone()),
+        Statement::DropTable { names } => DurableChange::Drop(names.clone()),
+        Statement::Insert { table, .. }
+        | Statement::Update { table, .. }
+        | Statement::Delete { table, .. } => DurableChange::Write(table.clone()),
+        Statement::Select { .. } => DurableChange::None,
     }
 }
 

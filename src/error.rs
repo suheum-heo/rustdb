@@ -65,6 +65,8 @@ pub enum DbError {
     InvalidLiteral(String),
     /// A catalog or execution invariant was violated.
     Internal(String),
+    /// A database file could not be read, written, or interpreted.
+    Storage(String),
 }
 
 impl DbError {
@@ -107,7 +109,7 @@ impl fmt::Display for DbError {
             Self::MissingValue { table, column } => {
                 write!(f, "missing value for column '{column}' in table '{table}'")
             }
-            Self::InvalidLiteral(message) => write!(f, "{message}"),
+            Self::InvalidLiteral(message) | Self::Storage(message) => write!(f, "{message}"),
             Self::Internal(message) => write!(f, "internal error: {message}"),
         }
     }

@@ -1,19 +1,23 @@
 //! In-memory table storage.
+//!
+//! Durable databases keep the same row vector while a statement runs. The
+//! store publishes those rows into slotted heap pages after the statement
+//! succeeds. Each row has an id assigned at insert time. `UPDATE` keeps ids
+//! by position, and `DELETE` keeps the ids of the surviving rows.
 
 use crate::error::DbError;
 use crate::schema::{Column, Schema};
+use crate::storage::{TableImage, ensure_record_fits};
 use crate::value::Value;
 
 /// One relation: a fixed schema and an insertion-ordered row list.
-///
-/// Rows are stored in row-major order. That keeps `INSERT` and tuple
-/// projection straightforward. A columnar layout would scan fewer bytes for
-/// `SELECT col`, and it can wait until there is a measurement worth chasing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Table {
     name: String,
     schema: Schema,
     rows: Vec<Vec<Value>>,
+    row_ids: Vec<u64>,
+    next_row_id: u64,
 }
 
 impl Table {
@@ -26,6 +30,8 @@ impl Table {
             name,
             schema,
             rows: Vec::new(),
+            row_ids: Vec::new(),
+            next_row_id: 1,
         })
     }
 
@@ -59,8 +65,19 @@ impl Table {
         for row in rows {
             prepared.push(self.align_row(&positions, row)?);
         }
+        for row in &prepared {
+            ensure_record_fits(row)?;
+        }
 
         let count = prepared.len();
+        let count_u64 = u64::try_from(count)
+            .map_err(|_| DbError::Storage("row id space is exhausted".to_string()))?;
+        let end = self
+            .next_row_id
+            .checked_add(count_u64)
+            .ok_or_else(|| DbError::Storage("row id space is exhausted".to_string()))?;
+        self.row_ids.extend(self.next_row_id..end);
+        self.next_row_id = end;
         self.rows.extend(prepared);
         Ok(count)
     }
@@ -109,11 +126,20 @@ impl Table {
         Ok(stored)
     }
 
-    /// Replace every row after a successful `UPDATE` or `DELETE` plan.
+    /// Replace every row after a successful `UPDATE`.
     ///
-    /// The caller builds `rows` without touching this table. A width mismatch
-    /// leaves the current rows in place.
-    pub(crate) fn replace_rows(&mut self, rows: Vec<Vec<Value>>) -> Result<(), DbError> {
+    /// `rows` must contain one value list per existing row, in the same order.
+    /// Row ids stay with those positions. A width or size error leaves the
+    /// current rows in place.
+    pub(crate) fn rewrite_all(&mut self, rows: Vec<Vec<Value>>) -> Result<(), DbError> {
+        if rows.len() != self.rows.len() {
+            return Err(DbError::Internal(format!(
+                "replacement for '{}' has {} rows, expected {}",
+                self.name,
+                rows.len(),
+                self.rows.len()
+            )));
+        }
         for (index, row) in rows.iter().enumerate() {
             if row.len() != self.schema.len() {
                 return Err(DbError::Internal(format!(
@@ -123,9 +149,76 @@ impl Table {
                     self.schema.len()
                 )));
             }
+            ensure_record_fits(row)?;
         }
         self.rows = rows;
         Ok(())
+    }
+
+    /// Keep rows at `indexes`, which must be strictly increasing.
+    ///
+    /// Surviving row ids stay attached to those rows. This is how `DELETE`
+    /// preserves identity without matching values that may not be unique.
+    pub(crate) fn retain_indexes(&mut self, indexes: &[usize]) -> Result<(), DbError> {
+        if self.row_ids.len() != self.rows.len() {
+            return Err(DbError::Internal(format!(
+                "table '{}' has {} row ids for {} rows",
+                self.name,
+                self.row_ids.len(),
+                self.rows.len()
+            )));
+        }
+        let mut kept_rows = Vec::with_capacity(indexes.len());
+        let mut kept_ids = Vec::with_capacity(indexes.len());
+        let mut previous = None;
+        for index in indexes {
+            if *index >= self.rows.len() || previous.is_some_and(|seen: usize| *index <= seen) {
+                return Err(DbError::Internal(format!(
+                    "cannot retain row {index} from table '{}'",
+                    self.name
+                )));
+            }
+            previous = Some(*index);
+            kept_rows.push(self.rows[*index].clone());
+            kept_ids.push(self.row_ids[*index]);
+        }
+        self.rows = kept_rows;
+        self.row_ids = kept_ids;
+        Ok(())
+    }
+
+    pub(crate) fn from_image(image: TableImage) -> Result<Self, DbError> {
+        let schema = Schema::try_new(&image.name, image.columns)?;
+        let mut rows = Vec::with_capacity(image.rows.len());
+        let mut row_ids = Vec::with_capacity(image.rows.len());
+        for (row_id, row) in image.rows {
+            if row.len() != schema.len() {
+                return Err(DbError::Storage("database file is corrupt".to_string()));
+            }
+            row_ids.push(row_id);
+            rows.push(row);
+        }
+        Ok(Self {
+            name: image.name,
+            schema,
+            rows,
+            row_ids,
+            next_row_id: image.next_row_id,
+        })
+    }
+
+    pub(crate) fn image(&self) -> TableImage {
+        TableImage {
+            name: self.name.clone(),
+            columns: self.schema.columns().to_vec(),
+            next_row_id: self.next_row_id,
+            rows: self
+                .row_ids
+                .iter()
+                .copied()
+                .zip(self.rows.iter().cloned())
+                .collect(),
+        }
     }
 }
 
@@ -203,5 +296,21 @@ mod tests {
                 vec![Value::Integer(2), Value::Text("Bea".to_string())],
             ]
         );
+    }
+
+    #[test]
+    fn insert_rejects_a_row_id_that_would_overflow() {
+        let mut table = users();
+        table.next_row_id = u64::MAX;
+        let error = table
+            .insert(
+                &[],
+                vec![vec![Value::Integer(1), Value::Text("Ada".to_string())]],
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "row id space is exhausted");
+        assert!(table.rows().is_empty());
+        assert!(table.row_ids.is_empty());
+        assert_eq!(table.next_row_id, u64::MAX);
     }
 }

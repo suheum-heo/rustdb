@@ -2,7 +2,7 @@
 name = "rustdb"
 version = "0.1.0"
 edition = "2024"
-description = "A small in-memory relational SQL engine"
+description = "A small relational SQL engine with a page-oriented database file"
 readme = "README.md"
 publish = false
 
