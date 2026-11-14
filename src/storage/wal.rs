@@ -271,7 +271,7 @@ pub(crate) fn recover(database: &mut File, wal_path: &Path) -> Result<(), DbErro
     }
     let meta_page = read_page0(database)?;
     let meta = page::read_meta(&meta_page)?;
-    if meta.version != page::FORMAT_VERSION {
+    if meta.version != page::FORMAT_VERSION && meta.version != page::FORMAT_VERSION_V3 {
         return Err(DbError::Storage(
             "refusing to recover a redo log for a database that is not format version 2"
                 .to_string(),
@@ -332,12 +332,28 @@ fn apply_committed(
             "redo log commit id conflicts with the database".to_string(),
         ));
     }
+    if frame_meta.version != meta.version {
+        return Err(DbError::Storage(
+            "redo log uses a database format this file has not migrated to".to_string(),
+        ));
+    }
     let mut seen = HashSet::with_capacity(log.frames.len());
-    for (id, _) in &log.frames {
+    for (id, page) in &log.frames {
         if !seen.insert(*id) {
             return Err(DbError::Storage(
                 "redo log commit id conflicts with the database".to_string(),
             ));
+        }
+        if meta.version == page::FORMAT_VERSION {
+            let page_type = page::page_type_of(page);
+            if page_type == page::TYPE_INDEX_CATALOG
+                || page_type == page::TYPE_INDEX_INTERNAL
+                || page_type == page::TYPE_INDEX_LEAF
+            {
+                return Err(DbError::Storage(
+                    "redo log uses a database format this file has not migrated to".to_string(),
+                ));
+            }
         }
     }
     for (id, page) in &log.frames {

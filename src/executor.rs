@@ -120,6 +120,18 @@ impl Database {
                 self.drop_tables(&names)?;
                 Ok(StatementResult::Ok)
             }
+            Statement::CreateIndex {
+                name,
+                table,
+                column,
+            } => {
+                self.create_index(name, table, column)?;
+                Ok(StatementResult::Ok)
+            }
+            Statement::DropIndex { names } => {
+                self.drop_indexes(&names)?;
+                Ok(StatementResult::Ok)
+            }
             Statement::Insert {
                 table,
                 columns,
@@ -241,6 +253,7 @@ fn durable_change(statement: &Statement) -> DurableChange {
         Statement::Insert { table, .. }
         | Statement::Update { table, .. }
         | Statement::Delete { table, .. } => DurableChange::Write(table.clone()),
+        Statement::CreateIndex { .. } | Statement::DropIndex { .. } => DurableChange::Index,
         Statement::Select { .. } => DurableChange::None,
     }
 }

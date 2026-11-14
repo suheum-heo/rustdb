@@ -35,6 +35,7 @@ pub(crate) fn parse(sql: &str) -> Result<Vec<Statement>, DbError> {
 fn convert_statement(statement: SqlStatement) -> Result<Statement, DbError> {
     match statement {
         SqlStatement::CreateTable(create) => convert_create(create),
+        SqlStatement::CreateIndex(create) => convert_create_index(create),
         SqlStatement::Insert(insert) => convert_insert(insert),
         SqlStatement::Update(update) => convert_update(update),
         SqlStatement::Delete(delete) => convert_delete(delete),
@@ -221,7 +222,62 @@ fn convert_data_type(data_type: &SqlDataType) -> Result<DataType, DbError> {
     }
 }
 
+fn convert_create_index(create: sqlparser::ast::CreateIndex) -> Result<Statement, DbError> {
+    if create.unique {
+        return Err(DbError::unsupported("UNIQUE indexes are not supported"));
+    }
+    if create.if_not_exists || create.concurrently || create.r#async {
+        return Err(DbError::unsupported(
+            "this CREATE INDEX clause is not supported",
+        ));
+    }
+    if create.using.is_some()
+        || !create.include.is_empty()
+        || create.nulls_distinct.is_some()
+        || !create.with.is_empty()
+        || create.predicate.is_some()
+        || !create.index_options.is_empty()
+        || !create.alter_options.is_empty()
+    {
+        return Err(DbError::unsupported(
+            "this CREATE INDEX clause is not supported",
+        ));
+    }
+    let Some(name) = create.name else {
+        return Err(DbError::invalid("CREATE INDEX requires an index name"));
+    };
+    if create.columns.len() != 1 {
+        return Err(DbError::unsupported("indexes must name exactly one column"));
+    }
+    let column = &create.columns[0];
+    if column.operator_class.is_some() || column.column.with_fill.is_some() {
+        return Err(DbError::unsupported(
+            "this CREATE INDEX clause is not supported",
+        ));
+    }
+    if !matches!(
+        column.column.options.sort,
+        None | Some(sqlparser::ast::OrderBySort::Asc)
+    ) || column.column.options.nulls_first.is_some()
+    {
+        return Err(DbError::unsupported(
+            "index sort order and NULLS ordering are not supported",
+        ));
+    }
+    let sqlparser::ast::Expr::Identifier(ident) = &column.column.expr else {
+        return Err(DbError::unsupported("index expressions are not supported"));
+    };
+    Ok(Statement::CreateIndex {
+        name: object_name(&name)?,
+        table: object_name(&create.table_name)?,
+        column: normalize_ident(ident),
+    })
+}
+
 fn convert_drop(drop: DropTable) -> Result<Statement, DbError> {
+    if drop.object_type == ObjectType::Index {
+        return convert_drop_index(drop);
+    }
     if drop.object_type != ObjectType::Table {
         return Err(DbError::unsupported(format!(
             "DROP {} is not supported",
@@ -252,6 +308,27 @@ fn convert_drop(drop: DropTable) -> Result<Statement, DbError> {
         converted.push(object_name(name)?);
     }
     Ok(Statement::DropTable { names: converted })
+}
+
+fn convert_drop_index(drop: DropTable) -> Result<Statement, DbError> {
+    if drop.if_exists {
+        return Err(DbError::unsupported(
+            "DROP INDEX IF EXISTS is not supported",
+        ));
+    }
+    if drop.cascade || drop.restrict || drop.purge || drop.temporary || drop.table.is_some() {
+        return Err(DbError::unsupported(
+            "this DROP INDEX clause is not supported",
+        ));
+    }
+    if drop.names.is_empty() {
+        return Err(DbError::invalid("DROP INDEX requires an index name"));
+    }
+    let mut names = Vec::with_capacity(drop.names.len());
+    for name in &drop.names {
+        names.push(object_name(name)?);
+    }
+    Ok(Statement::DropIndex { names })
 }
 
 struct DropTable {

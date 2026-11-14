@@ -22,6 +22,20 @@ pub(crate) enum Statement {
         /// Normalized table names, in source order.
         names: Vec<String>,
     },
+    /// `CREATE INDEX` on one INTEGER column.
+    CreateIndex {
+        /// Normalized index name.
+        name: String,
+        /// Normalized table name.
+        table: String,
+        /// Normalized column name.
+        column: String,
+    },
+    /// `DROP INDEX`, possibly with several names.
+    DropIndex {
+        /// Normalized index names, in source order.
+        names: Vec<String>,
+    },
     /// `INSERT INTO ... VALUES`.
     Insert {
         /// Normalized table name.
