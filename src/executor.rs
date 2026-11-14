@@ -6,20 +6,30 @@
 //! database publishes that result only after the statement succeeds.
 //!
 //! `SELECT` applies `WHERE`, then `ORDER BY`, then `LIMIT`, then projection.
-//! An indexed integer comparison may supply candidate rows first. The original
-//! `WHERE` is still applied to those candidates. Sort keys may name columns
-//! that are not in the select list. Equal keys keep insertion order because
-//! the sort is stable. NULL is greater than every non-NULL value unless the
-//! query overrides that with `NULLS FIRST` or `NULLS LAST`. `UPDATE` and
-//! `DELETE` still read every row.
+//! An indexed integer comparison on one table may supply candidate rows first.
+//! The original `WHERE` is still applied to those candidates. Sort keys may name
+//! columns that are not in the select list. Equal keys keep the order produced
+//! above because the sort is stable. NULL is greater than every non-NULL value
+//! unless the query overrides that with `NULLS FIRST` or `NULLS LAST`.
+//! `UPDATE` and `DELETE` still read every row of one table.
+//!
+//! An `INNER JOIN` walks the outer table in insertion order and, for each outer
+//! row, the inner table in insertion order. The catalog stores tables in one
+//! map, so the scan copies the smaller input and borrows the other. A self-join
+//! copies one side for the same reason. A pair is kept only when `ON` is TRUE.
+//! `WHERE` then runs on that pair. Pairs that fail are not concatenated. With
+//! no `ORDER BY`, a match is projected immediately and `LIMIT` stores only the
+//! rows it will return; later pairs are still evaluated. `ORDER BY` keeps the
+//! joined row until the sort. The join does not read an index and does not
+//! write the database.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use crate::ast::{Assignment, Expr, OrderKey, Projection, Statement};
+use crate::ast::{Assignment, Expr, OrderKey, Projection, QueryFrom, Statement, TableRef};
 use crate::database::{Database, DurableChange};
 use crate::error::DbError;
-use crate::expr::{self, BoundExpr};
+use crate::expr::{self, BoundExpr, Scope};
 use crate::parser;
 use crate::plan::{self, AccessPath};
 use crate::storage::IndexImage;
@@ -74,9 +84,25 @@ struct SortKey {
 
 struct PreparedSelect {
     output_indexes: Vec<usize>,
+    output_names: Vec<String>,
     filter: Option<BoundExpr>,
     sort_keys: Vec<SortKey>,
     path: AccessPath,
+}
+
+struct SelectTail<'a> {
+    projection: &'a Projection,
+    selection: Option<&'a Expr>,
+    order_by: &'a [OrderKey],
+    limit: Option<u64>,
+}
+
+struct PreparedJoin {
+    on: BoundExpr,
+    filter: Option<BoundExpr>,
+    sort_keys: Vec<SortKey>,
+    output_indexes: Vec<usize>,
+    output_names: Vec<String>,
 }
 
 impl Database {
@@ -159,38 +185,71 @@ impl Database {
             } => self.update(&table, &assignments, selection.as_ref()),
             Statement::Delete { table, selection } => self.delete(&table, selection.as_ref()),
             Statement::Select {
-                table,
+                from,
                 projection,
                 selection,
                 order_by,
                 limit,
-            } => self.query(&table, &projection, selection.as_ref(), &order_by, limit),
+            } => self.query(&from, &projection, selection.as_ref(), &order_by, limit),
             Statement::Explain(inner) => self.explain(inner.as_ref()),
         }
     }
 
     fn query(
         &mut self,
-        table_name: &str,
+        from: &QueryFrom,
         projection: &Projection,
         selection: Option<&Expr>,
         order_by: &[OrderKey],
         limit: Option<u64>,
     ) -> Result<StatementResult, DbError> {
-        let mut prepared = self.prepare_select(table_name, projection, selection, order_by)?;
+        match from {
+            QueryFrom::Table(source) => self.query_table(
+                source,
+                SelectTail {
+                    projection,
+                    selection,
+                    order_by,
+                    limit,
+                },
+            ),
+            QueryFrom::Join { outer, inner, on } => self.query_join(
+                outer,
+                inner,
+                on,
+                SelectTail {
+                    projection,
+                    selection,
+                    order_by,
+                    limit,
+                },
+            ),
+        }
+    }
+
+    fn query_table(
+        &mut self,
+        source: &TableRef,
+        tail: SelectTail<'_>,
+    ) -> Result<StatementResult, DbError> {
+        let mut prepared =
+            self.prepare_select(source, tail.projection, tail.selection, tail.order_by)?;
         prepared.path = self.settle_path(prepared.path)?;
         let positions = match &prepared.path {
             AccessPath::SeqScan => None,
-            AccessPath::IndexScan { .. } => Some(self.index_positions(table_name, &prepared.path)?),
+            AccessPath::IndexScan { .. } => {
+                Some(self.index_positions(&source.name, &prepared.path)?)
+            }
         };
 
-        let table = self.table(table_name)?;
+        let table = self.table(&source.name)?;
         let mut rows: Vec<&[Value]> = Vec::new();
         if let Some(positions) = positions {
             for position in positions {
                 let Some(row) = table.rows().get(position) else {
                     return Err(DbError::Internal(format!(
-                        "index position {position} is outside table '{table_name}'"
+                        "index position {position} is outside table '{}'",
+                        source.name
                     )));
                 };
                 if expr::row_matches(prepared.filter.as_ref(), row)? {
@@ -207,7 +266,7 @@ impl Database {
         if !prepared.sort_keys.is_empty() {
             rows.sort_by(|left, right| compare_rows(left, right, &prepared.sort_keys));
         }
-        if let Some(limit) = limit {
+        if let Some(limit) = tail.limit {
             let limit = usize::try_from(limit).unwrap_or(usize::MAX);
             if rows.len() > limit {
                 rows.truncate(limit);
@@ -218,16 +277,47 @@ impl Database {
         for row in rows {
             projected.push(project_row(row, &prepared.output_indexes)?);
         }
-        let columns = column_names(table, &prepared.output_indexes)?;
         Ok(StatementResult::Query(QueryResult {
-            columns,
+            columns: prepared.output_names,
             rows: projected,
         }))
     }
 
+    fn query_join(
+        &mut self,
+        outer: &TableRef,
+        inner: &TableRef,
+        on: &Expr,
+        tail: SelectTail<'_>,
+    ) -> Result<StatementResult, DbError> {
+        let prepared = self.prepare_join(
+            outer,
+            inner,
+            on,
+            tail.projection,
+            tail.selection,
+            tail.order_by,
+        )?;
+        // `tables` is one map, so two row slices cannot be borrowed together.
+        // A self-join is the same entry. Copy the smaller input and borrow the
+        // other. The copy is not updated: a join does not write either table.
+        let outer_len = self.table(&outer.name)?.rows().len();
+        let inner_len = self.table(&inner.name)?.rows().len();
+        let copy_inner = outer.name == inner.name || inner_len <= outer_len;
+        if copy_inner {
+            let inner_rows = self.table(&inner.name)?.rows().to_vec();
+            let outer_rows = self.table(&outer.name)?.rows();
+            scan_join(outer_rows, &inner_rows, prepared, tail.limit)
+        } else {
+            let outer_rows = self.table(&outer.name)?.rows().to_vec();
+            let inner_rows = self.table(&inner.name)?.rows();
+            scan_join(&outer_rows, inner_rows, prepared, tail.limit)
+        }
+    }
+
     fn explain(&mut self, statement: &Statement) -> Result<StatementResult, DbError> {
         let Statement::Select {
-            table,
+            from,
             projection,
             selection,
             order_by,
@@ -236,38 +326,95 @@ impl Database {
         else {
             return Err(DbError::unsupported("EXPLAIN is only supported for SELECT"));
         };
-        let mut prepared = self.prepare_select(table, projection, selection.as_ref(), order_by)?;
-        prepared.path = self.settle_path(prepared.path)?;
-        let (access, index, bounds) = plan::describe(&prepared.path);
-        Ok(StatementResult::Query(QueryResult {
-            columns: vec![
-                "access".to_string(),
-                "index".to_string(),
-                "bounds".to_string(),
-            ],
-            rows: vec![vec![access, index, bounds]],
-        }))
+        match from {
+            QueryFrom::Table(source) => {
+                let mut prepared =
+                    self.prepare_select(source, projection, selection.as_ref(), order_by)?;
+                prepared.path = self.settle_path(prepared.path)?;
+                let (access, index, bounds) = plan::describe(&prepared.path);
+                Ok(StatementResult::Query(QueryResult {
+                    columns: vec![
+                        "access".to_string(),
+                        "index".to_string(),
+                        "bounds".to_string(),
+                    ],
+                    rows: vec![vec![access, index, bounds]],
+                }))
+            }
+            QueryFrom::Join { outer, inner, on } => {
+                self.prepare_join(outer, inner, on, projection, selection.as_ref(), order_by)?;
+                let filter = selection
+                    .as_ref()
+                    .map(|expr| Value::Text(expr.render()))
+                    .unwrap_or(Value::Null);
+                Ok(StatementResult::Query(QueryResult {
+                    columns: vec![
+                        "access".to_string(),
+                        "outer".to_string(),
+                        "inner".to_string(),
+                        "condition".to_string(),
+                        "filter".to_string(),
+                    ],
+                    rows: vec![vec![
+                        Value::Text("NestedLoopJoin".to_string()),
+                        Value::Text(outer.explain_name()),
+                        Value::Text(inner.explain_name()),
+                        Value::Text(on.render()),
+                        filter,
+                    ]],
+                }))
+            }
+        }
     }
 
     fn prepare_select(
         &self,
-        table_name: &str,
+        source: &TableRef,
         projection: &Projection,
         selection: Option<&Expr>,
         order_by: &[OrderKey],
     ) -> Result<PreparedSelect, DbError> {
         let indexes = self.index_images().to_vec();
-        let table = self.table(table_name)?;
-        let output_indexes = output_columns(table, projection)?;
-        let filter = bind_optional_where(selection, table)?;
-        let sort_keys = bind_order(table, order_by)?;
+        let table = self.table(&source.name)?;
+        let scope = Scope::from_table(table, &source.alias);
+        let output_indexes = output_columns(&scope, projection)?;
+        let output_names = column_names(&scope, &output_indexes)?;
+        let filter = bind_optional_where(selection, &scope)?;
+        let sort_keys = bind_order(&scope, order_by)?;
         let choices = index_choices(table, &indexes)?;
-        let path = plan::choose(table_name, selection, &choices);
+        let path = plan::choose(&source.alias, selection, &choices);
         Ok(PreparedSelect {
             output_indexes,
+            output_names,
             filter,
             sort_keys,
             path,
+        })
+    }
+
+    fn prepare_join(
+        &self,
+        outer: &TableRef,
+        inner: &TableRef,
+        on: &Expr,
+        projection: &Projection,
+        selection: Option<&Expr>,
+        order_by: &[OrderKey],
+    ) -> Result<PreparedJoin, DbError> {
+        let outer_columns = Scope::columns(self.table(&outer.name)?);
+        let inner_columns = Scope::columns(self.table(&inner.name)?);
+        let scope = Scope::try_join(&outer.alias, outer_columns, &inner.alias, inner_columns)?;
+        let on = expr::bind_filter(on, &scope, "ON")?;
+        let filter = bind_optional_where(selection, &scope)?;
+        let sort_keys = bind_order(&scope, order_by)?;
+        let output_indexes = output_columns(&scope, projection)?;
+        let output_names = column_names(&scope, &output_indexes)?;
+        Ok(PreparedJoin {
+            on,
+            filter,
+            sort_keys,
+            output_indexes,
+            output_names,
         })
     }
 
@@ -374,8 +521,9 @@ impl Database {
     ) -> Result<StatementResult, DbError> {
         let (new_rows, count) = {
             let table = self.table(table_name)?;
-            let filter = bind_optional_where(selection, table)?;
-            let assignments = bind_assignments(table, assignments)?;
+            let scope = Scope::from_table(table, table.name());
+            let filter = bind_optional_where(selection, &scope)?;
+            let assignments = bind_assignments(&scope, table_name, assignments)?;
             let mut new_rows = Vec::with_capacity(table.rows().len());
             let mut count = 0usize;
             for row in table.rows() {
@@ -399,7 +547,8 @@ impl Database {
     ) -> Result<StatementResult, DbError> {
         let (kept_indexes, deleted) = {
             let table = self.table(table_name)?;
-            let filter = bind_optional_where(selection, table)?;
+            let scope = Scope::from_table(table, table.name());
+            let filter = bind_optional_where(selection, &scope)?;
             let mut kept_indexes = Vec::new();
             let mut deleted = 0usize;
             for (index, row) in table.rows().iter().enumerate() {
@@ -460,41 +609,61 @@ fn corrupt_index(name: &str) -> DbError {
 
 fn bind_optional_where(
     selection: Option<&Expr>,
-    table: &Table,
+    scope: &Scope,
 ) -> Result<Option<BoundExpr>, DbError> {
     selection
-        .map(|expr| expr::bind_where(expr, table))
+        .map(|expr| expr::bind_where(expr, scope))
         .transpose()
 }
 
-fn output_columns(table: &Table, projection: &Projection) -> Result<Vec<usize>, DbError> {
+fn output_columns(scope: &Scope, projection: &Projection) -> Result<Vec<usize>, DbError> {
     match projection {
-        Projection::All => Ok((0..table.schema().len()).collect()),
-        Projection::Columns(columns) => columns
-            .iter()
-            .map(|column| expr::resolve_column(table, column))
-            .collect(),
+        Projection::All => Ok((0..scope.len()).collect()),
+        Projection::QualifiedAll { qualifier } => scope.columns_of(qualifier),
+        Projection::Columns(columns) => {
+            columns.iter().map(|column| scope.resolve(column)).collect()
+        }
     }
 }
 
-fn column_names(table: &Table, indexes: &[usize]) -> Result<Vec<String>, DbError> {
+fn column_names(scope: &Scope, indexes: &[usize]) -> Result<Vec<String>, DbError> {
     let mut names = Vec::with_capacity(indexes.len());
     for index in indexes {
-        let Some(column) = table.schema().column(*index) else {
+        let Some(name) = scope.name_at(*index) else {
             return Err(DbError::Internal(format!(
-                "output column index {index} is outside table '{}'",
-                table.name()
+                "output column index {index} is outside the row"
             )));
         };
-        names.push(column.name().to_string());
+        names.push(name.to_string());
     }
     Ok(names)
 }
 
 fn project_row(row: &[Value], indexes: &[usize]) -> Result<Vec<Value>, DbError> {
+    project_at(indexes, |index| row.get(index))
+}
+
+fn project_pair(
+    outer: &[Value],
+    inner: &[Value],
+    indexes: &[usize],
+) -> Result<Vec<Value>, DbError> {
+    project_at(indexes, |index| {
+        if index < outer.len() {
+            outer.get(index)
+        } else {
+            inner.get(index - outer.len())
+        }
+    })
+}
+
+fn project_at<'a>(
+    indexes: &[usize],
+    mut value_at: impl FnMut(usize) -> Option<&'a Value>,
+) -> Result<Vec<Value>, DbError> {
     let mut projected = Vec::with_capacity(indexes.len());
     for index in indexes {
-        let Some(value) = row.get(*index) else {
+        let Some(value) = value_at(*index) else {
             return Err(DbError::Internal(format!(
                 "row is missing column index {index}"
             )));
@@ -505,32 +674,35 @@ fn project_row(row: &[Value], indexes: &[usize]) -> Result<Vec<Value>, DbError> 
 }
 
 fn bind_assignments(
-    table: &Table,
+    scope: &Scope,
+    table_name: &str,
     assignments: &[Assignment],
 ) -> Result<Vec<BoundAssignment>, DbError> {
     if assignments.is_empty() {
         return Err(DbError::invalid("UPDATE requires at least one assignment"));
     }
     let mut bound = Vec::with_capacity(assignments.len());
-    let mut seen = vec![false; table.schema().len()];
+    let mut seen = vec![false; scope.len()];
     for assignment in assignments {
-        let index = expr::resolve_column(table, &assignment.column)?;
+        let index = scope.resolve(&assignment.column)?;
         if seen[index] {
             return Err(DbError::invalid(format!(
-                "column '{}' is assigned more than once in table '{}'",
-                assignment.column.name,
-                table.name()
+                "column '{}' is assigned more than once in table '{table_name}'",
+                assignment.column.name
             )));
         }
         seen[index] = true;
-        let Some(column) = table.schema().column(index) else {
+        let Some(name) = scope.name_at(index) else {
             return Err(DbError::Internal(format!(
-                "assignment index {index} is outside table '{}'",
-                table.name()
+                "assignment index {index} is outside table '{table_name}'"
             )));
         };
-        let value =
-            expr::bind_assignment(&assignment.value, table, column.name(), column.data_type())?;
+        let Some(data_type) = scope.type_at(index) else {
+            return Err(DbError::Internal(format!(
+                "assignment index {index} is outside table '{table_name}'"
+            )));
+        };
+        let value = expr::bind_assignment(&assignment.value, scope, name, data_type)?;
         bound.push(BoundAssignment { index, value });
     }
     Ok(bound)
@@ -554,10 +726,10 @@ fn assign_row(row: &[Value], assignments: &[BoundAssignment]) -> Result<Vec<Valu
     Ok(updated)
 }
 
-fn bind_order(table: &Table, keys: &[OrderKey]) -> Result<Vec<SortKey>, DbError> {
+fn bind_order(scope: &Scope, keys: &[OrderKey]) -> Result<Vec<SortKey>, DbError> {
     let mut bound = Vec::with_capacity(keys.len());
     for key in keys {
-        let index = expr::resolve_column(table, &key.column)?;
+        let index = scope.resolve(&key.column)?;
         bound.push(SortKey {
             index,
             ascending: key.ascending,
@@ -565,6 +737,89 @@ fn bind_order(table: &Table, keys: &[OrderKey]) -> Result<Vec<SortKey>, DbError>
         });
     }
     Ok(bound)
+}
+
+fn scan_join(
+    outer_rows: &[Vec<Value>],
+    inner_rows: &[Vec<Value>],
+    prepared: PreparedJoin,
+    limit: Option<u64>,
+) -> Result<StatementResult, DbError> {
+    let limit_n = limit.map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+    if prepared.sort_keys.is_empty() {
+        let mut projected = Vec::new();
+        for outer_row in outer_rows {
+            for inner_row in inner_rows {
+                if !expr::pair_matches(Some(&prepared.on), outer_row, inner_row)? {
+                    continue;
+                }
+                if !expr::pair_matches(prepared.filter.as_ref(), outer_row, inner_row)? {
+                    continue;
+                }
+                if limit_n.is_some_and(|limit_n| projected.len() >= limit_n) {
+                    continue;
+                }
+                projected.push(project_pair(
+                    outer_row,
+                    inner_row,
+                    &prepared.output_indexes,
+                )?);
+            }
+        }
+        return Ok(StatementResult::Query(QueryResult {
+            columns: prepared.output_names,
+            rows: projected,
+        }));
+    }
+
+    let mut joined = Vec::new();
+    for outer_row in outer_rows {
+        for inner_row in inner_rows {
+            if !expr::pair_matches(Some(&prepared.on), outer_row, inner_row)? {
+                continue;
+            }
+            if !expr::pair_matches(prepared.filter.as_ref(), outer_row, inner_row)? {
+                continue;
+            }
+            let mut row = Vec::with_capacity(outer_row.len().saturating_add(inner_row.len()));
+            row.extend_from_slice(outer_row);
+            row.extend_from_slice(inner_row);
+            joined.push(row);
+        }
+    }
+    finish_rows(
+        joined,
+        &prepared.sort_keys,
+        limit,
+        &prepared.output_indexes,
+        prepared.output_names,
+    )
+}
+
+fn finish_rows(
+    mut rows: Vec<Vec<Value>>,
+    sort_keys: &[SortKey],
+    limit: Option<u64>,
+    output_indexes: &[usize],
+    output_names: Vec<String>,
+) -> Result<StatementResult, DbError> {
+    if !sort_keys.is_empty() {
+        rows.sort_by(|left, right| compare_rows(left, right, sort_keys));
+    }
+    if let Some(limit) = limit {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
+    }
+    let mut projected = Vec::with_capacity(rows.len());
+    for row in &rows {
+        projected.push(project_row(row, output_indexes)?);
+    }
+    Ok(StatementResult::Query(QueryResult {
+        columns: output_names,
+        rows: projected,
+    }))
 }
 
 fn compare_rows(left: &[Value], right: &[Value], keys: &[SortKey]) -> Ordering {

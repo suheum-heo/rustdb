@@ -3,19 +3,23 @@
 //! Unquoted identifiers are folded to lowercase, matching the usual SQL rule
 //! for case-insensitive names. Quoted identifiers keep their case and are
 //! matched exactly. Unsupported clauses are rejected here so execution cannot
-//! silently ignore `ORDER BY`, constraints, or joins.
+//! silently ignore `ORDER BY`, constraints, or a join this engine does not
+//! run. A `SELECT` may name one table or one `INNER JOIN` of two tables.
 
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CreateTable, CreateTableOptions, DataType as SqlDataType,
     Delete as SqlDelete, DescribeAlias, Expr as SqlExpr, FromTable, GroupByExpr,
-    HiveDistributionStyle, Ident, LimitClause, ObjectName, ObjectType, OrderBy, OrderByKind,
-    OrderBySort, Query, Select, SelectFlavor, SelectItem, SetExpr, Statement as SqlStatement,
-    TableFactor, UnaryOperator, Update as SqlUpdate, Value as SqlValue,
+    HiveDistributionStyle, Ident, JoinConstraint, JoinOperator, LimitClause, ObjectName,
+    ObjectType, OrderBy, OrderByKind, OrderBySort, Query, Select, SelectFlavor, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, Statement as SqlStatement, TableFactor,
+    UnaryOperator, Update as SqlUpdate, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::ast::{Assignment, BinOp, Expr, OrderKey, Projection, SelectColumn, Statement};
+use crate::ast::{
+    Assignment, BinOp, Expr, OrderKey, Projection, QueryFrom, SelectColumn, Statement, TableRef,
+};
 use crate::error::DbError;
 use crate::schema::Column;
 use crate::value::{DataType, Value};
@@ -535,7 +539,7 @@ fn convert_select(
     let projection = convert_projection(&select.projection)?;
     let selection = select.selection.as_ref().map(convert_expr).transpose()?;
     Ok(Statement::Select {
-        table,
+        from: table,
         projection,
         selection,
         order_by,
@@ -589,20 +593,58 @@ fn reject_select_clauses(select: &Select) -> Result<(), DbError> {
     Ok(())
 }
 
-fn convert_from(select: &Select) -> Result<String, DbError> {
+fn convert_from(select: &Select) -> Result<QueryFrom, DbError> {
+    if select.from.is_empty() {
+        return Err(DbError::invalid("SELECT requires a FROM clause"));
+    }
     if select.from.len() != 1 {
-        if select.from.is_empty() {
-            return Err(DbError::invalid("SELECT requires a FROM clause"));
-        }
-        return Err(DbError::unsupported("JOIN is not supported"));
+        return Err(DbError::unsupported("comma joins are not supported"));
     }
-    if !select.from[0].joins.is_empty() {
-        return Err(DbError::unsupported("JOIN is not supported"));
+    let item = &select.from[0];
+    let outer = table_ref(&item.relation)?;
+    if item.joins.is_empty() {
+        return Ok(QueryFrom::Table(outer));
     }
-    table_name(&select.from[0].relation)
+    if item.joins.len() != 1 {
+        return Err(DbError::unsupported("multiple JOINs are not supported"));
+    }
+    let join = &item.joins[0];
+    if join.global {
+        return Err(DbError::unsupported("GLOBAL JOIN is not supported"));
+    }
+    let inner = table_ref(&join.relation)?;
+    let on = inner_join_condition(&join.join_operator)?;
+    Ok(QueryFrom::Join { outer, inner, on })
 }
 
-fn table_name(factor: &TableFactor) -> Result<String, DbError> {
+fn inner_join_condition(operator: &JoinOperator) -> Result<Expr, DbError> {
+    let constraint = match operator {
+        JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => constraint,
+        JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => {
+            return Err(DbError::unsupported("LEFT JOIN is not supported"));
+        }
+        JoinOperator::Right(_) | JoinOperator::RightOuter(_) => {
+            return Err(DbError::unsupported("RIGHT JOIN is not supported"));
+        }
+        JoinOperator::FullOuter(_) => {
+            return Err(DbError::unsupported("FULL JOIN is not supported"));
+        }
+        JoinOperator::CrossJoin(_) => {
+            return Err(DbError::unsupported("CROSS JOIN is not supported"));
+        }
+        _ => return Err(DbError::unsupported("this JOIN is not supported")),
+    };
+    match constraint {
+        JoinConstraint::On(expr) => convert_expr(expr),
+        JoinConstraint::Using(_) | JoinConstraint::UsingAlias(_, _) => {
+            Err(DbError::unsupported("USING is not supported"))
+        }
+        JoinConstraint::Natural => Err(DbError::unsupported("NATURAL JOIN is not supported")),
+        JoinConstraint::None => Err(DbError::unsupported("JOIN requires an ON condition")),
+    }
+}
+
+fn table_ref(factor: &TableFactor) -> Result<TableRef, DbError> {
     match factor {
         TableFactor::Table {
             name,
@@ -617,9 +659,6 @@ fn table_name(factor: &TableFactor) -> Result<String, DbError> {
             index_directives,
             inheritance,
         } => {
-            if alias.is_some() {
-                return Err(DbError::unsupported("table aliases are not supported"));
-            }
             if args.is_some()
                 || !with_hints.is_empty()
                 || version.is_some()
@@ -632,10 +671,34 @@ fn table_name(factor: &TableFactor) -> Result<String, DbError> {
             {
                 return Err(DbError::unsupported("this FROM clause is not supported"));
             }
-            object_name(name)
+            let name = object_name(name)?;
+            let alias = match alias {
+                None => name.clone(),
+                Some(alias) => {
+                    if !alias.columns.is_empty() || alias.at.is_some() {
+                        return Err(DbError::unsupported(
+                            "table column aliases are not supported",
+                        ));
+                    }
+                    let alias = normalize_ident(&alias.name);
+                    if alias.is_empty() {
+                        return Err(DbError::invalid("table alias must not be empty"));
+                    }
+                    alias
+                }
+            };
+            Ok(TableRef { name, alias })
         }
         _ => Err(DbError::unsupported("subqueries in FROM are not supported")),
     }
+}
+
+/// A table named by `UPDATE` or `DELETE`. Those statements do not take an alias.
+fn table_name(factor: &TableFactor) -> Result<String, DbError> {
+    if let TableFactor::Table { alias: Some(_), .. } = factor {
+        return Err(DbError::unsupported("table aliases are not supported"));
+    }
+    Ok(table_ref(factor)?.name)
 }
 
 fn convert_projection(items: &[SelectItem]) -> Result<Projection, DbError> {
@@ -643,16 +706,14 @@ fn convert_projection(items: &[SelectItem]) -> Result<Projection, DbError> {
         return Err(DbError::invalid("SELECT requires a column list"));
     }
     if let [SelectItem::Wildcard(options)] = items {
-        if options.opt_ilike.is_none()
-            && options.opt_exclude.is_none()
-            && options.opt_except.is_none()
-            && options.opt_replace.is_none()
-            && options.opt_rename.is_none()
-            && options.opt_alias.is_none()
-        {
-            return Ok(Projection::All);
-        }
-        return Err(DbError::unsupported("wildcard options are not supported"));
+        reject_wildcard_options(options)?;
+        return Ok(Projection::All);
+    }
+    if let [SelectItem::QualifiedWildcard(kind, options)] = items {
+        reject_wildcard_options(options)?;
+        return Ok(Projection::QualifiedAll {
+            qualifier: wildcard_qualifier(kind)?,
+        });
     }
 
     let mut columns = Vec::with_capacity(items.len());
@@ -670,6 +731,40 @@ fn convert_projection(items: &[SelectItem]) -> Result<Projection, DbError> {
         }
     }
     Ok(Projection::Columns(columns))
+}
+
+fn reject_wildcard_options(
+    options: &sqlparser::ast::WildcardAdditionalOptions,
+) -> Result<(), DbError> {
+    if options.opt_ilike.is_none()
+        && options.opt_exclude.is_none()
+        && options.opt_except.is_none()
+        && options.opt_replace.is_none()
+        && options.opt_rename.is_none()
+        && options.opt_alias.is_none()
+    {
+        return Ok(());
+    }
+    Err(DbError::unsupported("wildcard options are not supported"))
+}
+
+fn wildcard_qualifier(kind: &SelectItemQualifiedWildcardKind) -> Result<String, DbError> {
+    let SelectItemQualifiedWildcardKind::ObjectName(name) = kind else {
+        return Err(DbError::unsupported("this wildcard is not supported"));
+    };
+    if name.0.len() != 1 {
+        return Err(DbError::unsupported(
+            "qualified names with more than two parts are not supported",
+        ));
+    }
+    let Some(ident) = name.0[0].as_ident() else {
+        return Err(DbError::unsupported("this wildcard is not supported"));
+    };
+    let qualifier = normalize_ident(ident);
+    if qualifier.is_empty() {
+        return Err(DbError::invalid("table name must not be empty"));
+    }
+    Ok(qualifier)
 }
 
 fn select_column(expr: &SqlExpr) -> Result<SelectColumn, DbError> {
@@ -1035,12 +1130,18 @@ mod tests {
         assert_eq!(statements.len(), 1);
         match &statements[0] {
             Statement::Select {
-                table,
+                from,
                 projection,
                 selection,
                 ..
             } => {
-                assert_eq!(table, "users");
+                assert_eq!(
+                    from,
+                    &QueryFrom::Table(TableRef {
+                        name: "users".to_string(),
+                        alias: "users".to_string(),
+                    })
+                );
                 assert_eq!(
                     projection,
                     &Projection::Columns(vec![SelectColumn {
@@ -1101,5 +1202,48 @@ mod tests {
     fn rejects_order_by_expressions() {
         let error = parse("SELECT * FROM users ORDER BY 1;").unwrap_err();
         assert_eq!(error.to_string(), "ORDER BY expressions are not supported");
+    }
+
+    #[test]
+    fn parses_an_inner_join_and_rejects_other_joins() {
+        let statements =
+            parse("SELECT u.name, o.total FROM users AS u JOIN orders o ON u.id = o.user_id;")
+                .unwrap();
+        match &statements[0] {
+            Statement::Select {
+                from: QueryFrom::Join { outer, inner, on },
+                projection,
+                ..
+            } => {
+                assert_eq!(outer.name, "users");
+                assert_eq!(outer.alias, "u");
+                assert_eq!(inner.name, "orders");
+                assert_eq!(inner.alias, "o");
+                assert_eq!(on.render(), "u.id = o.user_id");
+                assert_eq!(
+                    projection,
+                    &Projection::Columns(vec![
+                        SelectColumn {
+                            name: "name".to_string(),
+                            qualifier: Some("u".to_string()),
+                        },
+                        SelectColumn {
+                            name: "total".to_string(),
+                            qualifier: Some("o".to_string()),
+                        },
+                    ])
+                );
+            }
+            other => panic!("expected a join, got {other:?}"),
+        }
+
+        let error = parse("SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id;")
+            .unwrap_err();
+        assert_eq!(error.to_string(), "LEFT JOIN is not supported");
+        let error = parse(
+            "SELECT * FROM users JOIN orders ON users.id = orders.user_id JOIN notes ON notes.id = users.id;",
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "multiple JOINs are not supported");
     }
 }

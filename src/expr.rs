@@ -8,9 +8,171 @@
 
 use crate::ast::{BinOp, Expr, SelectColumn};
 use crate::error::DbError;
-use crate::schema::Schema;
 use crate::table::Table;
 use crate::value::{DataType, Value};
+
+/// One input of a statement, in the order its columns occupy in a joined row.
+struct Relation {
+    alias: String,
+    offset: usize,
+    columns: Vec<(String, DataType)>,
+}
+
+/// Columns a statement can name, laid out outer-then-inner.
+///
+/// A qualifier matches an alias, or the catalog name when the query wrote no
+/// alias. An unqualified name must match exactly one column. Binding stores
+/// the flat index, so later evaluation does not look names up again.
+pub(crate) struct Scope {
+    relations: Vec<Relation>,
+    types: Vec<DataType>,
+}
+
+impl Scope {
+    /// One table. `alias` is the catalog name when the query has no alias.
+    pub(crate) fn from_table(table: &Table, alias: &str) -> Self {
+        Self::from_parts(vec![(alias.to_string(), column_list(table))])
+    }
+
+    /// Two tables. The same visible name on both sides is an error.
+    ///
+    /// Column lists are owned so the caller can read each table separately,
+    /// including a self-join of one catalog table.
+    pub(crate) fn try_join(
+        outer_alias: &str,
+        outer_columns: Vec<(String, DataType)>,
+        inner_alias: &str,
+        inner_columns: Vec<(String, DataType)>,
+    ) -> Result<Self, DbError> {
+        if outer_alias == inner_alias {
+            return Err(DbError::invalid(format!(
+                "duplicate table alias '{outer_alias}'"
+            )));
+        }
+        Ok(Self::from_parts(vec![
+            (outer_alias.to_string(), outer_columns),
+            (inner_alias.to_string(), inner_columns),
+        ]))
+    }
+
+    pub(crate) fn columns(table: &Table) -> Vec<(String, DataType)> {
+        column_list(table)
+    }
+
+    fn from_parts(parts: Vec<(String, Vec<(String, DataType)>)>) -> Self {
+        let mut relations = Vec::with_capacity(parts.len());
+        let mut types = Vec::new();
+        for (alias, columns) in parts {
+            let offset = types.len();
+            types.extend(columns.iter().map(|(_, data_type)| *data_type));
+            relations.push(Relation {
+                alias,
+                offset,
+                columns,
+            });
+        }
+        Self { relations, types }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.types.len()
+    }
+
+    pub(crate) fn type_at(&self, index: usize) -> Option<DataType> {
+        self.types.get(index).copied()
+    }
+
+    pub(crate) fn name_at(&self, index: usize) -> Option<&str> {
+        for relation in &self.relations {
+            let Some(local) = index.checked_sub(relation.offset) else {
+                continue;
+            };
+            if local < relation.columns.len() {
+                return Some(relation.columns[local].0.as_str());
+            }
+        }
+        None
+    }
+
+    /// Indexes of every column belonging to `qualifier`, in declared order.
+    pub(crate) fn columns_of(&self, qualifier: &str) -> Result<Vec<usize>, DbError> {
+        let relation = self
+            .relations
+            .iter()
+            .find(|relation| relation.alias == qualifier)
+            .ok_or_else(|| self.unknown_qualifier(qualifier))?;
+        Ok((0..relation.columns.len())
+            .map(|local| relation.offset + local)
+            .collect())
+    }
+
+    /// Resolve `column` to an index in the flat row.
+    pub(crate) fn resolve(&self, column: &SelectColumn) -> Result<usize, DbError> {
+        if let Some(qualifier) = &column.qualifier {
+            let relation = self
+                .relations
+                .iter()
+                .find(|relation| relation.alias == *qualifier)
+                .ok_or_else(|| self.unknown_qualifier(qualifier))?;
+            let local = relation
+                .columns
+                .iter()
+                .position(|(name, _)| name == &column.name)
+                .ok_or_else(|| DbError::ColumnNotFound {
+                    table: qualifier.clone(),
+                    column: column.name.clone(),
+                })?;
+            return Ok(relation.offset + local);
+        }
+
+        let mut found = None;
+        for relation in &self.relations {
+            if let Some(local) = relation
+                .columns
+                .iter()
+                .position(|(name, _)| name == &column.name)
+            {
+                if found.is_some() {
+                    return Err(DbError::invalid(format!(
+                        "column '{}' is ambiguous",
+                        column.name
+                    )));
+                }
+                found = Some(relation.offset + local);
+            }
+        }
+        found.ok_or_else(|| {
+            if self.relations.len() == 1 {
+                DbError::ColumnNotFound {
+                    table: self.relations[0].alias.clone(),
+                    column: column.name.clone(),
+                }
+            } else {
+                DbError::invalid(format!("column '{}' does not exist", column.name))
+            }
+        })
+    }
+
+    fn unknown_qualifier(&self, qualifier: &str) -> DbError {
+        if self.relations.len() == 1 {
+            DbError::invalid(format!(
+                "table qualifier '{qualifier}' does not match '{}'",
+                self.relations[0].alias
+            ))
+        } else {
+            DbError::invalid(format!("table '{qualifier}' is not in scope"))
+        }
+    }
+}
+
+fn column_list(table: &Table) -> Vec<(String, DataType)> {
+    table
+        .schema()
+        .columns()
+        .iter()
+        .map(|column| (column.name().to_string(), column.data_type()))
+        .collect()
+}
 
 /// The type of a bound expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,45 +198,34 @@ pub(crate) enum BoundExpr {
     },
 }
 
-/// Resolve `column` against `table`.
-pub(crate) fn resolve_column(table: &Table, column: &SelectColumn) -> Result<usize, DbError> {
-    if let Some(qualifier) = &column.qualifier
-        && qualifier != table.name()
-    {
-        return Err(DbError::invalid(format!(
-            "table qualifier '{qualifier}' does not match '{}'",
-            table.name()
-        )));
+/// Bind a filter. It must be boolean, or an untyped null literal.
+///
+/// `ON` and `WHERE` both use this. The caller names the clause in the error
+/// when the context is not `WHERE`.
+pub(crate) fn bind_filter(expr: &Expr, scope: &Scope, clause: &str) -> Result<BoundExpr, DbError> {
+    let bound = bind(expr, scope)?;
+    match expr_type(&bound, &scope.types)? {
+        ExprType::Null | ExprType::Value(DataType::Boolean) => Ok(bound),
+        ExprType::Value(found) => Err(DbError::TypeError(format!(
+            "{clause} clause must evaluate to BOOLEAN, got {found}"
+        ))),
     }
-    table
-        .schema()
-        .index_of(&column.name)
-        .ok_or_else(|| DbError::ColumnNotFound {
-            table: table.name().to_string(),
-            column: column.name.clone(),
-        })
 }
 
 /// Bind a `WHERE` expression. It must be boolean, or an untyped null literal.
-pub(crate) fn bind_where(expr: &Expr, table: &Table) -> Result<BoundExpr, DbError> {
-    let bound = bind(expr, table)?;
-    match expr_type(&bound, table.schema())? {
-        ExprType::Null | ExprType::Value(DataType::Boolean) => Ok(bound),
-        ExprType::Value(found) => Err(DbError::TypeError(format!(
-            "WHERE clause must evaluate to BOOLEAN, got {found}"
-        ))),
-    }
+pub(crate) fn bind_where(expr: &Expr, scope: &Scope) -> Result<BoundExpr, DbError> {
+    bind_filter(expr, scope, "WHERE")
 }
 
 /// Bind an assignment value. Null is compatible with every column type.
 pub(crate) fn bind_assignment(
     expr: &Expr,
-    table: &Table,
+    scope: &Scope,
     column: &str,
     expected: DataType,
 ) -> Result<BoundExpr, DbError> {
-    let bound = bind(expr, table)?;
-    match expr_type(&bound, table.schema())? {
+    let bound = bind(expr, scope)?;
+    match expr_type(&bound, &scope.types)? {
         ExprType::Null => Ok(bound),
         ExprType::Value(actual) if actual == expected => Ok(bound),
         ExprType::Value(actual) => Err(DbError::TypeMismatch {
@@ -97,6 +248,56 @@ pub(crate) fn row_matches(filter: Option<&BoundExpr>, row: &[Value]) -> Result<b
 
 /// Evaluate `expr` for one row.
 pub(crate) fn eval(expr: &BoundExpr, row: &[Value]) -> Result<Value, DbError> {
+    eval_in(expr, &FlatRow::One(row))
+}
+
+/// Evaluate `expr` for one outer row joined to one inner row.
+///
+/// Indexes below `outer.len()` read the outer row. The rest read the inner row.
+pub(crate) fn eval_pair(
+    expr: &BoundExpr,
+    outer: &[Value],
+    inner: &[Value],
+) -> Result<Value, DbError> {
+    eval_in(expr, &FlatRow::Two(outer, inner))
+}
+
+/// Keep a joined pair only when `filter` evaluates to TRUE.
+pub(crate) fn pair_matches(
+    filter: Option<&BoundExpr>,
+    outer: &[Value],
+    inner: &[Value],
+) -> Result<bool, DbError> {
+    let Some(filter) = filter else {
+        return Ok(true);
+    };
+    Ok(matches!(
+        eval_pair(filter, outer, inner)?,
+        Value::Boolean(true)
+    ))
+}
+
+enum FlatRow<'a> {
+    One(&'a [Value]),
+    Two(&'a [Value], &'a [Value]),
+}
+
+impl FlatRow<'_> {
+    fn get(&self, index: usize) -> Option<&Value> {
+        match self {
+            Self::One(row) => row.get(index),
+            Self::Two(outer, inner) => {
+                if index < outer.len() {
+                    outer.get(index)
+                } else {
+                    inner.get(index - outer.len())
+                }
+            }
+        }
+    }
+}
+
+fn eval_in(expr: &BoundExpr, row: &FlatRow<'_>) -> Result<Value, DbError> {
     match expr {
         BoundExpr::Literal(value) => Ok(value.clone()),
         BoundExpr::Column(index) => row.get(*index).cloned().ok_or_else(|| {
@@ -104,41 +305,38 @@ pub(crate) fn eval(expr: &BoundExpr, row: &[Value]) -> Result<Value, DbError> {
                 "evaluation column index {index} is outside the row"
             ))
         }),
-        BoundExpr::Not(inner) => eval_not(eval(inner, row)?),
-        BoundExpr::IsNull(inner) => Ok(Value::Boolean(eval(inner, row)?.is_null())),
-        BoundExpr::IsNotNull(inner) => Ok(Value::Boolean(!eval(inner, row)?.is_null())),
+        BoundExpr::Not(inner) => eval_not(eval_in(inner, row)?),
+        BoundExpr::IsNull(inner) => Ok(Value::Boolean(eval_in(inner, row)?.is_null())),
+        BoundExpr::IsNotNull(inner) => Ok(Value::Boolean(!eval_in(inner, row)?.is_null())),
         BoundExpr::Binary { left, op, right } => {
-            let left = eval(left, row)?;
-            let right = eval(right, row)?;
+            let left = eval_in(left, row)?;
+            let right = eval_in(right, row)?;
             eval_binary(*op, &left, &right)
         }
     }
 }
 
-fn bind(expr: &Expr, table: &Table) -> Result<BoundExpr, DbError> {
+fn bind(expr: &Expr, scope: &Scope) -> Result<BoundExpr, DbError> {
     match expr {
         Expr::Literal(value) => Ok(BoundExpr::Literal(value.clone())),
         Expr::Column { name, qualifier } => {
-            let index = resolve_column(
-                table,
-                &SelectColumn {
-                    name: name.clone(),
-                    qualifier: qualifier.clone(),
-                },
-            )?;
+            let index = scope.resolve(&SelectColumn {
+                name: name.clone(),
+                qualifier: qualifier.clone(),
+            })?;
             Ok(BoundExpr::Column(index))
         }
         Expr::Not(inner) => {
-            let inner = bind(inner, table)?;
-            expect_boolean("NOT", expr_type(&inner, table.schema())?)?;
+            let inner = bind(inner, scope)?;
+            expect_boolean("NOT", expr_type(&inner, &scope.types)?)?;
             Ok(BoundExpr::Not(Box::new(inner)))
         }
-        Expr::IsNull(inner) => Ok(BoundExpr::IsNull(Box::new(bind(inner, table)?))),
-        Expr::IsNotNull(inner) => Ok(BoundExpr::IsNotNull(Box::new(bind(inner, table)?))),
+        Expr::IsNull(inner) => Ok(BoundExpr::IsNull(Box::new(bind(inner, scope)?))),
+        Expr::IsNotNull(inner) => Ok(BoundExpr::IsNotNull(Box::new(bind(inner, scope)?))),
         Expr::Binary { left, op, right } => {
-            let left = bind(left, table)?;
-            let right = bind(right, table)?;
-            check_binary(*op, &left, &right, table.schema())?;
+            let left = bind(left, scope)?;
+            let right = bind(right, scope)?;
+            check_binary(*op, &left, &right, &scope.types)?;
             Ok(BoundExpr::Binary {
                 left: Box::new(left),
                 op: *op,
@@ -152,10 +350,10 @@ fn check_binary(
     op: BinOp,
     left: &BoundExpr,
     right: &BoundExpr,
-    schema: &Schema,
+    types: &[DataType],
 ) -> Result<(), DbError> {
-    let left_type = expr_type(left, schema)?;
-    let right_type = expr_type(right, schema)?;
+    let left_type = expr_type(left, types)?;
+    let right_type = expr_type(right, types)?;
     if op.is_logical() {
         expect_boolean(op.as_str(), left_type)?;
         expect_boolean(op.as_str(), right_type)?;
@@ -192,7 +390,7 @@ fn expect_boolean(op: &str, found: ExprType) -> Result<(), DbError> {
     }
 }
 
-fn expr_type(expr: &BoundExpr, schema: &Schema) -> Result<ExprType, DbError> {
+fn expr_type(expr: &BoundExpr, types: &[DataType]) -> Result<ExprType, DbError> {
     match expr {
         BoundExpr::Literal(Value::Null) => Ok(ExprType::Null),
         BoundExpr::Literal(value) => {
@@ -201,12 +399,12 @@ fn expr_type(expr: &BoundExpr, schema: &Schema) -> Result<ExprType, DbError> {
             })?))
         }
         BoundExpr::Column(index) => {
-            let Some(column) = schema.column(*index) else {
+            let Some(data_type) = types.get(*index) else {
                 return Err(DbError::Internal(format!(
                     "bound column index {index} is outside the schema"
                 )));
             };
-            Ok(ExprType::Value(column.data_type()))
+            Ok(ExprType::Value(*data_type))
         }
         BoundExpr::Not(_)
         | BoundExpr::IsNull(_)
