@@ -2,7 +2,7 @@
 //!
 //! It parses a limited SQL subset, stores typed tables, and runs them from a
 //! REPL. [`Database::new`] is in memory. [`Database::open`] reads and writes a
-//! page file. It does not lock rows or build indexes.
+//! page file and holds an exclusive lock on it. It does not lock rows or build indexes.
 //!
 //! # Example
 //!

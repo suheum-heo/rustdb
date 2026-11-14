@@ -72,11 +72,17 @@ impl Database {
     ///
     /// Statements are autocommitted one by one. If a later statement fails,
     /// earlier statements in the same string stay applied. Each individual
-    /// `INSERT`, `UPDATE`, or `DELETE` is atomic. A durable database publishes
-    /// a statement only after that statement succeeds. A failure before the
-    /// file is replaced restores memory. Once the replacement is visible,
-    /// memory is left in place so it matches the file.
+    /// `INSERT`, `UPDATE`, or `DELETE` is atomic. A durable database writes a
+    /// redo log and checkpoints it before reporting success. A failure before
+    /// the commit record is synced restores memory when the log is still
+    /// incomplete. A failed sync of that record does not prove the record is
+    /// absent: memory stays, the log stays, and further statements are refused
+    /// until the file is reopened. A failure after a successful log sync does
+    /// the same.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<StatementResult>, DbError> {
+        if let Some(error) = self.fenced() {
+            return Err(error);
+        }
         let statements = parser::parse(sql)?;
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
@@ -96,10 +102,10 @@ impl Database {
             return Ok(result);
         }
         if let Err(error) = self.publish() {
-            if !self.publication_visible() {
+            if let crate::storage::StepError::BeforeCommit(_) = &error {
                 self.rollback(undo);
             }
-            return Err(error);
+            return Err(error.into_db());
         }
         Ok(result)
     }

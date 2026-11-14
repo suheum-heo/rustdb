@@ -211,6 +211,7 @@ impl Table {
         TableImage {
             name: self.name.clone(),
             columns: self.schema.columns().to_vec(),
+            table_id: 0,
             next_row_id: self.next_row_id,
             rows: self
                 .row_ids
