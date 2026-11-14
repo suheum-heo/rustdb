@@ -2,7 +2,7 @@
 
 RustDB is a small relational SQL engine written in Rust. It parses a limited SQL subset, checks types against a table schema, and runs queries from a REPL. It does not use SQLite, PostgreSQL, or any other database engine.
 
-Nothing is stored on disk. Restarting the process drops every table.
+`cargo run` starts an empty in-memory database. `cargo run -- --database PATH` opens a page file, creating it when the path is missing or empty. The SQL behavior is the same in both modes.
 
 ## Architecture
 
@@ -14,7 +14,8 @@ SQL text
   -> internal statement tree (parser)
   -> expression binder (expr)
   -> executor
-  -> catalog of in-memory tables
+  -> in-memory catalog
+  -> page image, written after a successful mutation (file mode)
   -> rendered result
 ```
 
@@ -22,27 +23,40 @@ SQL text
 | --- | --- |
 | `value` | `INTEGER`, `TEXT`, `BOOLEAN`, and `NULL` |
 | `schema` | Column names, types, and insert column mapping |
-| `table` | One table: schema plus rows in insertion order |
-| `database` | Catalog of named tables |
+| `table` | One table: schema, insertion-ordered rows, and stable row ids |
+| `database` | Catalog of named tables, in memory or backed by a file |
+| `storage` | Pager, slotted pages, record codec, and catalog image |
 | `ast` | Statements and expressions the executor understands |
 | `parser` | `sqlparser` boundary and identifier normalization |
 | `expr` | Bind columns, check types, and evaluate three-valued logic |
 | `executor` | `CREATE`, `DROP`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE` |
 | `format` | ASCII result tables |
 | `repl` | Interactive session |
-| `error` | Parse, schema, and type errors |
+| `error` | Parse, schema, type, and storage errors |
 
-Rows are stored row by row (`Vec<Vec<Value>>`). `NULL` is its own value, not a sentinel integer or an empty string. A column reference keeps the column's declared type even when the stored cell is null. A `NULL` literal has no type and is compatible with every column.
+While a statement runs, rows live in a `Vec`. That keeps `INSERT` validation and tuple projection the same as the in-memory engine. After a successful mutating statement, file mode publishes those rows into 4096-byte slotted pages. The byte layout is documented in [docs/storage-format.md](docs/storage-format.md). It uses explicit little-endian integers and UTF-8, not Rust's in-memory representation.
+
+`NULL` is its own value, not a sentinel integer or an empty string. A column reference keeps the column's declared type even when the stored cell is null. A `NULL` literal has no type and is compatible with every column.
 
 Unquoted identifiers are folded to lowercase. Quoted identifiers keep their case and match exactly, so `Users` and `"Users"` are different tables.
 
-`INSERT` checks every row before it appends any of them. `UPDATE` and `DELETE` build a complete replacement row list and install it only after every row succeeds. A type error or a missing column leaves the table unchanged. Separate statements in one string are applied one at a time: if the second statement fails, the first one stays.
+`INSERT` checks every row before it appends any of them. `UPDATE` and `DELETE` build the replacement rows and install them only after every row succeeds. A type error or a missing column leaves the table unchanged. In file mode the previous file is also left unchanged, because the new image is renamed into place only after the statement succeeds. Separate statements in one string are applied one at a time: if the second statement fails, the first one stays, including on disk.
 
 `SELECT`, `UPDATE`, and `DELETE` share one filter. The `WHERE` expression is bound to column indexes and type-checked before any row is read. An empty table still reports a missing column or a comparison between different types. `AND` and `OR` are type-checked on both sides; a false or unknown left side does not hide a type error on the right.
 
 A query keeps a row only when `WHERE` evaluates to TRUE. FALSE and UNKNOWN both drop the row.
 
-`SELECT` then sorts, then applies `LIMIT`, then projects. `ORDER BY` can name a column that is absent from the select list. The sort is stable, so equal keys stay in insertion order.
+`SELECT` then sorts, then applies `LIMIT`, then projects. `ORDER BY` can name a column that is absent from the select list. The sort is stable, so equal keys stay in insertion order. `SELECT` does not rewrite the file.
+
+## Durability
+
+Each successful `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, or `DELETE` writes a complete page image to a uniquely named temporary file in the same directory, syncs that file, syncs the directory, and renames the temporary file over the database. The directory is synced again after the rename on systems that can sync a directory. A crash before the rename leaves the previous file, and a leftover temporary file is ignored. A failure before the rename restores the in-memory tables. RustDB does not keep a write-ahead log and does not claim that a power loss during the rename is atomic. A checksum failure on a later open is reported and not repaired.
+
+A row must fit in one heap cell, at most 4068 bytes. Larger rows are rejected in both modes. There are no overflow pages. A table can still occupy many pages: each row is one cell, and cells are linked in insertion order.
+
+Deleted rows are omitted from the next image. Their pages become free ids and can be reused, so deleting a large table and inserting a similar one does not grow the file without bound. Inside one page, a deleted slot is reusable after compaction. A published page is packed, with no holes.
+
+Every row has a `u64` id assigned at insert. `UPDATE` keeps it. `DELETE` does not reuse it. The on-disk `(page, slot)` can change on the next publish; the row id does not. Row ids are not returned by SQL.
 
 ## Build and run
 
@@ -50,12 +64,13 @@ Requires a stable Rust toolchain (this project was built with Rust 1.100).
 
 ```sh
 cargo run
+cargo run -- --database ./rustdb.db
 cargo test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-The REPL prompts with `rustdb> `. End each statement with `;`. A statement can span lines. `exit` and `quit` close the session. SQL errors are printed and the session continues.
+With no arguments the REPL uses an empty in-memory database, and exiting drops every table. `--database PATH` creates the file when it does not exist and reloads it on the next run. The REPL prompts with `rustdb> `. End each statement with `;`. A statement can span lines. `exit` and `quit` close the session. SQL errors are printed and the session continues.
 
 Library use:
 
@@ -196,9 +211,44 @@ rustdb> exit
 
 `ORDER BY age DESC` places Bob first because a null age sorts before every number in descending order. `ORDER BY age ASC LIMIT 1` returns Unknown, whose age is 30, because ascending order places nulls last.
 
+The same statements persist across processes. This session used `cargo run -- --database /tmp/rustdb-m3-demo/rustdb.db`, exited, and started again with the same path:
+
+```text
+rustdb> CREATE TABLE users (id INT, name TEXT, age INT);
+OK
+rustdb> INSERT INTO users VALUES (1, 'Alice', 24), (2, 'Bob', NULL);
+2 rows inserted
+rustdb> UPDATE users SET age = 31 WHERE id = 1;
+1 row updated
+rustdb> exit
+```
+
+```text
+rustdb> SELECT name, age FROM users ORDER BY age ASC;
++-------+------+
+| name  | age  |
++-------+------+
+| Alice | 31   |
+| Bob   | NULL |
++-------+------+
+2 rows returned
+rustdb> DELETE FROM users WHERE name = 'Alice';
+1 row deleted
+rustdb> SELECT name, age FROM users;
++------+------+
+| name | age  |
++------+------+
+| Bob  | NULL |
++------+------+
+1 row returned
+rustdb> exit
+```
+
 ## Current limitations
 
-- Memory only. There is no file format, buffer pool, or crash recovery.
+- File mode replaces the whole page image after each mutating statement. There is no write-ahead log, buffer-pool eviction, or crash recovery. A power loss during the rename is not claimed to be atomic. A leftover temporary file from a crash before the rename is not recovered.
+- A row cannot exceed 4068 bytes. Rows do not overflow onto a second page.
+- One writer. The file is not locked, and two processes must not publish it at the same time.
 - No `JOIN`, `GROUP BY`, `DISTINCT`, aggregates, subqueries, `LIKE`, `IN`, `BETWEEN`, or arithmetic.
 - No primary keys, unique constraints, defaults, or column constraints. `NOT NULL` is rejected with the other constraints, so the engine does not yet enforce it.
 - No `UPDATE` or `DELETE` with `ORDER BY`, `LIMIT`, `RETURNING`, or a second table.
@@ -212,4 +262,4 @@ rustdb> exit
 
 ## Next milestone
 
-Milestone 3 should store the current row format on disk. The in-memory value model, including `NULL`, is now stable enough to give a page layout something concrete to persist. Indexes, a write-ahead log, and concurrency should wait until a page can be written and read back.
+Milestone 4 should add a B+ tree for equality and range lookup on one column. The page format is now concrete enough to hold internal index pages. A write-ahead log can wait until rewriting the whole file is the measured cost; it should not arrive disguised as a transaction system.

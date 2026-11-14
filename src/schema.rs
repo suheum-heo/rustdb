@@ -62,6 +62,10 @@ impl Schema {
         Ok(Self { columns })
     }
 
+    pub(crate) fn columns(&self) -> &[Column] {
+        &self.columns
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.columns.len()
     }

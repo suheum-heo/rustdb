@@ -1,7 +1,8 @@
-//! RustDB is a small in-memory relational SQL engine.
+//! RustDB is a small relational SQL engine.
 //!
-//! It parses a limited SQL subset, stores typed tables in memory, and runs
-//! them from a REPL. It does not persist data, lock rows, or build indexes.
+//! It parses a limited SQL subset, stores typed tables, and runs them from a
+//! REPL. [`Database::new`] is in memory. [`Database::open`] reads and writes a
+//! page file. It does not lock rows or build indexes.
 //!
 //! # Example
 //!
@@ -26,6 +27,7 @@ mod format;
 mod parser;
 mod repl;
 mod schema;
+mod storage;
 mod table;
 mod value;
 
@@ -34,4 +36,5 @@ pub use error::DbError;
 pub use executor::{QueryResult, StatementResult};
 pub use format::render_result;
 pub use repl::run;
+pub use storage::{MAX_RECORD_LEN, PAGE_SIZE};
 pub use value::{DataType, Value};
