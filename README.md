@@ -15,7 +15,7 @@ SQL text
   -> expression binder (expr)
   -> executor
   -> in-memory catalog
-  -> page image, written after a successful mutation (file mode)
+  -> dirty pages, redo log, then checkpoint (file mode)
   -> rendered result
 ```
 
@@ -25,7 +25,7 @@ SQL text
 | `schema` | Column names, types, and insert column mapping |
 | `table` | One table: schema, insertion-ordered rows, and stable row ids |
 | `database` | Catalog of named tables, in memory or backed by a file |
-| `storage` | Pager, slotted pages, record codec, and catalog image |
+| `storage` | Pager, slotted pages, redo log, and incremental page edits |
 | `ast` | Statements and expressions the executor understands |
 | `parser` | `sqlparser` boundary and identifier normalization |
 | `expr` | Bind columns, check types, and evaluate three-valued logic |
@@ -40,7 +40,7 @@ While a statement runs, rows live in a `Vec`. That keeps `INSERT` validation and
 
 Unquoted identifiers are folded to lowercase. Quoted identifiers keep their case and match exactly, so `Users` and `"Users"` are different tables.
 
-`INSERT` checks every row before it appends any of them. `UPDATE` and `DELETE` build the replacement rows and install them only after every row succeeds. A type error or a missing column leaves the table unchanged. In file mode the previous file is also left unchanged, because the new image is renamed into place only after the statement succeeds. Separate statements in one string are applied one at a time: if the second statement fails, the first one stays, including on disk.
+`INSERT` checks every row before it appends any of them. `UPDATE` and `DELETE` build the replacement rows and install them only after every row succeeds. A type error or a missing column leaves the table unchanged. In file mode a failure before the commit record is synced restores memory when the log is still incomplete. A failed sync of that record does not prove the record is absent: memory stays, the log stays, and the process refuses further statements until the file is reopened. A failure after a successful log sync does the same. Separate statements in one string are applied one at a time: if the second statement fails, the first one stays, including on disk.
 
 `SELECT`, `UPDATE`, and `DELETE` share one filter. The `WHERE` expression is bound to column indexes and type-checked before any row is read. An empty table still reports a missing column or a comparison between different types. `AND` and `OR` are type-checked on both sides; a false or unknown left side does not hide a type error on the right.
 
@@ -50,13 +50,19 @@ A query keeps a row only when `WHERE` evaluates to TRUE. FALSE and UNKNOWN both 
 
 ## Durability
 
-Each successful `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, or `DELETE` writes a complete page image to a uniquely named temporary file in the same directory, syncs that file, syncs the directory, and renames the temporary file over the database. The directory is synced again after the rename on systems that can sync a directory. A crash before the rename leaves the previous file, and a leftover temporary file is ignored. A failure before the rename restores the in-memory tables. RustDB does not keep a write-ahead log and does not claim that a power loss during the rename is atomic. A checksum failure on a later open is reported and not repaired.
+Each successful `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, or `DELETE` writes the pages that statement changed into `PATH.wal`, syncs that same file, writes those pages into the database, syncs the database, and only then truncates the log. A successful sync of the log is the commit point. A failed sync is not treated as a rollback. `SELECT` does not write the log. Unchanged pages stay as they are, including other tables' heap pages.
+
+The process holds an advisory `flock` on `PATH.lock` and on the database file for as long as it has the database open. The lock file stays after unlock. A second open of the same path fails, including a second open in this process. Renaming the database file does not release the inode lock held by the process that already has it open. `flock` is advisory: a process that does not take it is not stopped. A forked child inherits the lock until it closes that descriptor or starts a new program. The descriptor is close-on-exec.
+
+A crash before the commit record is durable leaves the previous database, and an incomplete log that belongs to the file is discarded on open. A crash after the commit record is durable and before the log is cleared is repaired on the next open by writing the logged pages again. That replay is safe to repeat. A version 1 file is not migrated on open. `rustdb --migrate PATH` rewrites it as version 2 and keeps row ids and table ids.
+
+This is not a power-loss proof. The tests stop the commit at chosen steps, including a sync that returns an error after the commit record has been written. They do not cut power. RustDB assumes a local filesystem that honors `File::sync_all` and `flock`. The byte layout, the log, and the remaining filesystem assumptions are in [docs/storage-format.md](docs/storage-format.md).
 
 A row must fit in one heap cell, at most 4068 bytes. Larger rows are rejected in both modes. There are no overflow pages. A table can still occupy many pages: each row is one cell, and cells are linked in insertion order.
 
-Deleted rows are omitted from the next image. Their pages become free ids and can be reused, so deleting a large table and inserting a similar one does not grow the file without bound. Inside one page, a deleted slot is reusable after compaction. A published page is packed, with no holes.
+Deleted rows leave free pages that a later statement can reuse, so deleting a large table and inserting a similar one does not grow the file without bound. The file is not shrunk. Inside one page, a deleted slot can be reused. An update that fits in the existing cell keeps that `(page, slot)`.
 
-Every row has a `u64` id assigned at insert. `UPDATE` keeps it. `DELETE` does not reuse it. The on-disk `(page, slot)` can change on the next publish; the row id does not. Row ids are not returned by SQL.
+Every row has a `u64` id assigned at insert. `UPDATE` keeps it. `DELETE` does not reuse it. Row ids are not returned by SQL. Table ids for a file written by this version come from a counter stored at the end of page 0. `DROP TABLE` does not return an id, including after that file is reopened. A file written before the counter existed has no record of deleted ids, so the first new table after opening it can reuse one. Table ids are not returned by SQL either.
 
 ## Build and run
 
@@ -65,12 +71,13 @@ Requires a stable Rust toolchain (this project was built with Rust 1.100).
 ```sh
 cargo run
 cargo run -- --database ./rustdb.db
+cargo run -- --migrate ./rustdb-v1.db
 cargo test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-With no arguments the REPL uses an empty in-memory database, and exiting drops every table. `--database PATH` creates the file when it does not exist and reloads it on the next run. The REPL prompts with `rustdb> `. End each statement with `;`. A statement can span lines. `exit` and `quit` close the session. SQL errors are printed and the session continues.
+With no arguments the REPL uses an empty in-memory database, and exiting drops every table. `--database PATH` creates a version 2 file when it does not exist and reloads it on the next run. `--migrate PATH` rewrites a version 1 file as version 2 and then exits. It does not start the REPL. A version 2 file is left unchanged and the command fails. The REPL prompts with `rustdb> `. End each statement with `;`. A statement can span lines. `exit` and `quit` close the session. SQL errors are printed and the session continues.
 
 Library use:
 
@@ -246,9 +253,9 @@ rustdb> exit
 
 ## Current limitations
 
-- File mode replaces the whole page image after each mutating statement. There is no write-ahead log, buffer-pool eviction, or crash recovery. A power loss during the rename is not claimed to be atomic. A leftover temporary file from a crash before the rename is not recovered.
+- File mode checkpoints the pages a statement changes. It is not a power-loss proof. Fault-injection tests stop the process between the log sync, the page writes, the database sync, and clearing the log. They do not show what a filesystem does when power is lost during `sync_all`. Network filesystems are not supported. A checksum or audit failure is reported and not repaired.
 - A row cannot exceed 4068 bytes. Rows do not overflow onto a second page.
-- One writer. The file is not locked, and two processes must not publish it at the same time.
+- One writer. A second process cannot open a database this process already has open. There are no concurrent readers and no multi-writer mode.
 - No `JOIN`, `GROUP BY`, `DISTINCT`, aggregates, subqueries, `LIKE`, `IN`, `BETWEEN`, or arithmetic.
 - No primary keys, unique constraints, defaults, or column constraints. `NOT NULL` is rejected with the other constraints, so the engine does not yet enforce it.
 - No `UPDATE` or `DELETE` with `ORDER BY`, `LIMIT`, `RETURNING`, or a second table.

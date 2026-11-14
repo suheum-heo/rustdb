@@ -107,6 +107,21 @@ pub(crate) fn patch_links(cell: &mut [u8], prev: Link, next: Link) -> Result<(),
     Ok(())
 }
 
+/// Update the fixed head of a catalog cell. The name and columns stay put.
+pub(crate) fn patch_catalog_head(
+    cell: &mut [u8],
+    next_row_id: u64,
+    head: Link,
+) -> Result<(), DbError> {
+    if cell.len() < 18 {
+        return Err(corrupt_file());
+    }
+    cell[4..12].copy_from_slice(&next_row_id.to_le_bytes());
+    cell[12..16].copy_from_slice(&head.page.to_le_bytes());
+    cell[16..18].copy_from_slice(&head.slot.to_le_bytes());
+    Ok(())
+}
+
 pub(crate) fn encode_catalog(
     table_id: u32,
     next_row_id: u64,

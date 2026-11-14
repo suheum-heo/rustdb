@@ -7,4 +7,5 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+fs4 = "0.13.1"
 sqlparser = "0.64.0"

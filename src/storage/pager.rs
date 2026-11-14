@@ -1,9 +1,10 @@
-//! Reads and publishes fixed-size pages.
+//! Reads pages and checkpoints dirty pages in place.
 //!
-//! A commit writes a complete image to a uniquely named temporary file in the
-//! same directory as the database, syncs the file and that directory, then
-//! renames it over the database. The previous file is left untouched until
-//! that rename. A failure before the rename does not replace the database.
+//! An ordinary commit writes a redo log, syncs that same file, writes those
+//! pages into the database, syncs the database, and truncates the log. A
+//! failed log sync keeps the log. Creating a database and migrating version 1
+//! still replace the file through a temporary name. The path lock is
+//! `PATH.lock` and is acquired before any of that work.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -11,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::DbError;
+use crate::storage::lock::DbLock;
 use crate::storage::page::{self, PAGE_SIZE, Page};
+use crate::storage::profile;
+use crate::storage::wal::{self, Inject, StepError};
 
 const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
 
@@ -19,13 +23,8 @@ pub(crate) struct Pager {
     path: PathBuf,
     file: File,
     page_count: u32,
-    /// Free data-page ids in the committed image. Highest id is reused first.
-    reusable: Vec<u32>,
     cache: Vec<Option<Page>>,
-    /// True after `rename` has replaced the database for the current publish.
-    publish_visible: bool,
-    /// The open handle still refers to the inode from before that rename.
-    reopen_required: bool,
+    held: Option<DbLock>,
 }
 
 /// Uncommitted pages for one publish.
@@ -39,14 +38,32 @@ pub(crate) struct Image {
 
 impl Pager {
     pub(crate) fn open(path: &Path) -> Result<Self, DbError> {
+        Self::open_locked(path, false)
+    }
+
+    /// Open a version 1 file for the explicit migration command.
+    pub(crate) fn open_v1(path: &Path) -> Result<Self, DbError> {
+        Self::open_locked(path, true)
+    }
+
+    fn open_locked(path: &Path, allow_v1: bool) -> Result<Self, DbError> {
+        let held = crate::storage::lock::acquire(path)?;
         if !path.exists()
             || fs::metadata(path)
                 .map_err(|error| open_error(path, &error))?
                 .len()
                 == 0
         {
-            let pages = initial_pages()?;
-            return Self::create(path, pages);
+            if allow_v1 {
+                return Err(DbError::Storage(format!(
+                    "database file '{}' is not format version 1",
+                    path.display()
+                )));
+            }
+            let pages = initial_pages_with(fresh_nonce())?;
+            let mut pager = Self::create(path, pages)?;
+            pager.held = Some(held);
+            return Ok(pager);
         }
 
         let file = File::options()
@@ -54,6 +71,7 @@ impl Pager {
             .write(true)
             .open(path)
             .map_err(|error| open_error(path, &error))?;
+        crate::storage::lock::lock_file(&file, path)?;
         let length = file
             .metadata()
             .map_err(|error| open_error(path, &error))?
@@ -66,11 +84,41 @@ impl Pager {
             file,
             page_count: u32::try_from(length / PAGE_SIZE_U64)
                 .map_err(|_| DbError::Storage("database file is corrupt".to_string()))?,
-            reusable: Vec::new(),
             cache: Vec::new(),
-            publish_visible: false,
-            reopen_required: false,
+            held: Some(held),
         };
+        let meta = {
+            let mut page = Page::new();
+            pager.read_into(0, &mut page)?;
+            page::read_meta(&page)?
+        };
+        if meta.version == page::FORMAT_VERSION_V1 {
+            if u64::from(meta.page_count) * PAGE_SIZE_U64 != length {
+                return Err(DbError::Storage("database file is truncated".to_string()));
+            }
+            if allow_v1 {
+                pager.page_count = meta.page_count;
+                return Ok(pager);
+            }
+            return Err(page::migration_required(path));
+        }
+        if allow_v1 {
+            return Err(DbError::Storage(
+                "database file is already format version 2".to_string(),
+            ));
+        }
+        wal::recover(&mut pager.file, &wal::path_for(path))?;
+        pager.cache.clear();
+        let length = pager
+            .file
+            .metadata()
+            .map_err(|error| open_error(path, &error))?
+            .len();
+        if length < PAGE_SIZE_U64 || length % PAGE_SIZE_U64 != 0 {
+            return Err(DbError::Storage("database file is truncated".to_string()));
+        }
+        pager.page_count = u32::try_from(length / PAGE_SIZE_U64)
+            .map_err(|_| DbError::Storage("database file is corrupt".to_string()))?;
         let meta = {
             let mut page = Page::new();
             pager.read_into(0, &mut page)?;
@@ -91,12 +139,6 @@ impl Pager {
         &self.path
     }
 
-    pub(crate) fn set_reusable(&mut self, mut reusable: Vec<u32>) {
-        reusable.sort_unstable();
-        reusable.dedup();
-        self.reusable = reusable;
-    }
-
     pub(crate) fn read_into(&mut self, id: u32, dest: &mut Page) -> Result<(), DbError> {
         self.load(id)?;
         let index = usize::try_from(id)
@@ -110,78 +152,105 @@ impl Pager {
         Ok(())
     }
 
-    pub(crate) fn begin_image(&self) -> Image {
-        Image {
-            pages: Vec::new(),
-            next_id: self.page_count,
-            reusable: self.reusable.clone(),
-            allocated: Vec::new(),
+    /// Sync a redo log of `pages`, write those pages, sync the database, then
+    /// truncate the log. `base_commit` is the commit id already durable in page 0.
+    pub(crate) fn checkpoint(
+        &mut self,
+        pages: Vec<(u32, Page)>,
+        page_count: u32,
+        nonce: u64,
+        base_commit: u64,
+        inject: Option<Inject>,
+    ) -> Result<(), StepError> {
+        let wal_path = wal::path_for(&self.path);
+        let plan = wal::Plan {
+            nonce,
+            base_commit,
+            frames: &pages,
+        };
+        let bytes = if inject == Some(Inject::BeforeLogSync) {
+            wal::encode_uncommitted(&plan).map_err(StepError::BeforeCommit)?
+        } else {
+            wal::encode_committed(&plan).map_err(StepError::BeforeCommit)?
+        };
+        let wal_mark = profile::start();
+        let written = write_log(&wal_path, &bytes);
+        profile::add_wal_write(wal_mark);
+        let wal_file = match written {
+            Ok(file) => file,
+            Err(error) => return Err(commit_write_error(&wal_path, error)),
+        };
+        if inject == Some(Inject::BeforeLogSync) {
+            return Err(StepError::BeforeCommit(DbError::Storage(
+                "injected failure before the redo log was synced".to_string(),
+            )));
         }
-    }
-
-    pub(crate) fn begin_publish(&mut self) {
-        self.publish_visible = false;
-    }
-
-    pub(crate) fn publication_visible(&self) -> bool {
-        self.publish_visible
-    }
-
-    /// Replace the database file with `pages` and remember `reusable`.
-    ///
-    /// `publication_visible` stays false until `rename` has replaced the
-    /// destination. A failure before that leaves the existing file alone. A
-    /// failure after it keeps the new page count so memory can stay with the
-    /// file that is now visible.
-    pub(crate) fn commit(&mut self, pages: Vec<Page>, reusable: Vec<u32>) -> Result<(), DbError> {
-        self.publish_visible = false;
-        let page_count = u32::try_from(pages.len())
-            .map_err(|_| DbError::Internal("published page count does not fit".to_string()))?;
-        match persist(&self.path, &pages) {
-            Ok(file) => {
-                self.publish_visible = true;
-                self.file = file;
-                self.page_count = page_count;
-                self.reusable = reusable;
-                self.cache.clear();
-                self.reopen_required = false;
-                Ok(())
-            }
-            Err(PersistError::NotVisible(error)) => Err(error),
-            Err(PersistError::Visible(error)) => {
-                self.publish_visible = true;
-                self.page_count = page_count;
-                self.reusable = reusable;
-                self.cache.clear();
-                self.reopen_required = true;
-                Err(error)
-            }
+        if inject == Some(Inject::CommitSyncFailed) {
+            return Err(ambiguous_sync());
         }
+        let sync_mark = profile::start();
+        let synced = wal_file.sync_all();
+        profile::add_wal_sync(sync_mark);
+        if let Err(error) = synced {
+            return Err(ambiguous_sync_io(&wal_path, &error));
+        }
+        if inject == Some(Inject::AfterLogSync) {
+            return Err(StepError::AfterCommit(DbError::Storage(
+                "injected failure after the redo log was synced".to_string(),
+            )));
+        }
+        let write_mark = profile::start();
+        for (written, (id, page)) in pages.iter().enumerate() {
+            if inject
+                == Some(Inject::DuringCheckpoint(
+                    u32::try_from(written).unwrap_or(u32::MAX),
+                ))
+            {
+                return Err(StepError::AfterCommit(DbError::Storage(
+                    "injected failure during checkpoint".to_string(),
+                )));
+            }
+            wal::write_page(&mut self.file, *id, page).map_err(StepError::AfterCommit)?;
+        }
+        profile::add_db_write(write_mark);
+        let db_sync = profile::start();
+        let synced = self.file.sync_all();
+        profile::add_db_sync(db_sync);
+        synced.map_err(|error| {
+            StepError::AfterCommit(DbError::Storage(format!(
+                "failed to sync database file '{}': {error}",
+                self.path.display()
+            )))
+        })?;
+        if matches!(inject, Some(Inject::AfterDbSync | Inject::BeforeLogClear)) {
+            return Err(StepError::AfterCommit(DbError::Storage(
+                "injected failure before the redo log was cleared".to_string(),
+            )));
+        }
+        let clear_mark = profile::start();
+        let cleared = wal::truncate_log(&wal_path);
+        profile::add_wal_clear(clear_mark);
+        cleared.map_err(StepError::AfterCommit)?;
+        profile::note_frames(u32::try_from(pages.len()).unwrap_or(u32::MAX));
+        self.page_count = page_count;
+        self.cache.clear();
+        Ok(())
     }
 
     fn create(path: &Path, pages: Vec<Page>) -> Result<Self, DbError> {
         let file = persist(path, &pages).map_err(PersistError::into_db_error)?;
+        crate::storage::lock::lock_file(&file, path)?;
         Ok(Self {
             path: path.to_path_buf(),
             file,
             page_count: u32::try_from(pages.len())
                 .map_err(|_| DbError::Internal("published page count does not fit".to_string()))?,
-            reusable: Vec::new(),
             cache: Vec::new(),
-            publish_visible: false,
-            reopen_required: false,
+            held: None,
         })
     }
 
     fn load(&mut self, id: u32) -> Result<(), DbError> {
-        if self.reopen_required {
-            self.file = File::options()
-                .read(true)
-                .write(true)
-                .open(&self.path)
-                .map_err(|error| open_error(&self.path, &error))?;
-            self.reopen_required = false;
-        }
         if id >= self.page_count {
             return Err(DbError::Storage(format!(
                 "database page {id} is outside the file"
@@ -215,7 +284,24 @@ impl Pager {
     }
 }
 
+impl Drop for Pager {
+    fn drop(&mut self) {
+        // Release the path lock before the file's inode lock drops with `file`.
+        drop(self.held.take());
+    }
+}
+
 impl Image {
+    /// An empty image used to build a complete file, including migration.
+    pub(crate) fn fresh() -> Self {
+        Self {
+            pages: Vec::new(),
+            next_id: 1,
+            reusable: Vec::new(),
+            allocated: Vec::new(),
+        }
+    }
+
     /// Reuse a free data page, or append a page id past the current end.
     pub(crate) fn allocate(&mut self) -> Result<u32, DbError> {
         let id = if let Some(id) = self.reusable.pop() {
@@ -306,14 +392,23 @@ impl Image {
     }
 }
 
+#[cfg(test)]
 fn initial_pages() -> Result<Vec<Page>, DbError> {
+    initial_pages_with(1)
+}
+
+fn initial_pages_with(nonce: u64) -> Result<Vec<Page>, DbError> {
     let mut meta = Page::new();
     page::write_meta(
         &mut meta,
         page::Meta {
+            version: page::FORMAT_VERSION,
             page_count: 2,
             catalog_root: 1,
             freelist_root: 0,
+            nonce,
+            commit_id: 0,
+            next_table_id: 1,
         },
         &[],
     )?;
@@ -448,6 +543,12 @@ fn open_database(path: &Path) -> Result<File, DbError> {
         .map_err(|error| open_error(path, &error))
 }
 
+pub(crate) fn replace_file(path: &Path, pages: &[Page]) -> Result<(), DbError> {
+    persist(path, pages)
+        .map(|_| ())
+        .map_err(PersistError::into_db_error)
+}
+
 fn open_error(path: &Path, error: &std::io::Error) -> DbError {
     DbError::Storage(format!(
         "failed to open database file '{}': {error}",
@@ -467,6 +568,63 @@ fn write_error(path: &Path, error: &std::io::Error) -> DbError {
         "failed to write database file '{}': {error}",
         path.display()
     ))
+}
+
+pub(crate) fn fresh_nonce() -> u64 {
+    let ticks = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(1);
+    let mixed = ticks ^ u64::from(std::process::id()).wrapping_shl(17);
+    if mixed == 0 { 1 } else { mixed }
+}
+
+fn write_log(path: &Path, bytes: &[u8]) -> Result<File, DbError> {
+    let mut file = File::create(path).map_err(|error| {
+        DbError::Storage(format!(
+            "failed to write database file '{}': {error}",
+            path.display()
+        ))
+    })?;
+    file.write_all(bytes).map_err(|error| {
+        DbError::Storage(format!(
+            "failed to write database file '{}': {error}",
+            path.display()
+        ))
+    })?;
+    Ok(file)
+}
+
+/// A failed write is a confirmed pre-commit failure only when the bytes left
+/// behind are not a commit record. A complete or damaged record fences the
+/// database and is left for recovery.
+fn commit_write_error(path: &Path, error: DbError) -> StepError {
+    let bytes = fs::read(path).unwrap_or_default();
+    match wal::classify_log(&bytes) {
+        wal::LogClass::Incomplete if bytes.is_empty() => StepError::BeforeCommit(error),
+        wal::LogClass::Incomplete => match wal::truncate_log(path) {
+            Ok(()) => StepError::BeforeCommit(error),
+            Err(_) => ambiguous(error),
+        },
+        wal::LogClass::Committed | wal::LogClass::Damaged => ambiguous(error),
+    }
+}
+
+fn ambiguous_sync() -> StepError {
+    ambiguous(DbError::Storage(
+        "injected failure while syncing the commit record; durability is unknown".to_string(),
+    ))
+}
+
+fn ambiguous_sync_io(path: &Path, error: &std::io::Error) -> StepError {
+    ambiguous(DbError::Storage(format!(
+        "failed to sync redo log '{}'; durability of the commit record is unknown: {error}",
+        path.display()
+    )))
+}
+
+fn ambiguous(error: DbError) -> StepError {
+    StepError::AfterCommit(error)
 }
 
 #[cfg(test)]

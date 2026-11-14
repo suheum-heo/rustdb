@@ -338,6 +338,9 @@ fn a_failed_publish_restores_memory_and_keeps_the_previous_file() {
     exec(&mut db, "CREATE TABLE users (id INT, name TEXT);");
     exec(&mut db, "INSERT INTO users VALUES (1, 'Ann');");
     let before = fs::read(file.path()).unwrap();
+    let mut wal = file.path().into_os_string();
+    wal.push(".wal");
+    let _ = fs::remove_file(wal);
     let _restore = Restore(file.dir.clone());
     let mut permissions = fs::metadata(&file.dir).unwrap().permissions();
     permissions.set_mode(0o555);

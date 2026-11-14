@@ -5,14 +5,14 @@ use std::path::Path;
 
 use crate::error::DbError;
 use crate::schema::Column;
-use crate::storage::{Store, TableImage};
+use crate::storage::{StepError, Store, TableImage};
 use crate::table::Table;
 
 /// A database holding named tables.
 ///
 /// [`Database::new`] keeps the catalog in memory. [`Database::open`] loads a
 /// page file and publishes each successful mutating statement back to that
-/// file. There is one catalog and no locking.
+/// file. One process holds an exclusive lock on that file. There is one catalog.
 pub struct Database {
     tables: HashMap<String, Table>,
     store: Option<Store>,
@@ -71,6 +71,16 @@ impl Database {
         })
     }
 
+    /// Rewrite a version 1 file as version 2. A version 2 file is left unchanged
+    /// and this returns an error.
+    pub fn migrate(path: impl AsRef<Path>) -> Result<(), DbError> {
+        Store::migrate(path.as_ref())
+    }
+
+    pub(crate) fn fenced(&self) -> Option<DbError> {
+        self.store.as_ref().and_then(Store::fenced)
+    }
+
     pub(crate) fn stores_on_disk(&self) -> bool {
         self.store.is_some()
     }
@@ -113,16 +123,12 @@ impl Database {
         }
     }
 
-    pub(crate) fn publish(&mut self) -> Result<(), DbError> {
+    pub(crate) fn publish(&mut self) -> Result<(), StepError> {
         let images: Vec<TableImage> = self.tables.values().map(Table::image).collect();
         let Some(store) = self.store.as_mut() else {
             return Ok(());
         };
         store.publish(&images)
-    }
-
-    pub(crate) fn publication_visible(&self) -> bool {
-        self.store.as_ref().is_some_and(Store::publication_visible)
     }
 
     pub(crate) fn create_table(
@@ -166,5 +172,104 @@ impl Database {
 impl Default for Database {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::StatementResult;
+    use crate::storage::Inject;
+    use crate::value::Value;
+
+    #[test]
+    fn a_failed_checkpoint_blocks_every_statement_until_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustdb-fence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db");
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        database
+            .store
+            .as_mut()
+            .expect("disk database")
+            .set_inject(Inject::AfterLogSync);
+        let error = database
+            .execute("INSERT INTO users VALUES (1, 'Ada');")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("checkpoint did not finish"),
+            "{error}"
+        );
+        let error = database.execute("SELECT name FROM users;").unwrap_err();
+        assert!(
+            error.to_string().contains("checkpoint did not finish"),
+            "{error}"
+        );
+        drop(database);
+
+        let mut database = Database::open(&path).unwrap();
+        let results = database.execute("SELECT name FROM users;").unwrap();
+        let StatementResult::Query(query) = &results[0] else {
+            panic!("expected a query");
+        };
+        assert_eq!(query.rows, vec![vec![Value::Text("Ada".to_string())]]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ambiguous_commit_sync_is_not_reported_as_a_rollback() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustdb-ambiguous-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db");
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        database
+            .store
+            .as_mut()
+            .expect("disk database")
+            .set_inject(Inject::CommitSyncFailed);
+        let error = database
+            .execute("INSERT INTO users VALUES (1, 'Ada');")
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("not a confirmed rollback"), "{message}");
+        assert!(message.contains("outcome is unknown"), "{message}");
+        assert!(
+            !message.contains("rolled back"),
+            "must not claim a rollback: {message}"
+        );
+        let mut wal = path.clone().into_os_string();
+        wal.push(".wal");
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        drop(database);
+
+        let mut database = Database::open(&path).unwrap();
+        let results = database.execute("SELECT name FROM users;").unwrap();
+        let StatementResult::Query(query) = &results[0] else {
+            panic!("expected a query");
+        };
+        assert_eq!(query.rows, vec![vec![Value::Text("Ada".to_string())]]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

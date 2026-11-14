@@ -1,6 +1,7 @@
-//! Release baseline for full-file publication.
+//! Release measurements for incremental page commits.
 //!
 //! Run with `cargo run --release --example storage_bench`.
+//! The historical full-file numbers are in `docs/benchmarks.md`.
 
 use std::fs;
 use std::path::PathBuf;
