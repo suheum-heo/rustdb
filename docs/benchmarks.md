@@ -480,3 +480,48 @@ The join builds 4 rows in `orders` per user and keeps 10 groups. Warm time is 54
 - The Milestone 10 table is a second release run on an in-memory database. The warm time is the median of five repeats. The cold time is the first sample. `bytes` counts the key vector, the accumulator vector, and one hash-map entry per group. It is not process RSS. A scalar aggregate has no hash map. The input table and the returned rows are not included. The earlier warm column is the first run of the same operator. The 100,000-group sample moved by 1,476 µs between those runs.
 - The Milestone 11 table is the pre-merge review run. Nested-loop and hash samples are in memory. Index samples are on a file after `CREATE INDEX`, with the probe forced because the inner table is only four times the outer table. The warm time is the median of five repeats. The cold time is the first sample. `bytes` is the grouping state before `HAVING`. `pair_bytes` is the joined rows the streaming path does not store. The hash path still stores 16 bytes of match positions per pair when it builds the outer table. None of those figures are process RSS.
 - The Milestone 12 table is one release run on an in-memory database. The warm time is the median of five repeats. The cold time is the first sample. Scalar `bytes` is the accumulator vector. Grouped `bytes` also counts key cells and one hash-map entry per accumulated group. `HAVING` still charges the groups it drops. The join is the in-memory hash join. None of those figures are process RSS. The Milestone 10 byte formula in code now uses the 48-byte accumulator; the published Milestone 10 table still shows the earlier 16-byte estimate.
+- The Milestone 13 table is the pre-merge review run on an in-memory database. The warm time is the median of five repeats. The cold time is the first sample. `acc_bytes` is the numeric accumulator state. `set_bytes` counts, per group, the `seen` vector header and the `Option` that owns the map, then one hash, one bucket header, and one `Value` per stored cell, plus the inserted text lengths. `Option<DistinctSet>` is 48 bytes, the same as the map. It does not include hash-table control bytes, spare capacity, or process RSS. A plain aggregate has `set_bytes` 0. Low-cardinality `SUM DISTINCT` and `AVG DISTINCT` are not slower than the plain forms on this run because they stop adding after 17 values.
+
+## Milestone 13 HAVING aliases and DISTINCT
+
+Release profile `profile_milestone13`, pre-merge review, 15 Nov 2026. Apple M5, 17179869184 bytes of memory, `rustc 1.100.0 (0ef1bc386 2026-11-09)`. `AccValue` is 48 bytes, `Value` is 32 bytes, `DistinctSet` is 48 bytes, and `Option<DistinctSet>` is also 48 bytes. The per-group `seen` vector header is 24 bytes. Each size is one in-memory load. The warm time is the median of the next five samples. The cold time is the first sample. Checksums are the printed wrapping sums, and a wrong result fails the run.
+
+`items` has `id`, a one-character `label` (`a` through `h`), a unique `tag` (`n` plus the id), `bucket = id % 10`, and `amount = id % 17` except when `id` is divisible by 11, where `amount` is NULL. `users` has one row per id. `orders` has four rows per user. Even order ids store NULL. Odd order ids store `id % 17`. The join keeps 10 groups. Its distinct count is the sum of the per-group set sizes, 85 at every measured size.
+
+| Shape | Rows | Returned | Groups | Distinct | Text bytes | Acc bytes | Set bytes | Checksum | Cold | Warm |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `COUNT(*)` | 1,000 | 1 | 1 | 0 | 0 | 72 | 0 | 1,000 | 378 µs | 37 µs |
+| `COUNT(DISTINCT bucket)` | 1,000 | 1 | 1 | 10 | 0 | 72 | 712 | 10 | 63 µs | 38 µs |
+| `COUNT(DISTINCT id)` | 1,000 | 1 | 1 | 1,000 | 0 | 72 | 64,072 | 1,000 | 176 µs | 162 µs |
+| `COUNT(DISTINCT label)` | 1,000 | 1 | 1 | 8 | 8 | 72 | 592 | 8 | 40 µs | 37 µs |
+| `COUNT(DISTINCT tag)` | 1,000 | 1 | 1 | 1,000 | 3,890 | 72 | 67,962 | 1,000 | 187 µs | 184 µs |
+| `SUM(amount)` | 1,000 | 1 | 1 | 0 | 0 | 72 | 0 | 7,253 | 40 µs | 37 µs |
+| `SUM(DISTINCT amount)` | 1,000 | 1 | 1 | 17 | 0 | 72 | 1,160 | 136 | 36 µs | 35 µs |
+| `AVG(amount)` | 1,000 | 1 | 1 | 0 | 0 | 72 | 0 | 8,162 | 37 µs | 36 µs |
+| `AVG(DISTINCT amount)` | 1,000 | 1 | 1 | 17 | 0 | 72 | 1,160 | 9 | 36 µs | 34 µs |
+| `HAVING` alias | 1,000 | 10 | 10 | 1,000 | 0 | 1,680 | 64,720 | 1,045 | 257 µs | 182 µs |
+| join `COUNT(DISTINCT amount)` | 1,000 | 10 | 10 | 85 | 0 | 1,680 | 6,160 | 130 | 617 µs | 535 µs |
+| `COUNT(*)` | 10,000 | 1 | 1 | 0 | 0 | 72 | 0 | 10,000 | 245 µs | 218 µs |
+| `COUNT(DISTINCT bucket)` | 10,000 | 1 | 1 | 10 | 0 | 72 | 712 | 10 | 311 µs | 217 µs |
+| `COUNT(DISTINCT id)` | 10,000 | 1 | 1 | 10,000 | 0 | 72 | 640,072 | 10,000 | 1,190 µs | 1,121 µs |
+| `COUNT(DISTINCT label)` | 10,000 | 1 | 1 | 8 | 8 | 72 | 592 | 8 | 242 µs | 218 µs |
+| `COUNT(DISTINCT tag)` | 10,000 | 1 | 1 | 10,000 | 48,890 | 72 | 688,962 | 10,000 | 1,292 µs | 1,291 µs |
+| `SUM(amount)` | 10,000 | 1 | 1 | 0 | 0 | 72 | 0 | 72,693 | 240 µs | 223 µs |
+| `SUM(DISTINCT amount)` | 10,000 | 1 | 1 | 17 | 0 | 72 | 1,160 | 136 | 207 µs | 201 µs |
+| `AVG(amount)` | 10,000 | 1 | 1 | 0 | 0 | 72 | 0 | 9,087 | 332 µs | 280 µs |
+| `AVG(DISTINCT amount)` | 10,000 | 1 | 1 | 17 | 0 | 72 | 1,160 | 9 | 207 µs | 201 µs |
+| `HAVING` alias | 10,000 | 10 | 10 | 10,000 | 0 | 1,680 | 640,720 | 10,045 | 1,585 µs | 1,525 µs |
+| join `COUNT(DISTINCT amount)` | 10,000 | 10 | 10 | 85 | 0 | 1,680 | 6,160 | 130 | 4,107 µs | 4,008 µs |
+| `COUNT(*)` | 100,000 | 1 | 1 | 0 | 0 | 72 | 0 | 100,000 | 2,669 µs | 2,842 µs |
+| `COUNT(DISTINCT bucket)` | 100,000 | 1 | 1 | 10 | 0 | 72 | 712 | 10 | 3,218 µs | 2,330 µs |
+| `COUNT(DISTINCT id)` | 100,000 | 1 | 1 | 100,000 | 0 | 72 | 6,400,072 | 100,000 | 14,500 µs | 13,642 µs |
+| `COUNT(DISTINCT label)` | 100,000 | 1 | 1 | 8 | 8 | 72 | 592 | 8 | 3,205 µs | 2,431 µs |
+| `COUNT(DISTINCT tag)` | 100,000 | 1 | 1 | 100,000 | 588,890 | 72 | 6,988,962 | 100,000 | 17,443 µs | 16,443 µs |
+| `SUM(amount)` | 100,000 | 1 | 1 | 0 | 0 | 72 | 0 | 727,233 | 3,544 µs | 2,575 µs |
+| `SUM(DISTINCT amount)` | 100,000 | 1 | 1 | 17 | 0 | 72 | 1,160 | 136 | 2,344 µs | 2,203 µs |
+| `AVG(amount)` | 100,000 | 1 | 1 | 0 | 0 | 72 | 0 | 20,978 | 2,460 µs | 2,507 µs |
+| `AVG(DISTINCT amount)` | 100,000 | 1 | 1 | 17 | 0 | 72 | 1,160 | 9 | 2,141 µs | 2,180 µs |
+| `HAVING` alias | 100,000 | 10 | 10 | 100,000 | 0 | 1,680 | 6,400,720 | 100,045 | 15,883 µs | 15,711 µs |
+| join `COUNT(DISTINCT amount)` | 100,000 | 10 | 10 | 85 | 0 | 1,680 | 6,160 | 130 | 48,624 µs | 44,821 µs |
+
+At 100,000 rows, warm `COUNT(*)` is 2,842 µs. Warm `COUNT(DISTINCT bucket)` over 10 values is 2,330 µs. Warm `COUNT(DISTINCT id)` over 100,000 values is 13,642 µs, and the set estimate is 6,400,072 bytes. Warm `COUNT(DISTINCT label)` over 8 one-byte strings is 2,431 µs. Warm `COUNT(DISTINCT tag)` over 100,000 strings, 588,890 inserted text bytes, is 16,443 µs and the set estimate is 6,988,962 bytes. Warm `SUM(amount)` is 2,575 µs and warm `SUM(DISTINCT amount)` over 17 values is 2,203 µs. Warm `AVG(amount)` is 2,507 µs and warm `AVG(DISTINCT amount)` is 2,180 µs. The `HAVING total > rows/20` alias query keeps all 10 groups, each holding its share of the 100,000 ids, in 15,711 µs warm. The hash join of 100,000 users and 400,000 orders, 10 groups and 85 distinct memberships, is 44,821 µs warm. The distinct set on that join is 6,160 bytes. The earlier table on this machine recorded 13,982 µs for `COUNT(DISTINCT id)` and 63,413 µs for the join. This run's distinct shape is 13,642 µs. The join sample is 44,821 µs here, and plain `COUNT(*)` is 2,842 µs against 2,271 µs earlier. Those two moved by more than the distinct-set change, in opposite directions, so that spread is run-to-run variation. The Milestone 12 join time is a different statement and is not a before-and-after for this one. `set_bytes` is 24 bytes per group higher than that earlier table because this run counts the `seen` vector header.

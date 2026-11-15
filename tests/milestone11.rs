@@ -718,6 +718,8 @@ fn explain_names_having_and_the_join_without_executing() {
             "predicate".to_string(),
             "residual".to_string(),
             "filter".to_string(),
+            "slots".to_string(),
+            "aliases".to_string(),
         ]
     );
     assert_eq!(explained.rows[0][0], text("HashAggregate"));

@@ -8,12 +8,12 @@
 
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CreateTable, CreateTableOptions, DataType as SqlDataType,
-    Delete as SqlDelete, DescribeAlias, Expr as SqlExpr, FromTable, Function as SqlFunction,
-    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, HiveDistributionStyle, Ident,
-    JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectType, OrderBy, OrderByKind,
-    OrderBySort, Query, Select, SelectFlavor, SelectItem as SqlSelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Statement as SqlStatement, TableFactor,
-    UnaryOperator, Update as SqlUpdate, Value as SqlValue,
+    Delete as SqlDelete, DescribeAlias, DuplicateTreatment, Expr as SqlExpr, FromTable,
+    Function as SqlFunction, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    HiveDistributionStyle, Ident, JoinConstraint, JoinOperator, LimitClause, ObjectName,
+    ObjectType, OrderBy, OrderByKind, OrderBySort, Query, Select, SelectFlavor,
+    SelectItem as SqlSelectItem, SelectItemQualifiedWildcardKind, SetExpr,
+    Statement as SqlStatement, TableFactor, UnaryOperator, Update as SqlUpdate, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -829,11 +829,37 @@ fn aggregate_call(expr: &SqlExpr) -> Result<Option<AggregateCall>, DbError> {
         _ => return Err(DbError::unsupported("function calls are not supported")),
     };
     reject_aggregate_options(function)?;
-    let argument = aggregate_argument(kind, function)?;
+    let distinct = duplicate_treatment(kind, function)?;
+    let argument = aggregate_argument(kind, function, distinct)?;
     Ok(Some(AggregateCall {
         function: kind,
         argument,
+        distinct,
     }))
+}
+
+/// `DISTINCT` is accepted for `COUNT`, `SUM`, and `AVG` of one column.
+/// `MIN(DISTINCT ...)` and `MAX(DISTINCT ...)` are rejected rather than run as
+/// ordinary extremes. `ALL` is rejected rather than ignored.
+fn duplicate_treatment(kind: AggregateFunction, function: &SqlFunction) -> Result<bool, DbError> {
+    let FunctionArguments::List(list) = &function.args else {
+        return Ok(false);
+    };
+    match list.duplicate_treatment {
+        Some(DuplicateTreatment::Distinct) => match kind {
+            AggregateFunction::Min => {
+                Err(DbError::unsupported("DISTINCT is not supported for MIN"))
+            }
+            AggregateFunction::Max => {
+                Err(DbError::unsupported("DISTINCT is not supported for MAX"))
+            }
+            AggregateFunction::Count | AggregateFunction::Sum | AggregateFunction::Avg => Ok(true),
+        },
+        Some(DuplicateTreatment::All) => {
+            Err(DbError::unsupported("ALL aggregates are not supported"))
+        }
+        None => Ok(false),
+    }
 }
 
 fn reject_aggregate_options(function: &SqlFunction) -> Result<(), DbError> {
@@ -867,15 +893,11 @@ fn reject_aggregate_options(function: &SqlFunction) -> Result<(), DbError> {
 fn aggregate_argument(
     kind: AggregateFunction,
     function: &SqlFunction,
+    distinct: bool,
 ) -> Result<AggregateArg, DbError> {
     let FunctionArguments::List(list) = &function.args else {
         return Err(DbError::unsupported("COUNT requires an argument"));
     };
-    if list.duplicate_treatment.is_some() {
-        return Err(DbError::unsupported(
-            "DISTINCT aggregates are not supported",
-        ));
-    }
     if !list.clauses.is_empty() {
         return Err(DbError::unsupported(
             "this aggregate clause is not supported",
@@ -891,6 +913,9 @@ fn aggregate_argument(
             "named function arguments are not supported",
         ));
     };
+    if distinct && matches!(argument, FunctionArgExpr::Wildcard) {
+        return Err(DbError::unsupported("DISTINCT requires a column"));
+    }
     match argument {
         FunctionArgExpr::Wildcard => match kind {
             AggregateFunction::Count => Ok(AggregateArg::Star),
