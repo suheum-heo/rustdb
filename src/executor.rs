@@ -5,13 +5,21 @@
 //! has been planned, so a failure leaves the table unchanged. A durable
 //! database publishes that result only after the statement succeeds.
 //!
-//! `SELECT` applies `WHERE`, then `ORDER BY`, then `LIMIT`, then projection.
-//! An aggregate query groups after `WHERE` and applies `HAVING` before the sort.
-//! An indexed integer comparison on one table may supply candidate rows first.
-//! The original `WHERE` is still applied to those candidates. Sort keys may name
-//! columns that are not in the select list. Equal keys keep the order produced
-//! above because the sort is stable. NULL is greater than every non-NULL value
-//! unless the query overrides that with `NULLS FIRST` or `NULLS LAST`.
+//! A plain `SELECT` applies `WHERE`, then `ORDER BY`, then `LIMIT`, then
+//! projection. Its sort keys may name columns that are not in the select list.
+//! `SELECT DISTINCT` is a non-aggregate query on one table. It projects the
+//! chosen columns, then keeps the first copy of each output row. NULL equals
+//! NULL in that comparison. A fingerprint collision still compares every cell.
+//! `ORDER BY` names a selected output column or its alias, and an unselected
+//! column is rejected because the hidden value would be ambiguous after
+//! deduplication. `ORDER BY` and `LIMIT` run after deduplication, and `LIMIT`
+//! does not stop the scan. The distinct rows stay in memory until the query
+//! finishes. An aggregate query groups after `WHERE` and applies `HAVING`
+//! before the sort. An indexed integer comparison on one table may supply
+//! candidate rows first. The original `WHERE` is still applied to those
+//! candidates. Equal keys keep the order produced above because the sort is
+//! stable. NULL is greater than every non-NULL value unless the query
+//! overrides that with `NULLS FIRST` or `NULLS LAST`.
 //! `UPDATE` and `DELETE` still read every row of one table.
 //!
 //! A `SELECT` may group rows from one table or from one `INNER JOIN`. `WHERE`
@@ -130,6 +138,7 @@ struct SelectTail<'a> {
     having: Option<&'a Expr>,
     order_by: &'a [OrderKey],
     limit: Option<u64>,
+    distinct: bool,
 }
 
 struct PreparedJoin {
@@ -240,6 +249,7 @@ impl Database {
                     having: query.having.as_ref(),
                     order_by: &query.order_by,
                     limit: query.limit,
+                    distinct: query.distinct,
                 },
             ),
             Statement::Explain(inner) => self.explain(inner.as_ref()),
@@ -251,6 +261,13 @@ impl Database {
         from: &QueryFrom,
         tail: SelectTail<'_>,
     ) -> Result<StatementResult, DbError> {
+        reject_runtime_distinct(from, tail)?;
+        if tail.distinct {
+            let QueryFrom::Table(source) = from else {
+                return Err(DbError::unsupported("DISTINCT is not supported for JOIN"));
+            };
+            return self.query_table(source, tail);
+        }
         if is_aggregate_query(tail.projection, tail.group_by, tail.having, tail.order_by) {
             return match from {
                 QueryFrom::Table(source) => self.aggregate_table(source, tail),
@@ -268,8 +285,13 @@ impl Database {
         source: &TableRef,
         tail: SelectTail<'_>,
     ) -> Result<StatementResult, DbError> {
-        let mut prepared =
-            self.prepare_select(source, tail.projection, tail.selection, tail.order_by)?;
+        let mut prepared = self.prepare_select(
+            source,
+            tail.projection,
+            tail.selection,
+            tail.order_by,
+            tail.distinct,
+        )?;
         prepared.path = self.settle_path(prepared.path)?;
         let positions = match &prepared.path {
             AccessPath::SeqScan => None,
@@ -279,6 +301,15 @@ impl Database {
         };
 
         let table = self.table(&source.name)?;
+        if tail.distinct {
+            return finish_distinct(
+                &source.name,
+                table.rows(),
+                positions.as_deref(),
+                &prepared,
+                tail.limit,
+            );
+        }
         let mut rows: Vec<&[Value]> = Vec::new();
         if let Some(positions) = positions {
             for position in positions {
@@ -699,7 +730,15 @@ impl Database {
             having: query.having.as_ref(),
             order_by: &query.order_by,
             limit: None,
+            distinct: query.distinct,
         };
+        reject_runtime_distinct(&query.from, tail)?;
+        if query.distinct {
+            let QueryFrom::Table(source) = &query.from else {
+                return Err(DbError::unsupported("DISTINCT is not supported for JOIN"));
+            };
+            return self.explain_distinct(source, query);
+        }
         if is_aggregate_query(
             &query.projection,
             &query.group_by,
@@ -720,6 +759,7 @@ impl Database {
                     &query.projection,
                     query.selection.as_ref(),
                     &query.order_by,
+                    false,
                 )?;
                 prepared.path = self.settle_path(prepared.path)?;
                 let (access, index, bounds) = plan::describe(&prepared.path);
@@ -843,19 +883,79 @@ impl Database {
         }
     }
 
+    fn explain_distinct(
+        &mut self,
+        source: &TableRef,
+        query: &crate::ast::SelectQuery,
+    ) -> Result<StatementResult, DbError> {
+        let mut prepared = self.prepare_select(
+            source,
+            &query.projection,
+            query.selection.as_ref(),
+            &query.order_by,
+            true,
+        )?;
+        prepared.path = self.settle_path(prepared.path)?;
+        let (access, index, bounds) = plan::describe(&prepared.path);
+        let filter = query
+            .selection
+            .as_ref()
+            .map(|expr| Value::Text(expr.render()))
+            .unwrap_or(Value::Null);
+        let order = if query.order_by.is_empty() {
+            Value::Null
+        } else {
+            Value::Text(
+                query
+                    .order_by
+                    .iter()
+                    .map(render_order_key)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        };
+        Ok(StatementResult::Query(QueryResult {
+            columns: vec![
+                "access".to_string(),
+                "index".to_string(),
+                "bounds".to_string(),
+                "distinct".to_string(),
+                "projection".to_string(),
+                "filter".to_string(),
+                "order_by".to_string(),
+                "limit".to_string(),
+            ],
+            rows: vec![vec![
+                access,
+                index,
+                bounds,
+                Value::Text("HashDistinct".to_string()),
+                Value::Text(projection_label(&query.projection)),
+                filter,
+                order,
+                limit_cell(query.limit),
+            ]],
+        }))
+    }
+
     fn prepare_select(
         &self,
         source: &TableRef,
         projection: &Projection,
         selection: Option<&Expr>,
         order_by: &[OrderKey],
+        distinct: bool,
     ) -> Result<PreparedSelect, DbError> {
         let indexes = self.index_images().to_vec();
         let table = self.table(&source.name)?;
         let scope = Scope::from_table(table, &source.alias);
         let outputs = output_columns(&scope, projection)?;
         let filter = bind_optional_where(selection, &scope)?;
-        let sort_keys = bind_order(&scope, order_by, &outputs)?;
+        let sort_keys = if distinct {
+            bind_distinct_order(&scope, order_by, &outputs)?
+        } else {
+            bind_order(&scope, order_by, &outputs)?
+        };
         let choices = index_choices(table, &indexes)?;
         let path = plan::choose(&source.alias, selection, &choices);
         Ok(PreparedSelect {
@@ -1395,6 +1495,10 @@ fn distinct_capacity() -> DbError {
 
 /// Test runs can fail the Nth set reservation before any group is modified.
 fn take_reserve_budget() -> Result<(), DbError> {
+    charge_reserve(distinct_capacity())
+}
+
+fn charge_reserve(error: DbError) -> Result<(), DbError> {
     #[cfg(test)]
     {
         let blocked = DISTINCT_RESERVE_BUDGET.with(|budget| {
@@ -1408,9 +1512,11 @@ fn take_reserve_budget() -> Result<(), DbError> {
             false
         });
         if blocked {
-            return Err(distinct_capacity());
+            return Err(error);
         }
     }
+    #[cfg(not(test))]
+    let _ = error;
     Ok(())
 }
 
@@ -1665,6 +1771,31 @@ fn text_list(labels: &[String]) -> Value {
     } else {
         Value::Text(labels.join(", "))
     }
+}
+
+fn reject_runtime_distinct(from: &QueryFrom, tail: SelectTail<'_>) -> Result<(), DbError> {
+    if !tail.distinct {
+        return Ok(());
+    }
+    if matches!(from, QueryFrom::Join { .. }) {
+        return Err(DbError::unsupported("DISTINCT is not supported for JOIN"));
+    }
+    if !tail.group_by.is_empty() {
+        return Err(DbError::unsupported(
+            "DISTINCT is not supported with GROUP BY",
+        ));
+    }
+    if tail.having.is_some() {
+        return Err(DbError::unsupported(
+            "DISTINCT is not supported with HAVING",
+        ));
+    }
+    if is_aggregate_query(tail.projection, tail.group_by, tail.having, tail.order_by) {
+        return Err(DbError::unsupported(
+            "DISTINCT is not supported with aggregate functions",
+        ));
+    }
+    Ok(())
 }
 
 fn is_aggregate_query(
@@ -2695,6 +2826,333 @@ fn bind_order(
     Ok(bound)
 }
 
+/// `SELECT DISTINCT` sorts projected rows, so each key is an output position.
+///
+/// An unqualified name uses a unique explicit alias, then a unique implicit
+/// output name, then the one projected source column of that name. A qualified
+/// name ignores aliases and must identify exactly one projected source column.
+/// A column that is not in the projection is rejected: after deduplication the
+/// hidden value is not a single row.
+fn bind_distinct_order(
+    scope: &Scope,
+    keys: &[OrderKey],
+    outputs: &OutputPlan,
+) -> Result<Vec<SortKey>, DbError> {
+    let mut bound = Vec::with_capacity(keys.len());
+    for key in keys {
+        let OrderTarget::Column(column) = &key.target else {
+            return Err(DbError::unsupported(
+                "DISTINCT is not supported with aggregate functions",
+            ));
+        };
+        let index = distinct_output_slot(scope, column, outputs)?;
+        bound.push(SortKey {
+            index,
+            ascending: key.ascending,
+            nulls_first: key.nulls_first.unwrap_or(!key.ascending),
+        });
+    }
+    Ok(bound)
+}
+
+fn distinct_output_slot(
+    scope: &Scope,
+    column: &SelectColumn,
+    outputs: &OutputPlan,
+) -> Result<usize, DbError> {
+    if let Some(hit) = output_name_index(column, outputs)? {
+        return Ok(hit);
+    }
+    let source = scope.resolve(column)?;
+    let hits: Vec<usize> = outputs
+        .indexes
+        .iter()
+        .enumerate()
+        .filter(|(_, index)| **index == source)
+        .map(|(hit, _)| hit)
+        .collect();
+    match hits.as_slice() {
+        [hit] => Ok(*hit),
+        [] => Err(DbError::invalid(format!(
+            "column '{}' must appear in the SELECT DISTINCT list",
+            column.render()
+        ))),
+        _ => Err(ambiguous_column(&column.name)),
+    }
+}
+
+/// Project, deduplicate, sort, then apply `LIMIT`.
+///
+/// Every candidate is visited. A later scan or reservation error is returned
+/// even when `LIMIT` would have discarded that row.
+fn finish_distinct(
+    table_name: &str,
+    stored: &[Vec<Value>],
+    positions: Option<&[usize]>,
+    prepared: &PreparedSelect,
+    limit: Option<u64>,
+) -> Result<StatementResult, DbError> {
+    let mut distinct = DistinctRows::new();
+    let mut admit = |row: &[Value]| -> Result<(), DbError> {
+        if expr::row_matches(prepared.filter.as_ref(), row)? {
+            distinct.admit(project_row(row, &prepared.output_indexes)?)?;
+        }
+        Ok(())
+    };
+    if let Some(positions) = positions {
+        for position in positions {
+            let Some(row) = stored.get(*position) else {
+                return Err(DbError::Internal(format!(
+                    "index position {position} is outside table '{table_name}'"
+                )));
+            };
+            admit(row)?;
+        }
+    } else {
+        for row in stored {
+            admit(row)?;
+        }
+    }
+    let mut rows = distinct.into_rows();
+    if !prepared.sort_keys.is_empty() {
+        rows.sort_by(|left, right| compare_rows(left, right, &prepared.sort_keys));
+    }
+    if let Some(limit) = limit {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
+    }
+    Ok(StatementResult::Query(QueryResult {
+        columns: prepared.output_names.clone(),
+        rows,
+    }))
+}
+
+/// First-seen projected rows of one `SELECT DISTINCT`.
+///
+/// The map key is a fingerprint of the whole output tuple. Each bucket stores
+/// positions into `rows`. Equality compares every cell, and NULL matches NULL,
+/// so a hash collision cannot merge unequal tuples. A row is stored once, when
+/// it is first admitted. Text is the clone made by projection; a duplicate
+/// drops that clone and reserves nothing. Memory is one stored tuple per
+/// unique output row, plus one hash and one bucket slot. There is no disk spill.
+struct DistinctRows {
+    buckets: HashMap<u64, Vec<usize>>,
+    rows: Vec<Vec<Value>>,
+}
+
+impl DistinctRows {
+    fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            rows: Vec::new(),
+        }
+    }
+
+    fn admit(&mut self, row: Vec<Value>) -> Result<(), DbError> {
+        let hash = fingerprint_row(&row);
+        let seen = self.buckets.get(&hash).is_some_and(|bucket| {
+            bucket
+                .iter()
+                .any(|&index| same_projected(&self.rows[index], &row))
+        });
+        if seen {
+            return Ok(());
+        }
+        if self.buckets.contains_key(&hash) {
+            self.admit_collision(hash, row)
+        } else {
+            self.admit_fresh(hash, row)
+        }
+    }
+
+    fn admit_fresh(&mut self, hash: u64, row: Vec<Value>) -> Result<(), DbError> {
+        charge_reserve(distinct_row_capacity())?;
+        self.buckets
+            .try_reserve(1)
+            .map_err(|_| distinct_row_capacity())?;
+        let mut bucket = Vec::new();
+        charge_reserve(distinct_row_capacity())?;
+        bucket.try_reserve(1).map_err(|_| distinct_row_capacity())?;
+        charge_reserve(distinct_row_capacity())?;
+        self.rows
+            .try_reserve(1)
+            .map_err(|_| distinct_row_capacity())?;
+        debug_assert!(!self.buckets.contains_key(&hash));
+        debug_assert!(bucket.capacity() > bucket.len());
+        debug_assert!(self.buckets.capacity() > self.buckets.len());
+        debug_assert!(self.rows.capacity() > self.rows.len());
+        let bucket_capacity = bucket.capacity();
+        let map_capacity = self.buckets.capacity();
+        let row_capacity = self.rows.capacity();
+        bucket.push(self.rows.len());
+        debug_assert_eq!(bucket.capacity(), bucket_capacity);
+        self.rows.push(row);
+        debug_assert_eq!(self.rows.capacity(), row_capacity);
+        self.buckets.insert(hash, bucket);
+        debug_assert_eq!(self.buckets.capacity(), map_capacity);
+        Ok(())
+    }
+
+    fn admit_collision(&mut self, hash: u64, row: Vec<Value>) -> Result<(), DbError> {
+        charge_reserve(distinct_row_capacity())?;
+        {
+            let Some(bucket) = self.buckets.get_mut(&hash) else {
+                return Err(DbError::Internal(
+                    "SELECT DISTINCT bucket disappeared".to_string(),
+                ));
+            };
+            bucket.try_reserve(1).map_err(|_| distinct_row_capacity())?;
+        }
+        charge_reserve(distinct_row_capacity())?;
+        self.rows
+            .try_reserve(1)
+            .map_err(|_| distinct_row_capacity())?;
+        let index = self.rows.len();
+        {
+            let Some(bucket) = self.buckets.get_mut(&hash) else {
+                return Err(DbError::Internal(
+                    "SELECT DISTINCT bucket disappeared".to_string(),
+                ));
+            };
+            debug_assert!(bucket.capacity() > bucket.len());
+            let bucket_capacity = bucket.capacity();
+            bucket.push(index);
+            debug_assert_eq!(bucket.capacity(), bucket_capacity);
+        }
+        debug_assert!(self.rows.capacity() > self.rows.len());
+        let row_capacity = self.rows.capacity();
+        self.rows.push(row);
+        debug_assert_eq!(self.rows.capacity(), row_capacity);
+        Ok(())
+    }
+
+    fn into_rows(self) -> Vec<Vec<Value>> {
+        self.rows
+    }
+}
+
+fn distinct_row_capacity() -> DbError {
+    DbError::Internal("SELECT DISTINCT result is too large".to_string())
+}
+
+fn fingerprint_row(row: &[Value]) -> u64 {
+    #[cfg(test)]
+    if let Some(forced) = FORCED_HASH.with(std::cell::Cell::get) {
+        return forced;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for value in row {
+        match value {
+            Value::Null => 0u8.hash(&mut hasher),
+            Value::Integer(item) => {
+                1u8.hash(&mut hasher);
+                item.hash(&mut hasher);
+            }
+            Value::Text(item) => {
+                2u8.hash(&mut hasher);
+                item.hash(&mut hasher);
+            }
+            Value::Boolean(item) => {
+                3u8.hash(&mut hasher);
+                item.hash(&mut hasher);
+            }
+            Value::Ratio {
+                numerator,
+                denominator,
+            } => {
+                4u8.hash(&mut hasher);
+                numerator.hash(&mut hasher);
+                denominator.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
+fn same_projected(left: &[Value], right: &[Value]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| distinct_equal(left, right))
+}
+
+/// NULL matches NULL. Unequal types do not match. Text keeps its case.
+fn distinct_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null, Value::Null) => true,
+        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Text(left), Value::Text(right)) => left == right,
+        (Value::Boolean(left), Value::Boolean(right)) => left == right,
+        (
+            Value::Ratio {
+                numerator: left_n,
+                denominator: left_d,
+            },
+            Value::Ratio {
+                numerator: right_n,
+                denominator: right_d,
+            },
+        ) => left_n == right_n && left_d == right_d,
+        _ => false,
+    }
+}
+
+fn projection_label(projection: &Projection) -> String {
+    match projection {
+        Projection::All => "*".to_string(),
+        Projection::QualifiedAll { qualifier } => format!("{qualifier}.*"),
+        Projection::Columns(items) => items
+            .iter()
+            .map(select_item_label)
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
+fn select_item_label(item: &SelectItem) -> String {
+    match item {
+        SelectItem::Column {
+            column,
+            alias: None,
+        } => column.render(),
+        SelectItem::Column {
+            column,
+            alias: Some(alias),
+        } => format!("{} AS {alias}", column.render()),
+        SelectItem::Aggregate { call, alias: None } => call.render(),
+        SelectItem::Aggregate {
+            call,
+            alias: Some(alias),
+        } => format!("{} AS {alias}", call.render()),
+    }
+}
+
+fn render_order_key(key: &OrderKey) -> String {
+    let target = match &key.target {
+        OrderTarget::Column(column) => column.render(),
+        OrderTarget::Aggregate(call) => call.render(),
+    };
+    let direction = if key.ascending { "ASC" } else { "DESC" };
+    match key.nulls_first {
+        None => format!("{target} {direction}"),
+        Some(true) => format!("{target} {direction} NULLS FIRST"),
+        Some(false) => format!("{target} {direction} NULLS LAST"),
+    }
+}
+
+fn limit_cell(limit: Option<u64>) -> Value {
+    match limit {
+        None => Value::Null,
+        Some(limit) => match i64::try_from(limit) {
+            Ok(limit) => Value::Integer(limit),
+            Err(_) => Value::Text(limit.to_string()),
+        },
+    }
+}
+
 /// Unqualified names prefer one explicit alias, then one implicit output name.
 ///
 /// A qualified name never consults aliases. Two implicit names with the same
@@ -3456,6 +3914,8 @@ impl Drop for ForceNestedJoin {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use super::*;
 
     fn setup() -> Database {
@@ -6153,6 +6613,276 @@ mod tests {
     }
 
     #[test]
+    fn select_distinct_checks_values_after_a_forced_collision() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE items (n INT, label TEXT, active BOOLEAN);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO items VALUES
+                (1, 'A', TRUE),
+                (1, 'A', TRUE),
+                (1, 'a', TRUE),
+                (NULL, 'A', TRUE),
+                (1, 'A', FALSE),
+                (1, NULL, NULL);",
+        )
+        .unwrap();
+        let _force = ForceHashCollision::new();
+        let result = query(&mut db, "SELECT DISTINCT n, label, active FROM items;");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    Value::Integer(1),
+                    Value::Text("A".to_string()),
+                    Value::Boolean(true)
+                ],
+                vec![
+                    Value::Integer(1),
+                    Value::Text("a".to_string()),
+                    Value::Boolean(true)
+                ],
+                vec![
+                    Value::Null,
+                    Value::Text("A".to_string()),
+                    Value::Boolean(true)
+                ],
+                vec![
+                    Value::Integer(1),
+                    Value::Text("A".to_string()),
+                    Value::Boolean(false)
+                ],
+                vec![Value::Integer(1), Value::Null, Value::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn select_distinct_limit_does_not_hide_a_reservation_failure() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE names (name TEXT);").unwrap();
+        db.execute("INSERT INTO names VALUES ('a'), ('a'), ('b'), ('c');")
+            .unwrap();
+        let _budget = DistinctReserveBudget::limit(3);
+        let error = db
+            .execute("SELECT DISTINCT name FROM names LIMIT 1;")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "internal error: SELECT DISTINCT result is too large"
+        );
+    }
+
+    #[test]
+    fn a_repeated_distinct_row_reserves_nothing() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE names (name TEXT);").unwrap();
+        db.execute("INSERT INTO names VALUES ('a'), ('a');")
+            .unwrap();
+        let _budget = DistinctReserveBudget::limit(3);
+        assert_eq!(
+            query(&mut db, "SELECT DISTINCT name FROM names;").rows,
+            vec![vec![Value::Text("a".to_string())]]
+        );
+    }
+
+    #[test]
+    fn a_colliding_distinct_row_reserves_the_bucket_and_the_row() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE nums (n INT);").unwrap();
+        db.execute("INSERT INTO nums VALUES (1), (2);").unwrap();
+        let _force = ForceHashCollision::new();
+        {
+            let _budget = DistinctReserveBudget::limit(5);
+            assert_eq!(
+                query(&mut db, "SELECT DISTINCT n FROM nums;").rows,
+                vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+            );
+        }
+        {
+            let _budget = DistinctReserveBudget::limit(4);
+            let error = db.execute("SELECT DISTINCT n FROM nums;").unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "internal error: SELECT DISTINCT result is too large"
+            );
+        }
+        assert_eq!(
+            query(&mut db, "SELECT DISTINCT n FROM nums;").rows,
+            vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+        );
+    }
+
+    #[test]
+    fn a_failed_distinct_admission_keeps_prior_rows_reachable() {
+        let mut distinct = DistinctRows::new();
+        distinct.admit(vec![Value::Integer(1)]).expect("first row");
+        for limit in [0, 1, 2] {
+            let _budget = DistinctReserveBudget::limit(limit);
+            let error = distinct.admit(vec![Value::Integer(2)]).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "internal error: SELECT DISTINCT result is too large"
+            );
+            assert_eq!(distinct.rows, vec![vec![Value::Integer(1)]]);
+            distinct_rows_are_consistent(&distinct);
+        }
+        distinct.admit(vec![Value::Integer(2)]).unwrap();
+        distinct.admit(vec![Value::Integer(1)]).unwrap();
+        assert_eq!(
+            distinct.rows,
+            vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+        );
+        distinct_rows_are_consistent(&distinct);
+
+        let mut distinct = DistinctRows::new();
+        let _force = ForceHashCollision::new();
+        distinct.admit(vec![Value::Integer(1)]).unwrap();
+        for limit in [0, 1] {
+            let _budget = DistinctReserveBudget::limit(limit);
+            let error = distinct.admit(vec![Value::Integer(9)]).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "internal error: SELECT DISTINCT result is too large"
+            );
+            assert_eq!(distinct.rows, vec![vec![Value::Integer(1)]]);
+            distinct_rows_are_consistent(&distinct);
+        }
+        distinct.admit(vec![Value::Integer(9)]).unwrap();
+        distinct.admit(vec![Value::Integer(1)]).unwrap();
+        assert_eq!(
+            distinct.rows,
+            vec![vec![Value::Integer(1)], vec![Value::Integer(9)]]
+        );
+        distinct_rows_are_consistent(&distinct);
+    }
+
+    #[test]
+    fn colliding_wide_rows_match_a_linear_scan() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE items (n INT, label TEXT, active BOOLEAN);")
+            .unwrap();
+        let alpha = "a".repeat(80);
+        let longer = format!("{alpha}B");
+        let upper = "A".repeat(80);
+        db.execute(&format!(
+            "INSERT INTO items VALUES
+                (1, '{alpha}', TRUE),
+                (1, '{alpha}', TRUE),
+                (1, '{longer}', TRUE),
+                (NULL, '{alpha}', TRUE),
+                (1, '{alpha}', NULL),
+                (NULL, NULL, NULL),
+                (NULL, NULL, NULL),
+                (1, '{upper}', TRUE),
+                (NULL, '{alpha}', NULL);"
+        ))
+        .unwrap();
+        let input = vec![
+            vec![
+                Value::Integer(1),
+                Value::Text(alpha.clone()),
+                Value::Boolean(true),
+            ],
+            vec![
+                Value::Integer(1),
+                Value::Text(alpha.clone()),
+                Value::Boolean(true),
+            ],
+            vec![
+                Value::Integer(1),
+                Value::Text(longer.clone()),
+                Value::Boolean(true),
+            ],
+            vec![
+                Value::Null,
+                Value::Text(alpha.clone()),
+                Value::Boolean(true),
+            ],
+            vec![Value::Integer(1), Value::Text(alpha.clone()), Value::Null],
+            vec![Value::Null, Value::Null, Value::Null],
+            vec![Value::Null, Value::Null, Value::Null],
+            vec![Value::Integer(1), Value::Text(upper), Value::Boolean(true)],
+            vec![Value::Null, Value::Text(alpha), Value::Null],
+        ];
+        let expected = linear_distinct(&input);
+        let _force = ForceHashCollision::new();
+        assert_eq!(
+            query(&mut db, "SELECT DISTINCT n, label, active FROM items;").rows,
+            expected
+        );
+        let filtered = linear_distinct(
+            &input
+                .iter()
+                .filter(|row| matches!(row[0], Value::Integer(1)))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT DISTINCT n, label, active FROM items WHERE n = 1;"
+            )
+            .rows,
+            filtered
+        );
+        let mut ordered = expected.clone();
+        ordered.sort_by(|left, right| match (&left[1], &right[1]) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Greater,
+            (_, Value::Null) => Ordering::Less,
+            (Value::Text(left), Value::Text(right)) => left.cmp(right),
+            _ => Ordering::Equal,
+        });
+        ordered.truncate(2);
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT DISTINCT n, label, active FROM items ORDER BY label ASC LIMIT 2;"
+            )
+            .rows,
+            ordered
+        );
+    }
+
+    fn distinct_rows_are_consistent(distinct: &DistinctRows) {
+        let mut seen = vec![false; distinct.rows.len()];
+        for bucket in distinct.buckets.values() {
+            assert!(!bucket.is_empty());
+            for &index in bucket {
+                assert!(index < distinct.rows.len());
+                assert!(!seen[index]);
+                seen[index] = true;
+            }
+        }
+        assert!(seen.iter().all(|kept| *kept));
+    }
+
+    fn linear_distinct(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
+        let mut kept: Vec<Vec<Value>> = Vec::new();
+        for row in rows {
+            if !kept.iter().any(|seen| tuple_same(seen, row)) {
+                kept.push(row.clone());
+            }
+        }
+        kept
+    }
+
+    fn tuple_same(left: &[Value], right: &[Value]) -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(left, right)| match (left, right) {
+                    (Value::Null, Value::Null) => true,
+                    (Value::Integer(left), Value::Integer(right)) => left == right,
+                    (Value::Text(left), Value::Text(right)) => left == right,
+                    (Value::Boolean(left), Value::Boolean(right)) => left == right,
+                    _ => false,
+                })
+    }
+
+    #[test]
     #[ignore = "release profile of DISTINCT aggregates and HAVING aliases"]
     fn profile_milestone13() {
         let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
@@ -6477,6 +7207,404 @@ mod tests {
                 } else {
                     sql.push_str(&format!("({user}, {})", id % 17));
                 }
+            }
+            database.execute(&sql).unwrap();
+            start = end + 1;
+        }
+        text_bytes
+    }
+
+    #[test]
+    #[ignore = "release profile of SELECT DISTINCT"]
+    fn profile_milestone14() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone14 cpu={cpu} mem_bytes={mem} rustc={rustc} value_bytes={} row_vec_bytes={} map_entry_bytes={}",
+            std::mem::size_of::<Value>(),
+            std::mem::size_of::<Vec<Value>>(),
+            std::mem::size_of::<u64>()
+                + std::mem::size_of::<Vec<usize>>()
+                + std::mem::size_of::<usize>()
+        );
+        for rows in [1_000_i64, 10_000, 100_000] {
+            let mut database = Database::new();
+            let text_bytes = load_select_distinct_profile(&mut database, rows);
+            let pairs = first_seen_pairs(rows);
+            profile_select_shape(
+                &mut database,
+                rows,
+                "plain_bucket",
+                "SELECT bucket FROM items;",
+                usize::try_from(rows).unwrap_or(usize::MAX),
+                1,
+                0,
+                false,
+                |result| {
+                    assert_eq!(
+                        result.rows.len(),
+                        usize::try_from(rows).unwrap_or(usize::MAX)
+                    );
+                },
+            );
+            profile_select_shape(
+                &mut database,
+                rows,
+                "distinct_bucket",
+                "SELECT DISTINCT bucket FROM items;",
+                10,
+                1,
+                0,
+                true,
+                |result| {
+                    assert_eq!(
+                        result.rows,
+                        (0..10)
+                            .map(|bucket| vec![Value::Integer(bucket)])
+                            .collect::<Vec<_>>()
+                    );
+                },
+            );
+            let id_sum = rows.saturating_mul(rows - 1) / 2;
+            profile_select_shape(
+                &mut database,
+                rows,
+                "plain_id",
+                "SELECT id FROM items;",
+                usize::try_from(rows).unwrap_or(usize::MAX),
+                1,
+                0,
+                false,
+                |result| {
+                    assert_eq!(
+                        result.rows.len(),
+                        usize::try_from(rows).unwrap_or(usize::MAX)
+                    );
+                    assert_eq!(profile_checksum(result), id_sum);
+                },
+            );
+            profile_select_shape(
+                &mut database,
+                rows,
+                "distinct_id",
+                "SELECT DISTINCT id FROM items;",
+                usize::try_from(rows).unwrap_or(usize::MAX),
+                1,
+                0,
+                true,
+                |result| {
+                    assert_eq!(
+                        result.rows.len(),
+                        usize::try_from(rows).unwrap_or(usize::MAX)
+                    );
+                    assert_eq!(profile_checksum(result), id_sum);
+                },
+            );
+            profile_select_shape(
+                &mut database,
+                rows,
+                "plain_pair",
+                "SELECT bucket, label FROM items;",
+                usize::try_from(rows).unwrap_or(usize::MAX),
+                2,
+                usize::try_from(rows).unwrap_or(usize::MAX),
+                false,
+                |result| {
+                    assert_eq!(
+                        result.rows.len(),
+                        usize::try_from(rows).unwrap_or(usize::MAX)
+                    );
+                },
+            );
+            profile_select_shape(
+                &mut database,
+                rows,
+                "distinct_pair",
+                "SELECT DISTINCT bucket, label FROM items;",
+                pairs.len(),
+                2,
+                pairs.len(),
+                true,
+                |result| {
+                    let expected = pairs
+                        .iter()
+                        .map(|(bucket, label)| {
+                            vec![Value::Integer(*bucket), Value::Text(label.to_string())]
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(result.rows, expected);
+                },
+            );
+            profile_select_shape(
+                &mut database,
+                rows,
+                "plain_tag",
+                "SELECT tag FROM items;",
+                usize::try_from(rows).unwrap_or(usize::MAX),
+                1,
+                text_bytes,
+                false,
+                |result| {
+                    assert_eq!(
+                        result.rows.len(),
+                        usize::try_from(rows).unwrap_or(usize::MAX)
+                    );
+                },
+            );
+            profile_select_shape(
+                &mut database,
+                rows,
+                "distinct_tag",
+                "SELECT DISTINCT tag FROM items;",
+                usize::try_from(rows).unwrap_or(usize::MAX),
+                1,
+                text_bytes,
+                true,
+                |result| {
+                    assert_eq!(
+                        result.rows.len(),
+                        usize::try_from(rows).unwrap_or(usize::MAX)
+                    );
+                    assert_eq!(
+                        profile_checksum(result),
+                        i64::try_from(text_bytes).unwrap_or(i64::MAX)
+                    );
+                },
+            );
+            profile_select_shape(
+                &mut database,
+                rows,
+                "distinct_where",
+                "SELECT DISTINCT bucket FROM items WHERE flag = TRUE;",
+                5,
+                1,
+                0,
+                true,
+                |result| {
+                    assert_eq!(
+                        result.rows,
+                        [0, 2, 4, 6, 8]
+                            .into_iter()
+                            .map(|bucket| vec![Value::Integer(bucket)])
+                            .collect::<Vec<_>>()
+                    );
+                },
+            );
+            profile_select_shape(
+                &mut database,
+                rows,
+                "distinct_order_limit",
+                "SELECT DISTINCT label FROM items ORDER BY label ASC LIMIT 3;",
+                8,
+                1,
+                8,
+                true,
+                |result| {
+                    assert_eq!(
+                        result.rows,
+                        vec![
+                            vec![Value::Text("a".to_string())],
+                            vec![Value::Text("b".to_string())],
+                            vec![Value::Text("c".to_string())],
+                        ]
+                    );
+                },
+            );
+            let range = "SELECT DISTINCT bucket FROM items WHERE id >= 10 AND id < 40;";
+            profile_indexed_range(rows, range);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn profile_select_shape(
+        database: &mut Database,
+        rows: i64,
+        shape: &str,
+        sql: &str,
+        unique: usize,
+        width: usize,
+        text_bytes: usize,
+        distinct: bool,
+        check: impl Fn(&QueryResult),
+    ) {
+        let bytes = if distinct {
+            distinct_output_bytes(unique, width, text_bytes)
+        } else {
+            projected_output_bytes(unique, width, text_bytes)
+        };
+        let mut samples = Vec::with_capacity(6);
+        let mut checksum = 0_i64;
+        let mut returned = 0_usize;
+        for _ in 0..6 {
+            let started = std::time::Instant::now();
+            let result = query(database, sql);
+            samples.push(started.elapsed().as_micros());
+            check(&result);
+            checksum = profile_checksum(&result);
+            returned = result.rows.len();
+        }
+        let cold = samples[0];
+        let mut warm = samples[1..].to_vec();
+        warm.sort_unstable();
+        let warm = warm[warm.len() / 2];
+        let examined = usize::try_from(rows).unwrap_or(usize::MAX);
+        println!(
+            "milestone14 shape={shape} rows={rows} examined={examined} returned={returned} unique={unique} width={width} text_bytes={text_bytes} bytes={bytes} checksum={checksum} cold_us={cold} warm_us={warm}"
+        );
+    }
+
+    fn profile_checksum(result: &QueryResult) -> i64 {
+        let mut checksum = 0_i64;
+        for row in &result.rows {
+            for cell in row {
+                checksum = checksum.wrapping_add(profile_cell(cell));
+            }
+        }
+        checksum
+    }
+
+    fn distinct_output_bytes(unique: usize, width: usize, text_bytes: usize) -> usize {
+        if unique == 0 {
+            return 0;
+        }
+        let row = std::mem::size_of::<Vec<Value>>()
+            .saturating_add(width.saturating_mul(std::mem::size_of::<Value>()));
+        let entry = std::mem::size_of::<u64>()
+            .saturating_add(std::mem::size_of::<Vec<usize>>())
+            .saturating_add(std::mem::size_of::<usize>());
+        unique
+            .saturating_mul(row)
+            .saturating_add(unique.saturating_mul(entry))
+            .saturating_add(text_bytes)
+    }
+
+    fn projected_output_bytes(returned: usize, width: usize, text_bytes: usize) -> usize {
+        if returned == 0 {
+            return 0;
+        }
+        let row = std::mem::size_of::<Vec<Value>>()
+            .saturating_add(width.saturating_mul(std::mem::size_of::<Value>()));
+        returned.saturating_mul(row).saturating_add(text_bytes)
+    }
+
+    fn first_seen_pairs(rows: i64) -> Vec<(i64, char)> {
+        let mut seen = Vec::new();
+        for id in 0..rows {
+            let pair = (id % 10, (b'a' + u8::try_from(id % 8).unwrap_or(0)) as char);
+            if !seen.contains(&pair) {
+                seen.push(pair);
+            }
+        }
+        seen
+    }
+
+    fn profile_indexed_range(rows: i64, range: &str) {
+        let dir = crate::test_dir::TestDir::new("select-distinct-profile");
+        let path = dir.join("db");
+        {
+            let mut database = Database::open(&path).unwrap();
+            load_select_distinct_profile(&mut database, rows);
+        }
+        Database::migrate(&path).unwrap();
+        let mut database = Database::open(&path).unwrap();
+        let expected = (0..10)
+            .map(|bucket| vec![Value::Integer(bucket)])
+            .collect::<Vec<_>>();
+        let explained = query(&mut database, &format!("EXPLAIN {range}"));
+        assert_eq!(explained.rows[0][0], Value::Text("SeqScan".to_string()));
+        let sequential = query(&mut database, range);
+        assert_eq!(sequential.rows, expected);
+        profile_select_shape(
+            &mut database,
+            rows,
+            "distinct_file_seq",
+            range,
+            10,
+            1,
+            0,
+            true,
+            |result| assert_eq!(result.rows, expected),
+        );
+        database
+            .execute("CREATE INDEX idx_items_id ON items (id);")
+            .unwrap();
+        let explained = query(&mut database, &format!("EXPLAIN {range}"));
+        assert_eq!(explained.rows[0][0], Value::Text("IndexScan".to_string()));
+        assert_eq!(
+            explained.rows[0][1],
+            Value::Text("idx_items_id".to_string())
+        );
+        let indexed = query(&mut database, range);
+        assert_eq!(indexed.rows, sequential.rows);
+        let matches = query(
+            &mut database,
+            "SELECT COUNT(*) FROM items WHERE id >= 10 AND id < 40;",
+        );
+        assert_eq!(matches.rows, vec![vec![Value::Integer(30)]]);
+        profile_range_shape(
+            &mut database,
+            rows,
+            "distinct_file_index",
+            range,
+            30,
+            &expected,
+        );
+    }
+
+    fn profile_range_shape(
+        database: &mut Database,
+        rows: i64,
+        shape: &str,
+        sql: &str,
+        examined: usize,
+        expected: &[Vec<Value>],
+    ) {
+        let bytes = distinct_output_bytes(10, 1, 0);
+        let mut samples = Vec::with_capacity(6);
+        let mut checksum = 0_i64;
+        for _ in 0..6 {
+            let started = std::time::Instant::now();
+            let result = query(database, sql);
+            samples.push(started.elapsed().as_micros());
+            assert_eq!(result.rows, expected);
+            checksum = profile_checksum(&result);
+        }
+        let cold = samples[0];
+        let mut warm = samples[1..].to_vec();
+        warm.sort_unstable();
+        let warm = warm[warm.len() / 2];
+        println!(
+            "milestone14 shape={shape} rows={rows} examined={examined} returned=10 unique=10 width=1 text_bytes=0 bytes={bytes} checksum={checksum} cold_us={cold} warm_us={warm}"
+        );
+    }
+
+    fn load_select_distinct_profile(database: &mut Database, rows: i64) -> usize {
+        database
+            .execute(
+                "CREATE TABLE items (
+                    id INT,
+                    label TEXT,
+                    tag TEXT,
+                    bucket INT,
+                    flag BOOLEAN
+                );",
+            )
+            .unwrap();
+        let mut text_bytes = 0_usize;
+        let mut start = 0_i64;
+        while start < rows {
+            let end = (start + 499).min(rows - 1);
+            let mut sql = String::from("INSERT INTO items VALUES ");
+            for id in start..=end {
+                if id != start {
+                    sql.push(',');
+                }
+                let label = (b'a' + u8::try_from(id % 8).unwrap_or(0)) as char;
+                let tag = format!("{:24}{}", "", id);
+                text_bytes = text_bytes.saturating_add(tag.len());
+                let flag = if id % 2 == 0 { "TRUE" } else { "FALSE" };
+                sql.push_str(&format!("({id}, '{label}', '{tag}', {}, {flag})", id % 10));
             }
             database.execute(&sql).unwrap();
             start = end + 1;
