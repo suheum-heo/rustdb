@@ -1667,6 +1667,191 @@ mod tests {
     }
 
     #[test]
+    fn recovery_stress_repeats_checkpoints_and_keeps_duplicate_keys() {
+        #[derive(Clone)]
+        struct Row {
+            id: u64,
+            key: i64,
+            name: &'static str,
+        }
+        fn rows(expected: &[Row]) -> Vec<(u64, Vec<Value>)> {
+            expected
+                .iter()
+                .map(|row| (row.id, sample(row.key, row.name)))
+                .collect()
+        }
+        fn keys(expected: &[Row], key: i64) -> Vec<(i64, u64)> {
+            expected
+                .iter()
+                .filter(|row| row.key == key)
+                .map(|row| (row.key, row.id))
+                .collect()
+        }
+        fn assert_recovered(path: &Path, expected: &[Row]) {
+            for _ in 0..3 {
+                let (mut store, loaded) = Store::open(path).unwrap();
+                assert_eq!(loaded.len(), 1);
+                assert_eq!(loaded[0].rows.len(), expected.len());
+                for (got, want) in loaded[0].rows.iter().zip(expected) {
+                    assert_eq!(got.0, want.id);
+                    assert_eq!(got.1[0], Value::Integer(want.key));
+                    assert_eq!(got.1[1], Value::Text(want.name.to_string()));
+                    assert_eq!(got.1[2], Value::Boolean(true));
+                }
+                let root = store.index_root("idx_users_id").unwrap();
+                let mut seen = Vec::new();
+                for row in expected {
+                    if !seen.contains(&row.key) {
+                        seen.push(row.key);
+                    }
+                }
+                for key in seen {
+                    assert_eq!(
+                        store.read_index_equal(root, key).unwrap(),
+                        keys(expected, key)
+                    );
+                }
+                drop(store);
+            }
+            assert_eq!(wal::path_for(path).metadata().unwrap().len(), 0);
+        }
+
+        let indexes = [id_index()];
+        let (file, _, _) = migrated_users(vec![(1, sample(7, "Ada"))], 2);
+        let mut expected = vec![Row {
+            id: 1,
+            key: 7,
+            name: "Ada",
+        }];
+        {
+            let (mut store, _) = Store::open(file.path()).unwrap();
+            store
+                .publish_indexes(&[image("users", rows(&expected), 2)], &indexes)
+                .unwrap();
+        }
+
+        for step in 0..4u32 {
+            expected.push(Row {
+                id: u64::from(step) + 2,
+                key: 7,
+                name: "Dup",
+            });
+            let next = expected.last().unwrap().id + 1;
+            {
+                let (mut store, _) = Store::open(file.path()).unwrap();
+                store.set_inject(Inject::DuringCheckpoint(step % 2));
+                let error = store
+                    .publish_indexes(&[image("users", rows(&expected), next)], &indexes)
+                    .unwrap_err();
+                let StepError::AfterCommit(error) = error else {
+                    panic!("expected a fenced checkpoint");
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("injected failure during checkpoint"),
+                    "{error}"
+                );
+            }
+            assert_recovered(file.path(), &expected);
+        }
+
+        expected[0].name = "Ada2";
+        {
+            let (mut store, _) = Store::open(file.path()).unwrap();
+            store.set_inject(Inject::AfterLogSync);
+            let error = store
+                .publish_indexes(&[image("users", rows(&expected), 6)], &indexes)
+                .unwrap_err();
+            assert!(matches!(error, StepError::AfterCommit(_)));
+        }
+        assert_recovered(file.path(), &expected);
+
+        let removed = expected.pop().unwrap();
+        {
+            let (mut store, _) = Store::open(file.path()).unwrap();
+            store.set_inject(Inject::CommitSyncFailed);
+            let error = store
+                .publish_indexes(&[image("users", rows(&expected), removed.id + 1)], &indexes)
+                .unwrap_err();
+            let StepError::AfterCommit(error) = error else {
+                panic!("expected an uncertain commit");
+            };
+            let message = error.to_string();
+            assert!(message.contains("durability is unknown"), "{message}");
+            assert!(message.contains("not a confirmed rollback"), "{message}");
+            assert!(!message.contains("rolled back"), "{message}");
+        }
+        assert_recovered(file.path(), &expected);
+
+        expected.push(Row {
+            id: 6,
+            key: 9,
+            name: "Zy",
+        });
+        {
+            let (mut store, _) = Store::open(file.path()).unwrap();
+            store
+                .publish_indexes(&[image("users", rows(&expected), 7)], &indexes)
+                .unwrap();
+        }
+        assert_recovered(file.path(), &expected);
+
+        {
+            let (store, _) = Store::open(file.path()).unwrap();
+            let error = Store::open(file.path()).unwrap_err();
+            assert!(error.to_string().contains("is locked"), "{error}");
+            drop(store);
+        }
+
+        let snapshot = fs::read(file.path()).unwrap();
+        {
+            let (mut store, _) = Store::open(file.path()).unwrap();
+            store.set_inject(Inject::AfterLogSync);
+            let mut extra = expected.clone();
+            extra.push(Row {
+                id: 8,
+                key: 9,
+                name: "Gone",
+            });
+            let error = store
+                .publish_indexes(&[image("users", rows(&extra), 9)], &indexes)
+                .unwrap_err();
+            assert!(matches!(error, StepError::AfterCommit(_)));
+        }
+        let wal_path = wal::path_for(file.path());
+        let log = fs::read(&wal_path).unwrap();
+        assert!(log.len() > 120);
+        fs::write(&wal_path, &log[..120]).unwrap();
+        assert_recovered(file.path(), &expected);
+        assert_eq!(fs::read(file.path()).unwrap(), snapshot);
+
+        {
+            let (mut store, _) = Store::open(file.path()).unwrap();
+            store.set_inject(Inject::AfterLogSync);
+            let mut extra = expected.clone();
+            extra.push(Row {
+                id: 8,
+                key: 9,
+                name: "Gone",
+            });
+            let error = store
+                .publish_indexes(&[image("users", rows(&extra), 9)], &indexes)
+                .unwrap_err();
+            assert!(matches!(error, StepError::AfterCommit(_)));
+        }
+        let mut damaged = fs::read(&wal_path).unwrap();
+        let checksum_at = damaged.len() - 32 + 12;
+        damaged[checksum_at] ^= 0xff;
+        let wal_len = damaged.len();
+        fs::write(&wal_path, &damaged).unwrap();
+        let error = Store::open(file.path()).unwrap_err();
+        assert!(error.to_string().contains("damaged"), "{error}");
+        assert_eq!(fs::read(file.path()).unwrap(), snapshot);
+        assert_eq!(fs::metadata(&wal_path).unwrap().len(), wal_len as u64);
+    }
+
+    #[test]
     fn clears_a_log_that_was_already_applied_to_the_database() {
         for inject in [Inject::AfterDbSync, Inject::BeforeLogClear] {
             let file = TempPath::new();
