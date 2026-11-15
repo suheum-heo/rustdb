@@ -48,6 +48,11 @@ mod table;
 mod test_dir;
 mod value;
 
+#[cfg(feature = "fuzz")]
+pub mod fuzzing;
+#[cfg(not(feature = "fuzz"))]
+pub(crate) mod fuzzing;
+
 pub use database::Database;
 pub use error::DbError;
 pub use executor::{QueryResult, StatementResult};

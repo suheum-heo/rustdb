@@ -9,3 +9,12 @@ publish = false
 [dependencies]
 fs4 = "0.13.1"
 sqlparser = "0.64.0"
+
+[dev-dependencies]
+# Property tests in src/storage/reliability.rs. Not used by the library.
+proptest = "1.6"
+
+[features]
+# Exposes byte-oriented decoders for the separate fuzz crate. Normal builds
+# keep that module crate-private, so `cargo test` does not need nightly.
+fuzz = []

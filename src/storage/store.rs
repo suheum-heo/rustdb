@@ -1496,6 +1496,177 @@ mod tests {
     }
 
     #[test]
+    fn recovery_is_idempotent_and_a_damaged_log_is_not_applied() {
+        let committed = [
+            Inject::AfterLogSync,
+            Inject::DuringCheckpoint(0),
+            Inject::DuringCheckpoint(1),
+            Inject::AfterDbSync,
+            Inject::BeforeLogClear,
+            Inject::CommitSyncFailed,
+        ];
+        for inject in committed {
+            let file = TempPath::new();
+            let (mut store, _) = Store::open(file.path()).unwrap();
+            store
+                .publish(&[image("users", vec![(1, sample(1, "Ada"))], 2)])
+                .unwrap();
+            store.set_inject(inject);
+            let error = store
+                .publish(&[image(
+                    "users",
+                    vec![(1, sample(1, "Ada")), (2, sample(2, "Bea"))],
+                    3,
+                )])
+                .unwrap_err();
+            assert!(
+                matches!(error, StepError::AfterCommit(_)),
+                "{inject:?} {error:?}"
+            );
+            let message = error.into_db().to_string();
+            let expected = match inject {
+                Inject::CommitSyncFailed => "durability is unknown",
+                Inject::AfterLogSync => "injected failure after the redo log was synced",
+                Inject::DuringCheckpoint(_) => "injected failure during checkpoint",
+                Inject::AfterDbSync | Inject::BeforeLogClear => {
+                    "injected failure before the redo log was cleared"
+                }
+                Inject::BeforeLogSync => unreachable!("handled below"),
+            };
+            assert!(message.contains(expected), "{inject:?}: {message}");
+            assert!(wal::path_for(file.path()).metadata().unwrap().len() > 0);
+            drop(store);
+            let (store, first) = Store::open(file.path()).unwrap();
+            assert_eq!(first[0].rows.len(), 2, "{inject:?}");
+            assert_eq!(first[0].rows[1].0, 2, "{inject:?}");
+            drop(store);
+            let (store, second) = Store::open(file.path()).unwrap();
+            assert_eq!(second[0].rows, first[0].rows, "{inject:?}");
+            drop(store);
+            assert_eq!(wal::path_for(file.path()).metadata().unwrap().len(), 0);
+        }
+
+        let file = TempPath::new();
+        let (mut store, _) = Store::open(file.path()).unwrap();
+        store
+            .publish(&[image("users", vec![(1, sample(1, "Ada"))], 2)])
+            .unwrap();
+        store.set_inject(Inject::BeforeLogSync);
+        assert!(matches!(
+            store.publish(&[image(
+                "users",
+                vec![(1, sample(1, "Ada")), (2, sample(2, "Bea"))],
+                3,
+            )]),
+            Err(StepError::BeforeCommit(_))
+        ));
+        drop(store);
+        let (store, first) = Store::open(file.path()).unwrap();
+        assert_eq!(first[0].rows.len(), 1);
+        drop(store);
+        let (_, second) = Store::open(file.path()).unwrap();
+        assert_eq!(second[0].rows.len(), 1);
+        assert_eq!(wal::path_for(file.path()).metadata().unwrap().len(), 0);
+
+        let file = TempPath::new();
+        {
+            let (store, _) = Store::open(file.path()).unwrap();
+            drop(store);
+        }
+        let before = fs::read(file.path()).unwrap();
+        let meta = read_meta(file.path());
+        let mut page = Page::new();
+        page.as_mut_slice().copy_from_slice(&before[..PAGE_SIZE]);
+        let mut log = wal::encode_committed(&wal::Plan {
+            nonce: meta.nonce,
+            base_commit: meta.commit_id,
+            frames: &[(0, page)],
+        })
+        .unwrap();
+        let checksum_at = log.len() - 32 + 12;
+        log[checksum_at] ^= 0xff;
+        let wal_path = wal::path_for(file.path());
+        fs::write(&wal_path, &log).unwrap();
+        let error = Store::open(file.path()).unwrap_err();
+        assert!(error.to_string().contains("damaged"), "{error}");
+        assert_eq!(fs::read(file.path()).unwrap(), before);
+        assert!(fs::metadata(&wal_path).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn a_recovered_heap_insert_keeps_the_matching_index_entry() {
+        let visible = [
+            Inject::CommitSyncFailed,
+            Inject::AfterLogSync,
+            Inject::DuringCheckpoint(0),
+            Inject::DuringCheckpoint(1),
+        ];
+        for inject in visible {
+            let (file, _, _) = migrated_users(vec![(1, sample(1, "Ada"))], 2);
+            {
+                let (mut store, _) = Store::open(file.path()).unwrap();
+                store
+                    .publish_indexes(
+                        &[image("users", vec![(1, sample(1, "Ada"))], 2)],
+                        &[id_index()],
+                    )
+                    .unwrap();
+                store.set_inject(inject);
+                let error = store
+                    .publish_indexes(
+                        &[image(
+                            "users",
+                            vec![(1, sample(1, "Ada")), (2, sample(2, "Bea"))],
+                            3,
+                        )],
+                        &[id_index()],
+                    )
+                    .unwrap_err();
+                assert!(
+                    matches!(error, StepError::AfterCommit(_)),
+                    "{inject:?} {error:?}"
+                );
+            }
+            for _ in 0..2 {
+                let (mut store, loaded) = Store::open(file.path()).unwrap();
+                assert_eq!(loaded[0].rows.len(), 2, "{inject:?}");
+                assert_eq!(loaded[0].rows[1].0, 2, "{inject:?}");
+                let root = store.index_root("idx_users_id").unwrap();
+                assert_eq!(store.read_index_equal(root, 1).unwrap(), vec![(1, 1)]);
+                assert_eq!(store.read_index_equal(root, 2).unwrap(), vec![(2, 2)]);
+            }
+        }
+
+        let (file, _, _) = migrated_users(vec![(1, sample(1, "Ada"))], 2);
+        {
+            let (mut store, _) = Store::open(file.path()).unwrap();
+            store
+                .publish_indexes(
+                    &[image("users", vec![(1, sample(1, "Ada"))], 2)],
+                    &[id_index()],
+                )
+                .unwrap();
+            store.set_inject(Inject::BeforeLogSync);
+            let error = store
+                .publish_indexes(
+                    &[image(
+                        "users",
+                        vec![(1, sample(1, "Ada")), (2, sample(2, "Bea"))],
+                        3,
+                    )],
+                    &[id_index()],
+                )
+                .unwrap_err();
+            assert!(matches!(error, StepError::BeforeCommit(_)));
+        }
+        let (mut store, loaded) = Store::open(file.path()).unwrap();
+        assert_eq!(loaded[0].rows.len(), 1);
+        let root = store.index_root("idx_users_id").unwrap();
+        assert_eq!(store.read_index_equal(root, 1).unwrap(), vec![(1, 1)]);
+        assert!(store.read_index_equal(root, 2).unwrap().is_empty());
+    }
+
+    #[test]
     fn clears_a_log_that_was_already_applied_to_the_database() {
         for inject in [Inject::AfterDbSync, Inject::BeforeLogClear] {
             let file = TempPath::new();
