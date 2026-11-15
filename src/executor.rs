@@ -45,13 +45,21 @@
 //!
 //! An `INNER JOIN` walks the outer table in insertion order. For each outer
 //! row it reads inner candidates, then keeps a pair only when `ON` is TRUE.
-//! `WHERE` then runs on that pair. A `LEFT JOIN` uses only a nested loop.
-//! Every left row is visited in insertion order. Each right row that makes
-//! `ON` TRUE is emitted in insertion order. `WHERE` runs on that pair. A left
-//! row with no TRUE `ON` match is emitted once, with NULL for every right
-//! column, and `WHERE` then sees that extended row. A `WHERE` that removes
-//! the matches does not add the NULL row. `ON` FALSE and `ON` UNKNOWN do not
-//! match, including `NULL = NULL`. `LIMIT` does not stop that scan.
+//! `WHERE` then runs on that pair. A `LEFT JOIN` hashes the right table when
+//! `ON` has a same-type column equality. The hash key skips NULL. Each exact
+//! key still runs the original `ON`, so a residual predicate can reject a
+//! candidate. A stored cell that is not NULL and not the column's declared
+//! type is joined with the nested loop instead, because that comparison
+//! raises a type error on pairs the hash key would otherwise skip. Any other
+//! `ON` compares every left row with every right row.
+//! Either way, left rows are visited in insertion order and matching right
+//! rows are emitted in insertion order. `WHERE` runs on that pair. A left row
+//! with no TRUE `ON` match is emitted once, with NULL for every right column,
+//! and `WHERE` then sees that extended row. A `WHERE` that removes the matches
+//! does not add the NULL row. `ON` FALSE and `ON` UNKNOWN do not match,
+//! including `NULL = NULL`. `LIMIT` does not stop that scan. The left hash
+//! table stores positions into the right rows, not copied keys, and it does
+//! not buffer pairs. The right table is always the build side.
 //! An indexed integer equality on an `INNER JOIN` uses the index
 //! when the outer table is empty or the inner table has more than 64 times as
 //! many rows. Otherwise that equality builds a hash table. Each bucket keeps
@@ -501,7 +509,7 @@ impl Database {
         }
     }
 
-    /// Nested loop for `LEFT JOIN`. The planner's inner-join path is not used.
+    /// `LEFT JOIN`. An equality hashes the right table. Anything else is a nested loop.
     fn query_left_join(
         &mut self,
         outer: &TableRef,
@@ -518,10 +526,67 @@ impl Database {
             tail.order_by,
             false,
         )?;
-        let inner_width = self.table(&inner.name)?.schema().columns().len();
-        self.with_copied_side(outer, inner, |outer_rows, inner_rows, _| {
-            scan_left_join(outer_rows, inner_rows, inner_width, prepared, tail.limit)
+        let path = self.left_access(outer, inner, on)?;
+        let outer_types = self
+            .table(&outer.name)?
+            .schema()
+            .columns()
+            .iter()
+            .map(crate::schema::Column::data_type)
+            .collect::<Vec<_>>();
+        let inner_types = self
+            .table(&inner.name)?
+            .schema()
+            .columns()
+            .iter()
+            .map(crate::schema::Column::data_type)
+            .collect::<Vec<_>>();
+        let inner_width = inner_types.len();
+        self.with_copied_side(outer, inner, |outer_rows, inner_rows, _| match path {
+            plan::LeftAccess::NestedLoop => {
+                scan_left_join(outer_rows, inner_rows, inner_width, prepared, tail.limit)
+            }
+            plan::LeftAccess::Hash {
+                outer_ordinal,
+                inner_ordinal,
+                ..
+            } => scan_hash_left_join(
+                outer_rows,
+                inner_rows,
+                &outer_types,
+                &inner_types,
+                HashKeys {
+                    outer_ordinal,
+                    inner_ordinal,
+                },
+                prepared,
+                tail.limit,
+            ),
         })
+    }
+
+    /// The left-join strategy `EXPLAIN` and execution share.
+    ///
+    /// This reads schemas only. It does not hash rows or visit pairs.
+    fn left_access(
+        &self,
+        outer: &TableRef,
+        inner: &TableRef,
+        on: &Expr,
+    ) -> Result<plan::LeftAccess, DbError> {
+        #[cfg(test)]
+        if force_nested_join() {
+            return Ok(plan::LeftAccess::NestedLoop);
+        }
+        let outer_columns = Scope::columns(self.table(&outer.name)?);
+        let inner_columns = Scope::columns(self.table(&inner.name)?);
+        Ok(plan::choose_left_join(
+            &outer.alias,
+            &outer_columns,
+            &inner.alias,
+            &inner_columns,
+            on,
+        ))
     }
 
     fn explain_left_join(
@@ -540,6 +605,7 @@ impl Database {
             &query.order_by,
             false,
         )?;
+        let path = self.left_access(outer, inner, on)?;
         let filter = query
             .selection
             .as_ref()
@@ -557,22 +623,44 @@ impl Database {
                     .join(", "),
             )
         };
+        let (access, build, predicate, residual) = match path {
+            plan::LeftAccess::NestedLoop => (
+                "LeftNestedLoopJoin",
+                Value::Null,
+                Value::Null,
+                Value::Text(on.render()),
+            ),
+            plan::LeftAccess::Hash {
+                predicate,
+                residual,
+                ..
+            } => (
+                "HashLeftJoin",
+                Value::Text(inner.explain_name()),
+                Value::Text(predicate),
+                residual.map(Value::Text).unwrap_or(Value::Null),
+            ),
+        };
         Ok(StatementResult::Query(QueryResult {
             columns: vec![
                 "access".to_string(),
                 "outer".to_string(),
                 "inner".to_string(),
-                "condition".to_string(),
+                "build".to_string(),
+                "predicate".to_string(),
+                "residual".to_string(),
                 "filter".to_string(),
                 "projection".to_string(),
                 "order_by".to_string(),
                 "limit".to_string(),
             ],
             rows: vec![vec![
-                Value::Text("LeftNestedLoopJoin".to_string()),
+                Value::Text(access.to_string()),
                 Value::Text(outer.explain_name()),
                 Value::Text(inner.explain_name()),
-                Value::Text(on.render()),
+                build,
+                predicate,
+                residual,
                 filter,
                 Value::Text(prepared.output_names.join(", ")),
                 order,
@@ -4031,6 +4119,182 @@ fn hash_key(key: KeyRef<'_>) -> u64 {
         }
     }
     hasher.finish()
+}
+
+fn scan_hash_left_join(
+    outer_rows: &[Vec<Value>],
+    inner_rows: &[Vec<Value>],
+    outer_types: &[DataType],
+    inner_types: &[DataType],
+    keys: HashKeys,
+    prepared: PreparedJoin,
+    limit: Option<u64>,
+) -> Result<StatementResult, DbError> {
+    // A non-NULL cell whose runtime type disagrees with the column makes the
+    // original `ON` raise "different types" for every pair. Exact-key pruning
+    // would skip that pair. The nested loop evaluates it.
+    if !on_cells_match_schema(
+        outer_types,
+        inner_types,
+        outer_rows,
+        inner_rows,
+        &prepared.on,
+    ) {
+        return scan_left_join(outer_rows, inner_rows, inner_types.len(), prepared, limit);
+    }
+    let nulls = vec![Value::Null; inner_types.len()];
+    let limit_n = limit.map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+    if prepared.sort_keys.is_empty() {
+        let mut projected = Vec::new();
+        let outputs = prepared.output_indexes.clone();
+        visit_hash_left_pairs(
+            outer_rows,
+            inner_rows,
+            &nulls,
+            keys,
+            &prepared,
+            |outer_row, inner_row| {
+                if limit_n.is_some_and(|limit_n| projected.len() >= limit_n) {
+                    return Ok(());
+                }
+                projected.push(project_pair(outer_row, inner_row, &outputs)?);
+                Ok(())
+            },
+        )?;
+        return Ok(StatementResult::Query(QueryResult {
+            columns: prepared.output_names,
+            rows: projected,
+        }));
+    }
+    let mut joined = Vec::new();
+    visit_hash_left_pairs(
+        outer_rows,
+        inner_rows,
+        &nulls,
+        keys,
+        &prepared,
+        |outer_row, inner_row| {
+            joined.push(concat_pair(outer_row, inner_row));
+            Ok(())
+        },
+    )?;
+    finish_rows(
+        joined,
+        &prepared.sort_keys,
+        limit,
+        &prepared.output_indexes,
+        prepared.output_names,
+    )
+}
+
+/// True when every `ON` column agrees with its declared type.
+///
+/// `NULL` is allowed. A missing cell, a ratio, or any other runtime type is
+/// not: the nested loop reports that when it evaluates the comparison.
+fn on_cells_match_schema(
+    outer_types: &[DataType],
+    inner_types: &[DataType],
+    outer_rows: &[Vec<Value>],
+    inner_rows: &[Vec<Value>],
+    on: &BoundExpr,
+) -> bool {
+    if outer_rows.iter().any(|row| row.len() != outer_types.len())
+        || inner_rows.iter().any(|row| row.len() != inner_types.len())
+    {
+        return false;
+    }
+    let mut columns = Vec::new();
+    bound_columns(on, &mut columns);
+    let outer_width = outer_types.len();
+    columns.into_iter().all(|index| {
+        let (rows, expected) = if index < outer_width {
+            (outer_rows, outer_types.get(index).copied())
+        } else {
+            (inner_rows, inner_types.get(index - outer_width).copied())
+        };
+        let Some(expected) = expected else {
+            return false;
+        };
+        let local = index - usize::from(index >= outer_width) * outer_width;
+        rows.iter()
+            .all(|row| cell_matches_type(row.get(local), expected))
+    })
+}
+
+fn bound_columns(expr: &BoundExpr, out: &mut Vec<usize>) {
+    match expr {
+        BoundExpr::Literal(_) => {}
+        BoundExpr::Column(index) => {
+            if !out.contains(index) {
+                out.push(*index);
+            }
+        }
+        BoundExpr::Not(inner) | BoundExpr::IsNull(inner) | BoundExpr::IsNotNull(inner) => {
+            bound_columns(inner, out);
+        }
+        BoundExpr::Binary { left, right, .. } => {
+            bound_columns(left, out);
+            bound_columns(right, out);
+        }
+    }
+}
+
+fn cell_matches_type(cell: Option<&Value>, expected: DataType) -> bool {
+    match cell {
+        Some(Value::Null) => true,
+        Some(value) => value.data_type() == Some(expected),
+        None => false,
+    }
+}
+
+/// Hash the right table, then walk left rows in insertion order.
+///
+/// A bucket group stores positions, and those positions stay in right
+/// insertion order. Exact key equality selects the group. The original `ON`
+/// still decides whether the left row matched, including a residual predicate.
+/// `WHERE` runs only after that decision. NULL keys are not hashed and do not
+/// probe. There is no pair-position buffer: the right table is always built,
+/// even when it is the larger input. Text keys are borrowed from the right
+/// rows for the lookup and are not copied into the table.
+fn visit_hash_left_pairs(
+    outer_rows: &[Vec<Value>],
+    inner_rows: &[Vec<Value>],
+    nulls: &[Value],
+    keys: HashKeys,
+    prepared: &PreparedJoin,
+    mut visit: impl FnMut(&[Value], &[Value]) -> Result<(), DbError>,
+) -> Result<(), DbError> {
+    let table = build_hash(inner_rows, keys.inner_ordinal, hash_key)?;
+    for outer_row in outer_rows {
+        let mut matched = false;
+        if let Some(hits) = matching_positions(
+            &table,
+            inner_rows,
+            keys.inner_ordinal,
+            outer_row,
+            keys.outer_ordinal,
+            hash_key,
+        )? {
+            for &position in hits {
+                let Some(inner_row) = inner_rows.get(position) else {
+                    return Err(DbError::Internal(
+                        "hash left join position is outside the build side".to_string(),
+                    ));
+                };
+                if !expr::pair_matches(Some(&prepared.on), outer_row, inner_row)? {
+                    continue;
+                }
+                matched = true;
+                if expr::pair_matches(prepared.filter.as_ref(), outer_row, inner_row)? {
+                    visit(outer_row, inner_row)?;
+                }
+            }
+        }
+        if !matched && expr::pair_matches(prepared.filter.as_ref(), outer_row, nulls)? {
+            visit(outer_row, nulls)?;
+        }
+    }
+    Ok(())
 }
 
 fn scan_left_join(
@@ -9302,6 +9566,476 @@ mod tests {
     }
 
     #[test]
+    fn a_hash_left_join_still_reports_a_later_residual_error() {
+        let error = scan_hash_amount(
+            vec![vec![Value::Integer(1)]],
+            vec![
+                vec![Value::Integer(1), Value::Integer(5)],
+                vec![Value::Integer(1), Value::Text("later".to_string())],
+            ],
+            Some(1),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("different types"), "{error}");
+        let limited = scan_hash_amount(
+            vec![vec![Value::Integer(1)]],
+            vec![
+                vec![Value::Integer(1), Value::Integer(5)],
+                vec![Value::Integer(1), Value::Text("later".to_string())],
+            ],
+            Some(0),
+            true,
+        );
+        assert!(limited.unwrap_err().to_string().contains("different types"));
+    }
+
+    #[test]
+    fn a_hash_left_null_extension_still_reports_a_where_error() {
+        let error = scan_hash_where_outer(
+            vec![
+                vec![Value::Integer(1), Value::Integer(1)],
+                vec![Value::Integer(2), Value::Text("later".to_string())],
+            ],
+            vec![vec![Value::Integer(9), Value::Integer(1)]],
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("different types"), "{error}");
+    }
+
+    /// The second right key is text stored in an integer column. It is not an
+    /// exact hash key, but `1 = 'later'` is a type error, including after
+    /// `LIMIT` has accepted the first match.
+    #[test]
+    fn a_mistyped_key_still_errors_after_limit() {
+        let outer = vec![vec![Value::Integer(1)]];
+        let inner = vec![
+            vec![Value::Integer(1)],
+            vec![Value::Text("later".to_string())],
+        ];
+        let hashed = scan_hash_equal(outer.clone(), inner.clone(), Some(1), false);
+        let nested = scan_typed_left(
+            outer.clone(),
+            inner.clone(),
+            OnShape::Equal,
+            None,
+            false,
+            Some(1),
+        );
+        assert_eq!(
+            hashed.unwrap_err().to_string(),
+            nested.unwrap_err().to_string()
+        );
+        let sorted = scan_hash_equal(outer.clone(), inner.clone(), Some(1), true);
+        let nested_sorted = scan_typed_left(outer, inner, OnShape::Equal, None, true, Some(1));
+        assert_eq!(
+            sorted.unwrap_err().to_string(),
+            nested_sorted.unwrap_err().to_string()
+        );
+    }
+
+    /// `user_id` does not match, and `amount` is text. The residual comparison
+    /// still runs, so the hash path cannot treat the key miss as success.
+    #[test]
+    fn a_mistyped_residual_on_another_key_still_errors() {
+        let outer = vec![vec![Value::Integer(1)]];
+        let inner = vec![vec![Value::Integer(2), Value::Text("later".to_string())]];
+        let hashed = scan_amount(true, outer.clone(), inner.clone(), Some(0), false);
+        let nested = scan_amount(false, outer, inner, Some(0), false);
+        assert_eq!(
+            hashed.unwrap_err().to_string(),
+            nested.unwrap_err().to_string()
+        );
+    }
+
+    /// A NULL left key does not make `NULL = text` a type error by itself.
+    /// The residual comparison on the text amount still does.
+    #[test]
+    fn a_null_probe_still_reports_a_mistyped_residual() {
+        let outer = vec![vec![Value::Null]];
+        let inner = vec![vec![Value::Integer(1), Value::Text("later".to_string())]];
+        let hashed = scan_amount(true, outer.clone(), inner.clone(), None, true);
+        let nested = scan_amount(false, outer, inner, None, true);
+        assert_eq!(
+            hashed.unwrap_err().to_string(),
+            nested.unwrap_err().to_string()
+        );
+    }
+
+    /// `IS NULL` does not reject a text cell. The key matches and the residual
+    /// is FALSE, so both paths null-extend and the next query can succeed.
+    #[test]
+    fn a_mistyped_cell_under_is_null_matches_the_nested_loop() {
+        let outer = vec![vec![Value::Integer(1)], vec![Value::Integer(2)]];
+        let inner = vec![vec![Value::Integer(1), Value::Text("kept".to_string())]];
+        let hashed = scan_is_null_amount(true, outer.clone(), inner.clone()).unwrap();
+        let nested = scan_is_null_amount(false, outer, inner).unwrap();
+        let StatementResult::Query(hashed) = hashed else {
+            panic!("expected a query");
+        };
+        let StatementResult::Query(nested) = nested else {
+            panic!("expected a query");
+        };
+        assert_eq!(hashed.rows, nested.rows);
+        assert_eq!(
+            hashed.rows,
+            vec![
+                vec![Value::Integer(1), Value::Null],
+                vec![Value::Integer(2), Value::Null],
+            ]
+        );
+        let followed = scan_hash_equal(
+            vec![vec![Value::Integer(1)]],
+            vec![vec![Value::Integer(1)]],
+            None,
+            false,
+        )
+        .unwrap();
+        let StatementResult::Query(followed) = followed else {
+            panic!("expected a query");
+        };
+        assert_eq!(
+            followed.rows,
+            vec![vec![Value::Integer(1), Value::Integer(1)]]
+        );
+    }
+
+    /// No left row means the mistyped right key is never compared.
+    #[test]
+    fn an_empty_left_side_does_not_read_a_mistyped_right_key() {
+        let result = scan_hash_equal(
+            Vec::new(),
+            vec![vec![Value::Text("later".to_string())]],
+            Some(1),
+            false,
+        )
+        .unwrap();
+        let StatementResult::Query(result) = result else {
+            panic!("expected a query");
+        };
+        assert!(result.rows.is_empty());
+    }
+
+    fn scan_hash_equal(
+        outer: Vec<Vec<Value>>,
+        inner: Vec<Vec<Value>>,
+        limit: Option<u64>,
+        sort: bool,
+    ) -> Result<StatementResult, DbError> {
+        let scope = Scope::try_join(
+            "u",
+            vec![("id".to_string(), DataType::Integer)],
+            "o",
+            vec![("user_id".to_string(), DataType::Integer)],
+        )
+        .unwrap();
+        let on = Expr::Binary {
+            left: Box::new(Expr::Column {
+                name: "id".to_string(),
+                qualifier: Some("u".to_string()),
+            }),
+            op: crate::ast::BinOp::Eq,
+            right: Box::new(Expr::Column {
+                name: "user_id".to_string(),
+                qualifier: Some("o".to_string()),
+            }),
+        };
+        let prepared = PreparedJoin {
+            on: expr::bind_filter(&on, &scope, "ON").unwrap(),
+            filter: None,
+            sort_keys: if sort {
+                vec![SortKey {
+                    index: 0,
+                    ascending: true,
+                    nulls_first: false,
+                }]
+            } else {
+                Vec::new()
+            },
+            output_indexes: vec![0, 1],
+            output_names: vec!["id".to_string(), "user_id".to_string()],
+            path: JoinAccess::NestedLoop,
+        };
+        scan_hash_left_join(
+            &outer,
+            &inner,
+            &[DataType::Integer],
+            &[DataType::Integer],
+            HashKeys {
+                outer_ordinal: 0,
+                inner_ordinal: 0,
+            },
+            prepared,
+            limit,
+        )
+    }
+
+    fn scan_is_null_amount(
+        hash: bool,
+        outer: Vec<Vec<Value>>,
+        inner: Vec<Vec<Value>>,
+    ) -> Result<StatementResult, DbError> {
+        let scope = Scope::try_join(
+            "u",
+            vec![("id".to_string(), DataType::Integer)],
+            "o",
+            vec![
+                ("user_id".to_string(), DataType::Integer),
+                ("amount".to_string(), DataType::Integer),
+            ],
+        )
+        .unwrap();
+        let on = Expr::Binary {
+            left: Box::new(Expr::Binary {
+                left: Box::new(Expr::Column {
+                    name: "id".to_string(),
+                    qualifier: Some("u".to_string()),
+                }),
+                op: crate::ast::BinOp::Eq,
+                right: Box::new(Expr::Column {
+                    name: "user_id".to_string(),
+                    qualifier: Some("o".to_string()),
+                }),
+            }),
+            op: crate::ast::BinOp::And,
+            right: Box::new(Expr::IsNull(Box::new(Expr::Column {
+                name: "amount".to_string(),
+                qualifier: Some("o".to_string()),
+            }))),
+        };
+        let prepared = PreparedJoin {
+            on: expr::bind_filter(&on, &scope, "ON").unwrap(),
+            filter: None,
+            sort_keys: Vec::new(),
+            output_indexes: vec![0, 2],
+            output_names: vec!["id".to_string(), "amount".to_string()],
+            path: JoinAccess::NestedLoop,
+        };
+        if !hash {
+            return scan_left_join(&outer, &inner, 2, prepared, None);
+        }
+        scan_hash_left_join(
+            &outer,
+            &inner,
+            &[DataType::Integer],
+            &[DataType::Integer, DataType::Integer],
+            HashKeys {
+                outer_ordinal: 0,
+                inner_ordinal: 0,
+            },
+            prepared,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_forced_collision_matches_the_nested_left_join() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Bea'), (3, 'Cy'), (NULL, 'Dee');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 50), (1, 150), (1, NULL), (2, 10), (NULL, 5);")
+            .unwrap();
+        let sqls = [
+            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON o.user_id = u.id AND o.amount > 100;",
+            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount > 100;",
+            "SELECT u.name, o.user_id, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.user_id IS NULL;",
+            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id OR o.amount = 5;",
+            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.amount > 1000;",
+            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.amount = NULL;",
+            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount > 1000;",
+        ];
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            sqls.iter()
+                .map(|sql| query(&mut db, sql).rows)
+                .collect::<Vec<_>>()
+        };
+        let hashed = sqls
+            .iter()
+            .map(|sql| query(&mut db, sql).rows)
+            .collect::<Vec<_>>();
+        assert_eq!(hashed, nested);
+        let collided = {
+            let _force = ForceHashCollision::new();
+            sqls.iter()
+                .map(|sql| query(&mut db, sql).rows)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(collided, nested);
+        let explained = query(
+            &mut db,
+            "EXPLAIN SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+        );
+        assert_eq!(
+            explained.rows[0][0],
+            Value::Text("HashLeftJoin".to_string())
+        );
+        assert_eq!(explained.rows[0][3], Value::Text("o (orders)".to_string()));
+        let nested_plan = {
+            let _force = ForceNestedJoin::new();
+            query(
+                &mut db,
+                "EXPLAIN SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id OR o.amount = 5;",
+            )
+        };
+        assert_eq!(
+            nested_plan.rows[0][0],
+            Value::Text("LeftNestedLoopJoin".to_string())
+        );
+    }
+
+    fn scan_hash_amount(
+        outer: Vec<Vec<Value>>,
+        inner: Vec<Vec<Value>>,
+        limit: Option<u64>,
+        sort: bool,
+    ) -> Result<StatementResult, DbError> {
+        scan_amount(true, outer, inner, limit, sort)
+    }
+
+    fn scan_amount(
+        hash: bool,
+        outer: Vec<Vec<Value>>,
+        inner: Vec<Vec<Value>>,
+        limit: Option<u64>,
+        sort: bool,
+    ) -> Result<StatementResult, DbError> {
+        let scope = Scope::try_join(
+            "u",
+            vec![("id".to_string(), DataType::Integer)],
+            "o",
+            vec![
+                ("user_id".to_string(), DataType::Integer),
+                ("amount".to_string(), DataType::Integer),
+            ],
+        )
+        .unwrap();
+        let on = Expr::Binary {
+            left: Box::new(Expr::Binary {
+                left: Box::new(Expr::Column {
+                    name: "id".to_string(),
+                    qualifier: Some("u".to_string()),
+                }),
+                op: crate::ast::BinOp::Eq,
+                right: Box::new(Expr::Column {
+                    name: "user_id".to_string(),
+                    qualifier: Some("o".to_string()),
+                }),
+            }),
+            op: crate::ast::BinOp::And,
+            right: Box::new(Expr::Binary {
+                left: Box::new(Expr::Column {
+                    name: "amount".to_string(),
+                    qualifier: Some("o".to_string()),
+                }),
+                op: crate::ast::BinOp::Gt,
+                right: Box::new(Expr::Literal(Value::Integer(0))),
+            }),
+        };
+        let prepared = PreparedJoin {
+            on: expr::bind_filter(&on, &scope, "ON").unwrap(),
+            filter: None,
+            sort_keys: if sort {
+                vec![SortKey {
+                    index: 0,
+                    ascending: true,
+                    nulls_first: false,
+                }]
+            } else {
+                Vec::new()
+            },
+            output_indexes: vec![0, 2],
+            output_names: vec!["id".to_string(), "amount".to_string()],
+            path: JoinAccess::NestedLoop,
+        };
+        if !hash {
+            return scan_left_join(&outer, &inner, 2, prepared, limit);
+        }
+        scan_hash_left_join(
+            &outer,
+            &inner,
+            &[DataType::Integer],
+            &[DataType::Integer, DataType::Integer],
+            HashKeys {
+                outer_ordinal: 0,
+                inner_ordinal: 0,
+            },
+            prepared,
+            limit,
+        )
+    }
+
+    fn scan_hash_where_outer(
+        outer: Vec<Vec<Value>>,
+        inner: Vec<Vec<Value>>,
+        limit: Option<u64>,
+    ) -> Result<StatementResult, DbError> {
+        let scope = Scope::try_join(
+            "u",
+            vec![
+                ("id".to_string(), DataType::Integer),
+                ("n".to_string(), DataType::Integer),
+            ],
+            "o",
+            vec![
+                ("user_id".to_string(), DataType::Integer),
+                ("amount".to_string(), DataType::Integer),
+            ],
+        )
+        .unwrap();
+        let on = Expr::Binary {
+            left: Box::new(Expr::Column {
+                name: "id".to_string(),
+                qualifier: Some("u".to_string()),
+            }),
+            op: crate::ast::BinOp::Eq,
+            right: Box::new(Expr::Column {
+                name: "user_id".to_string(),
+                qualifier: Some("o".to_string()),
+            }),
+        };
+        let filter = expr::bind_filter(
+            &Expr::Binary {
+                left: Box::new(Expr::Column {
+                    name: "n".to_string(),
+                    qualifier: Some("u".to_string()),
+                }),
+                op: crate::ast::BinOp::Gt,
+                right: Box::new(Expr::Literal(Value::Integer(0))),
+            },
+            &scope,
+            "WHERE",
+        )
+        .unwrap();
+        let prepared = PreparedJoin {
+            on: expr::bind_filter(&on, &scope, "ON").unwrap(),
+            filter: Some(filter),
+            sort_keys: Vec::new(),
+            output_indexes: vec![0, 1],
+            output_names: vec!["id".to_string(), "n".to_string()],
+            path: JoinAccess::NestedLoop,
+        };
+        scan_hash_left_join(
+            &outer,
+            &inner,
+            &[DataType::Integer, DataType::Integer],
+            &[DataType::Integer, DataType::Integer],
+            HashKeys {
+                outer_ordinal: 0,
+                inner_ordinal: 0,
+            },
+            prepared,
+            limit,
+        )
+    }
+
+    #[test]
     #[ignore = "release profile of LEFT JOIN"]
     fn profile_milestone18() {
         let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
@@ -9312,6 +10046,7 @@ mod tests {
             std::mem::size_of::<Value>(),
             std::mem::size_of::<Vec<Value>>()
         );
+        let _nested = ForceNestedJoin::new();
         for rows in [100_i64, 1_000, 4_000] {
             for shape in [
                 "matched",
@@ -9407,6 +10142,9 @@ mod tests {
                 if user_id != user {
                     continue;
                 }
+                if shape == "residual" && order <= threshold {
+                    continue;
+                }
                 hit = true;
                 matched += 1;
                 if shape != "where" || order > threshold {
@@ -9465,5 +10203,139 @@ mod tests {
             database.execute(&sql).unwrap();
             start = end + 1;
         }
+    }
+
+    #[test]
+    #[ignore = "release profile of hash LEFT JOIN"]
+    fn profile_milestone19() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone19 cpu={cpu} mem_bytes={mem} rustc={rustc} value_bytes={} row_vec_bytes={}",
+            std::mem::size_of::<Value>(),
+            std::mem::size_of::<Vec<Value>>()
+        );
+        for rows in [100_i64, 1_000, 4_000, 10_000] {
+            for shape in [
+                "matched",
+                "few",
+                "none",
+                "duplicates",
+                "residual",
+                "where",
+                "order_limit",
+            ] {
+                profile_hash_left(rows, rows, shape);
+            }
+        }
+        for (users, orders) in [
+            (100_i64, 4_000),
+            (4_000, 100),
+            (1_000, 10_000),
+            (10_000, 1_000),
+        ] {
+            for shape in ["matched", "none", "duplicates", "where", "order_limit"] {
+                profile_hash_left(users, orders, shape);
+            }
+        }
+    }
+
+    fn profile_hash_left(users: i64, orders: i64, shape: &str) {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        database
+            .execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        load_left_users(&mut database, users);
+        load_left_orders(&mut database, orders, shape);
+        let sql = match shape {
+            "where" => format!(
+                "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount > {};",
+                orders / 2
+            ),
+            "residual" => format!(
+                "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.amount > {};",
+                orders / 2
+            ),
+            "order_limit" => "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id ORDER BY o.amount ASC LIMIT 5;".to_string(),
+            _ => "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;".to_string(),
+        };
+        let explained = query(&mut database, &format!("EXPLAIN {sql}"));
+        assert_eq!(
+            explained.rows[0][0],
+            Value::Text("HashLeftJoin".to_string()),
+            "{shape}"
+        );
+        assert_eq!(explained.rows[0][3], Value::Text("o (orders)".to_string()));
+        let (matched, extended, returned) = left_counts(users, orders, shape);
+        let examined = hash_left_examined(users, orders, shape);
+        let (groups, positions) = hash_left_build(orders, shape);
+        let (hash_cold, hash_warm, hash_sum) = time_left(&mut database, &sql, returned, shape);
+        let (nested_cold, nested_warm, nested_sum) = {
+            let _force = ForceNestedJoin::new();
+            time_left(&mut database, &sql, returned, shape)
+        };
+        assert_eq!(hash_sum, nested_sum, "{shape} {users}x{orders}");
+        let hash_bytes = hash_table_bytes(groups, positions);
+        let copy_rows = if orders <= users { orders } else { users };
+        let copy_bytes = usize::try_from(copy_rows)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(
+                std::mem::size_of::<Vec<Value>>()
+                    .saturating_add(2usize.saturating_mul(std::mem::size_of::<Value>())),
+            );
+        let nested_examined = users.saturating_mul(orders);
+        println!(
+            "milestone19 shape={shape} users={users} orders={orders} examined={examined} nested_examined={nested_examined} matched={matched} null_extended={extended} returned={returned} groups={groups} positions={positions} hash_bytes={hash_bytes} copy_rows={copy_rows} copy_bytes={copy_bytes} hash_cold_us={hash_cold} hash_warm_us={hash_warm} nested_cold_us={nested_cold} nested_warm_us={nested_warm} checksum={hash_sum}"
+        );
+    }
+
+    fn time_left(
+        database: &mut Database,
+        sql: &str,
+        returned: usize,
+        shape: &str,
+    ) -> (u128, u128, i64) {
+        let mut samples = Vec::with_capacity(6);
+        let mut checksum = 0_i64;
+        for _ in 0..6 {
+            let started = std::time::Instant::now();
+            let result = query(database, sql);
+            samples.push(started.elapsed().as_micros());
+            assert_eq!(result.rows.len(), returned, "{shape}");
+            checksum = profile_checksum(&result);
+        }
+        let cold = samples[0];
+        let mut warm = samples[1..].to_vec();
+        warm.sort_unstable();
+        (cold, warm[warm.len() / 2], checksum)
+    }
+
+    fn hash_left_examined(users: i64, orders: i64, shape: &str) -> usize {
+        if users == 0 || orders == 0 {
+            return 0;
+        }
+        match shape {
+            "none" => 0,
+            "few" => usize::try_from(orders).unwrap_or(usize::MAX),
+            "duplicates" => (0..orders).filter(|order| order % 10 < users).count(),
+            _ => usize::try_from(users.min(orders)).unwrap_or(usize::MAX),
+        }
+    }
+
+    fn hash_left_build(orders: i64, shape: &str) -> (usize, usize) {
+        if orders == 0 {
+            return (0, 0);
+        }
+        let positions = usize::try_from(orders).unwrap_or(usize::MAX);
+        let groups = match shape {
+            "none" | "few" => 1,
+            "duplicates" => usize::try_from(orders.min(10)).unwrap_or(10),
+            _ => positions,
+        };
+        (groups, positions)
     }
 }

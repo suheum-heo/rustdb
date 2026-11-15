@@ -411,21 +411,25 @@ fn an_index_does_not_change_rows_and_explain_does_not_write() {
             "access".to_string(),
             "outer".to_string(),
             "inner".to_string(),
-            "condition".to_string(),
+            "build".to_string(),
+            "predicate".to_string(),
+            "residual".to_string(),
             "filter".to_string(),
             "projection".to_string(),
             "order_by".to_string(),
             "limit".to_string(),
         ]
     );
-    assert_eq!(explained.rows[0][0], text("LeftNestedLoopJoin"));
+    assert_eq!(explained.rows[0][0], text("HashLeftJoin"));
     assert_eq!(explained.rows[0][1], text("u (users)"));
     assert_eq!(explained.rows[0][2], text("o (orders)"));
-    assert_eq!(explained.rows[0][3], text("u.id = o.user_id"));
-    assert_eq!(explained.rows[0][4], text("o.amount > 15"));
-    assert_eq!(explained.rows[0][5], text("name, amount"));
-    assert_eq!(explained.rows[0][6], text("u.name ASC"));
-    assert_eq!(explained.rows[0][7], integer(1));
+    assert_eq!(explained.rows[0][3], text("o (orders)"));
+    assert_eq!(explained.rows[0][4], text("u.id = o.user_id"));
+    assert_eq!(explained.rows[0][5], Value::Null);
+    assert_eq!(explained.rows[0][6], text("o.amount > 15"));
+    assert_eq!(explained.rows[0][7], text("name, amount"));
+    assert_eq!(explained.rows[0][8], text("u.name ASC"));
+    assert_eq!(explained.rows[0][9], integer(1));
     assert_eq!(std::fs::metadata(&path).unwrap().len(), after_index);
     assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
     let failed = failure(

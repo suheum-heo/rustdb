@@ -17,8 +17,10 @@
 //! `COUNT`, `SUM`, and `AVG` accept `DISTINCT` on one column. `SELECT DISTINCT`
 //! keeps the first copy of each projected row from one non-aggregate table or
 //! from one non-aggregate `INNER JOIN`. A non-aggregate `LEFT JOIN` of two
-//! tables keeps every left row. A left row with no TRUE `ON` match is returned
-//! once, with NULL for each right column. `WHERE` runs after that extension.
+//! tables keeps every left row. A same-type column equality hashes the right
+//! table. Any other `ON` uses a nested loop. A left row with no TRUE `ON`
+//! match is returned once, with NULL for each right column. `WHERE` runs after
+//! that extension.
 //! Other filters scan the in-memory table.
 //!
 //! # Example
