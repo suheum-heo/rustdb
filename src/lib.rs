@@ -15,7 +15,8 @@
 //! `HAVING` keeps a group only when it is TRUE. A select-list alias is an
 //! output name, an `ORDER BY` name, and an unqualified `HAVING` name.
 //! `COUNT`, `SUM`, and `AVG` accept `DISTINCT` on one column. `SELECT DISTINCT`
-//! keeps the first copy of each projected row from one non-aggregate table.
+//! keeps the first copy of each projected row from one non-aggregate table or
+//! from one non-aggregate `INNER JOIN`.
 //! Other filters scan the in-memory table.
 //!
 //! # Example

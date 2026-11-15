@@ -716,20 +716,8 @@ fn explain_plans_without_writing_and_a_restart_keeps_the_rows() {
 }
 
 #[test]
-fn join_group_by_and_aggregates_stay_rejected() {
+fn group_by_and_aggregates_stay_rejected() {
     let mut database = employees();
-    for sql in [
-        "SELECT DISTINCT a.department FROM employees a
-         JOIN employees b ON a.employee_id = b.employee_id;",
-        "EXPLAIN SELECT DISTINCT a.department FROM employees a
-         JOIN employees b ON a.employee_id = b.employee_id;",
-    ] {
-        assert_eq!(
-            failure(&mut database, sql),
-            "DISTINCT is not supported for JOIN",
-            "{sql}"
-        );
-    }
     assert_eq!(
         failure(
             &mut database,

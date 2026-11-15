@@ -573,3 +573,74 @@ Release profile `profile_milestone14`, 15 Nov 2026. Apple M5, 17179869184 bytes 
 | file index range | 100,000 | 30 | 10 | 10 | 1 | 0 | 960 | 45 | 12 µs | 11 µs |
 
 At 100,000 rows, warm plain `bucket` is 1,219 µs and warm `DISTINCT bucket` over 10 values is 3,295 µs. Warm plain `id` is 1,201 µs and warm `DISTINCT id` over 100,000 values is 13,725 µs, with a 9,600,000-byte estimate. Warm plain `tag` is 2,278 µs and warm `DISTINCT tag` is 15,142 µs. The hash table is the extra cost: a plain scan only copies the projection. Low-cardinality `DISTINCT` still hashes every input row, so it is slower than the plain scan on this run. `WHERE`, `ORDER BY`, and `LIMIT` do not remove that scan. On the same file, the sequential range examines 100,000 rows and is 1,849 µs warm. After `CREATE INDEX` the same statement examines 30 keys and is 11 µs warm. Both return the same 10 buckets. `SELECT DISTINCT` does not add a skip scan.
+
+## Milestone 16 SELECT DISTINCT JOIN
+
+Release profile `profile_milestone16`, 15 Nov 2026. Apple M5, 17179869184 bytes of memory, `rustc 1.100.0 (0ef1bc386 2026-11-09)`. `Value` is 32 bytes and a row vector header is 24 bytes. A hash-join position pair is 16 bytes. The warm time is the median of the next five samples. The cold time is the first sample. A wrong row count fails the run. Checksums are the printed wrapping sums of the returned cells.
+
+Each size is a keyed join, `users.id = orders.user_id`, not a Cartesian product. A 10,000 by 10,000 nested loop was not run. On the equal input every order matches one user, `amount` is NULL on even ids and `id % 5` on odd ids, `name` is one of `a` through `h`, and `tag` is the id printed in 64 characters. The duplicate input uses the same row counts and sets `user_id = id % 10`, so ten users own every order. The skewed input has `max(n / 100, 1)` users and `n` orders.
+
+Equal sizes build the inner table, so the hash position buffer is empty. The planner selects `HashJoin` for those equalities. `NestedLoopJoin` and `IndexNestedLoopJoin` on the equal input are forced, so those rows compare the operators rather than the planner. The skewed index is the planner's choice: the inner table is more than 64 times the outer table and `orders.user_id` is indexed. The skewed hash row is the same data with no index. It builds the outer table and keeps one position pair per match. Nested loop and index nested loop do not keep that pair buffer. `Bytes` is the projected-row estimate for a plain select and the distinct-set estimate for `SELECT DISTINCT`. `ORDER BY` / `LIMIT` still charges all 24 unique pairs, not the five returned rows. Neither figure is process RSS.
+
+| Strategy | Shape | Users | Orders | Matches | Returned | Unique | Bytes | Pair bytes | Cold | Warm |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HashJoin | plain `name` | 100 | 100 | 100 | 100 | 100 | 5,700 | 0 | 106 µs | 30 µs |
+| HashJoin | `DISTINCT name` | 100 | 100 | 100 | 8 | 8 | 776 | 0 | 37 µs | 33 µs |
+| HashJoin | plain ids | 100 | 100 | 100 | 100 | 100 | 8,800 | 0 | 28 µs | 27 µs |
+| HashJoin | `DISTINCT` ids | 100 | 100 | 100 | 100 | 100 | 12,800 | 0 | 45 µs | 45 µs |
+| HashJoin | `DISTINCT amount` | 100 | 100 | 100 | 6 | 6 | 576 | 0 | 30 µs | 28 µs |
+| HashJoin | `DISTINCT tag` | 100 | 100 | 100 | 100 | 100 | 16,000 | 0 | 44 µs | 43 µs |
+| HashJoin | `DISTINCT` order limit | 100 | 100 | 100 | 5 | 24 | 3,096 | 0 | 66 µs | 40 µs |
+| HashJoin | duplicate plain `name` | 100 | 100 | 100 | 100 | 100 | 5,700 | 0 | 24 µs | 22 µs |
+| HashJoin | duplicate `DISTINCT name` | 100 | 100 | 100 | 8 | 8 | 776 | 0 | 27 µs | 27 µs |
+| HashJoin | skewed `DISTINCT name` | 1 | 100 | 100 | 1 | 1 | 97 | 1,600 | 22 µs | 19 µs |
+| NestedLoopJoin | `DISTINCT name` | 100 | 100 | 100 | 8 | 8 | 776 | 0 | 111 µs | 109 µs |
+| NestedLoopJoin | `DISTINCT` ids | 100 | 100 | 100 | 100 | 100 | 12,800 | 0 | 123 µs | 122 µs |
+| IndexNestedLoopJoin | `DISTINCT name` | 100 | 100 | 100 | 8 | 8 | 776 | 0 | 210 µs | 107 µs |
+| IndexNestedLoopJoin | `DISTINCT` ids | 100 | 100 | 100 | 100 | 100 | 12,800 | 0 | 125 µs | 134 µs |
+| IndexNestedLoopJoin | skewed `DISTINCT name` | 1 | 100 | 100 | 1 | 1 | 97 | 0 | 87 µs | 26 µs |
+| HashJoin | plain `name` | 1,000 | 1,000 | 1,000 | 1,000 | 1,000 | 57,000 | 0 | 256 µs | 210 µs |
+| HashJoin | `DISTINCT name` | 1,000 | 1,000 | 1,000 | 8 | 8 | 776 | 0 | 256 µs | 225 µs |
+| HashJoin | plain ids | 1,000 | 1,000 | 1,000 | 1,000 | 1,000 | 88,000 | 0 | 238 µs | 186 µs |
+| HashJoin | `DISTINCT` ids | 1,000 | 1,000 | 1,000 | 1,000 | 1,000 | 128,000 | 0 | 442 µs | 393 µs |
+| HashJoin | `DISTINCT amount` | 1,000 | 1,000 | 1,000 | 6 | 6 | 576 | 0 | 215 µs | 213 µs |
+| HashJoin | `DISTINCT tag` | 1,000 | 1,000 | 1,000 | 1,000 | 1,000 | 160,000 | 0 | 383 µs | 371 µs |
+| HashJoin | `DISTINCT` order limit | 1,000 | 1,000 | 1,000 | 5 | 24 | 3,096 | 0 | 234 µs | 226 µs |
+| HashJoin | duplicate plain `name` | 1,000 | 1,000 | 1,000 | 1,000 | 1,000 | 57,000 | 0 | 127 µs | 118 µs |
+| HashJoin | duplicate `DISTINCT name` | 1,000 | 1,000 | 1,000 | 8 | 8 | 776 | 0 | 153 µs | 153 µs |
+| HashJoin | skewed `DISTINCT name` | 10 | 1,000 | 1,000 | 8 | 8 | 776 | 16,000 | 141 µs | 123 µs |
+| NestedLoopJoin | `DISTINCT name` | 1,000 | 1,000 | 1,000 | 8 | 8 | 776 | 0 | 7,698 µs | 6,911 µs |
+| NestedLoopJoin | `DISTINCT` ids | 1,000 | 1,000 | 1,000 | 1,000 | 1,000 | 128,000 | 0 | 6,703 µs | 6,604 µs |
+| IndexNestedLoopJoin | `DISTINCT name` | 1,000 | 1,000 | 1,000 | 8 | 8 | 776 | 0 | 1,519 µs | 1,169 µs |
+| IndexNestedLoopJoin | `DISTINCT` ids | 1,000 | 1,000 | 1,000 | 1,000 | 1,000 | 128,000 | 0 | 1,250 µs | 1,183 µs |
+| IndexNestedLoopJoin | skewed `DISTINCT name` | 10 | 1,000 | 1,000 | 8 | 8 | 776 | 0 | 493 µs | 161 µs |
+| HashJoin | plain `name` | 4,000 | 4,000 | 4,000 | 4,000 | 4,000 | 228,000 | 0 | 715 µs | 629 µs |
+| HashJoin | `DISTINCT name` | 4,000 | 4,000 | 4,000 | 8 | 8 | 776 | 0 | 769 µs | 718 µs |
+| HashJoin | plain ids | 4,000 | 4,000 | 4,000 | 4,000 | 4,000 | 352,000 | 0 | 620 µs | 579 µs |
+| HashJoin | `DISTINCT` ids | 4,000 | 4,000 | 4,000 | 4,000 | 4,000 | 512,000 | 0 | 1,284 µs | 1,174 µs |
+| HashJoin | `DISTINCT amount` | 4,000 | 4,000 | 4,000 | 6 | 6 | 576 | 0 | 602 µs | 600 µs |
+| HashJoin | `DISTINCT tag` | 4,000 | 4,000 | 4,000 | 4,000 | 4,000 | 640,000 | 0 | 1,275 µs | 1,140 µs |
+| HashJoin | `DISTINCT` order limit | 4,000 | 4,000 | 4,000 | 5 | 24 | 3,096 | 0 | 671 µs | 661 µs |
+| HashJoin | duplicate plain `name` | 4,000 | 4,000 | 4,000 | 4,000 | 4,000 | 228,000 | 0 | 387 µs | 348 µs |
+| HashJoin | duplicate `DISTINCT name` | 4,000 | 4,000 | 4,000 | 8 | 8 | 776 | 0 | 547 µs | 457 µs |
+| HashJoin | skewed `DISTINCT name` | 40 | 4,000 | 4,000 | 8 | 8 | 776 | 64,000 | 396 µs | 370 µs |
+| NestedLoopJoin | `DISTINCT name` | 4,000 | 4,000 | 4,000 | 8 | 8 | 776 | 0 | 102,725 µs | 101,808 µs |
+| IndexNestedLoopJoin | `DISTINCT name` | 4,000 | 4,000 | 4,000 | 8 | 8 | 776 | 0 | 4,368 µs | 3,320 µs |
+| IndexNestedLoopJoin | `DISTINCT` ids | 4,000 | 4,000 | 4,000 | 4,000 | 4,000 | 512,000 | 0 | 3,589 µs | 3,511 µs |
+| IndexNestedLoopJoin | skewed `DISTINCT name` | 40 | 4,000 | 4,000 | 8 | 8 | 776 | 0 | 1,586 µs | 538 µs |
+| HashJoin | plain `name` | 10,000 | 10,000 | 10,000 | 10,000 | 10,000 | 570,000 | 0 | 1,406 µs | 1,299 µs |
+| HashJoin | `DISTINCT name` | 10,000 | 10,000 | 10,000 | 8 | 8 | 776 | 0 | 1,511 µs | 1,435 µs |
+| HashJoin | plain ids | 10,000 | 10,000 | 10,000 | 10,000 | 10,000 | 880,000 | 0 | 1,213 µs | 1,195 µs |
+| HashJoin | `DISTINCT` ids | 10,000 | 10,000 | 10,000 | 10,000 | 10,000 | 1,280,000 | 0 | 2,752 µs | 2,598 µs |
+| HashJoin | `DISTINCT amount` | 10,000 | 10,000 | 10,000 | 6 | 6 | 576 | 0 | 1,377 µs | 1,402 µs |
+| HashJoin | `DISTINCT tag` | 10,000 | 10,000 | 10,000 | 10,000 | 10,000 | 1,600,000 | 0 | 2,640 µs | 2,681 µs |
+| HashJoin | `DISTINCT` order limit | 10,000 | 10,000 | 10,000 | 5 | 24 | 3,096 | 0 | 1,550 µs | 1,555 µs |
+| HashJoin | duplicate plain `name` | 10,000 | 10,000 | 10,000 | 10,000 | 10,000 | 570,000 | 0 | 870 µs | 852 µs |
+| HashJoin | duplicate `DISTINCT name` | 10,000 | 10,000 | 10,000 | 8 | 8 | 776 | 0 | 1,120 µs | 1,088 µs |
+| HashJoin | skewed `DISTINCT name` | 100 | 10,000 | 10,000 | 8 | 8 | 776 | 160,000 | 954 µs | 918 µs |
+| IndexNestedLoopJoin | `DISTINCT name` | 10,000 | 10,000 | 10,000 | 8 | 8 | 776 | 0 | 10,679 µs | 8,573 µs |
+| IndexNestedLoopJoin | `DISTINCT` ids | 10,000 | 10,000 | 10,000 | 10,000 | 10,000 | 1,280,000 | 0 | 9,574 µs | 9,535 µs |
+| IndexNestedLoopJoin | skewed `DISTINCT name` | 100 | 10,000 | 10,000 | 8 | 8 | 776 | 0 | 3,126 µs | 1,063 µs |
+
+At 10,000 by 10,000, warm hash plain `name` is 1,299 µs and warm `DISTINCT name` over 8 values is 1,435 µs. The distinct set is 776 bytes. Warm hash plain ids is 1,195 µs and warm `DISTINCT` ids over 10,000 pairs is 2,598 µs, with a 1,280,000-byte estimate. Warm `DISTINCT tag` over 10,000 strings, 640,000 text bytes, is 2,681 µs and the estimate is 1,600,000 bytes. Warm `DISTINCT amount` over 6 values, half of them NULL, is 1,402 µs. Warm `ORDER BY name, amount LIMIT 5` is 1,555 µs and still stores 24 pairs. The duplicate-key hash, ten distinct `user_id` values, is 852 µs warm for the plain name list and 1,088 µs warm for `DISTINCT name`. Forced nested loop of the 4,000 by 4,000 name query is 101,808 µs warm against 718 µs for the hash join of the same statement. Forced index nested loop of the 10,000 by 10,000 id query is 9,535 µs warm against 2,598 µs for hash. The planner still uses hash for that equal input. On the skewed 100 by 10,000 input the hash join is 918 µs warm and holds a 160,000-byte position buffer. The index probe the planner selects there is 1,063 µs warm and does not hold that buffer.
+

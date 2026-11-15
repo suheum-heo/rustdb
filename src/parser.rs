@@ -573,17 +573,14 @@ fn select_distinct(select: &Select) -> Result<bool, DbError> {
     }
 }
 
-/// This milestone deduplicates one non-aggregate table.
+/// `SELECT DISTINCT` covers one table or one non-aggregate `INNER JOIN`.
 fn reject_distinct_query(
-    from: &QueryFrom,
+    _from: &QueryFrom,
     projection: &Projection,
     group_by: &[SelectColumn],
     having: Option<&Expr>,
     order_by: &[OrderKey],
 ) -> Result<(), DbError> {
-    if matches!(from, QueryFrom::Join { .. }) {
-        return Err(DbError::unsupported("DISTINCT is not supported for JOIN"));
-    }
     if !group_by.is_empty() {
         return Err(DbError::unsupported(
             "DISTINCT is not supported with GROUP BY",
@@ -595,7 +592,9 @@ fn reject_distinct_query(
         ));
     }
     let aggregate = match projection {
-        Projection::All | Projection::QualifiedAll { .. } => false,
+        Projection::All | Projection::QualifiedAll { .. } | Projection::QualifiedStars { .. } => {
+            false
+        }
         Projection::Columns(items) => items
             .iter()
             .any(|item| matches!(item, SelectItem::Aggregate { .. })),
@@ -768,6 +767,16 @@ fn convert_projection(items: &[SqlSelectItem]) -> Result<Projection, DbError> {
             qualifier: wildcard_qualifier(kind)?,
         });
     }
+    if items.len() > 1
+        && items.iter().all(|item| {
+            matches!(
+                item,
+                SqlSelectItem::Wildcard(_) | SqlSelectItem::QualifiedWildcard(_, _)
+            )
+        })
+    {
+        return qualified_stars(items);
+    }
 
     let mut columns = Vec::with_capacity(items.len());
     for item in items {
@@ -793,6 +802,35 @@ fn convert_projection(items: &[SqlSelectItem]) -> Result<Projection, DbError> {
         }
     }
     Ok(Projection::Columns(columns))
+}
+
+fn qualified_stars(items: &[SqlSelectItem]) -> Result<Projection, DbError> {
+    let mut qualifiers = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            SqlSelectItem::QualifiedWildcard(kind, options) => {
+                reject_wildcard_options(options)?;
+                let qualifier = wildcard_qualifier(kind)?;
+                if qualifiers.iter().any(|seen| seen == &qualifier) {
+                    return Err(DbError::invalid(format!(
+                        "duplicate wildcard qualifier '{qualifier}'"
+                    )));
+                }
+                qualifiers.push(qualifier);
+            }
+            SqlSelectItem::Wildcard(_) => {
+                return Err(DbError::unsupported(
+                    "mixing * with other select items is not supported",
+                ));
+            }
+            _ => {
+                return Err(DbError::unsupported(
+                    "mixing * with other select items is not supported",
+                ));
+            }
+        }
+    }
+    Ok(Projection::QualifiedStars { qualifiers })
 }
 
 fn reject_wildcard_options(
