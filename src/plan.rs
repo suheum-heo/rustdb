@@ -177,8 +177,9 @@ pub(crate) fn choose(table: &str, selection: Option<&Expr>, indexes: &[IndexChoi
 
 /// How an `INNER JOIN` finds candidate pairs.
 ///
-/// [`JoinAccess::IndexNestedLoop`] still evaluates the original `ON`. `residual`
-/// is that text when `ON` is wider than the equality used for the probe.
+/// [`JoinAccess::IndexNestedLoop`] and [`JoinAccess::HashJoin`] still evaluate
+/// the original `ON`. `residual` is that text when `ON` is wider than the
+/// equality used to find candidates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JoinAccess {
     /// Compare every outer row with every inner row.
@@ -196,16 +197,34 @@ pub(crate) enum JoinAccess {
         /// Original `ON` text when it is not exactly `predicate`.
         residual: Option<String>,
     },
+    /// Probe an in-memory hash table built from one equality.
+    ///
+    /// The executor builds the smaller input. Equal sizes build the inner
+    /// table, so matches can be emitted in outer insertion order.
+    HashJoin {
+        /// Schema position of the outer join key.
+        outer_ordinal: usize,
+        /// Schema position of the inner join key.
+        inner_ordinal: usize,
+        /// The equality that supplies the hash key.
+        predicate: String,
+        /// Original `ON` text when it is not exactly `predicate`.
+        residual: Option<String>,
+    },
 }
 
-/// Pick a join path. There is no cost comparison.
+/// Pick a join path from the shape of `ON`. Row counts are applied later.
 ///
-/// An equality wins only when one side is an outer integer column and the
-/// other is an inner column that has an index. Reversed operands are the same
-/// equality. `AND` may hide that equality among other predicates. The earliest
-/// matching index in `indexes` wins, and `indexes` is catalog order. `OR`
-/// anywhere, a missing index, a non-equality, or a comparison that is not
-/// between those two sides stays a nested loop.
+/// An indexed integer equality is the first candidate when one side is an
+/// outer integer column and the other is an inner column that has an index.
+/// Reversed operands are the same equality. `AND` may hide that equality
+/// among other predicates. The earliest matching index in `indexes` wins, and
+/// `indexes` is catalog order. Otherwise a column-to-column equality of the
+/// same scalar type is a hash join, using the first such atom in `AND` order.
+/// `OR` anywhere, a non-equality, or a comparison that is not between the two
+/// sides stays a nested loop. The executor keeps the index only when the inner
+/// table is empty-probed or much larger than the outer table. Every other
+/// indexed equality becomes a hash join on the same columns.
 pub(crate) fn choose_join(
     outer_alias: &str,
     outer_columns: &[(String, DataType)],
@@ -214,11 +233,45 @@ pub(crate) fn choose_join(
     on: &Expr,
     indexes: &[IndexChoice],
 ) -> JoinAccess {
-    if indexes.is_empty() || contains_or(on) {
+    if contains_or(on) {
         return JoinAccess::NestedLoop;
     }
     let mut atoms = Vec::new();
     flatten_and(on, &mut atoms);
+    if let Some(path) = index_join(
+        outer_alias,
+        outer_columns,
+        inner_alias,
+        inner_columns,
+        on,
+        indexes,
+        &atoms,
+    ) {
+        return path;
+    }
+    for atom in atoms {
+        let Some((outer_ordinal, inner_ordinal)) =
+            hash_ordinals(atom, outer_alias, outer_columns, inner_alias, inner_columns)
+        else {
+            continue;
+        };
+        return hash_join(on, atom, outer_ordinal, inner_ordinal);
+    }
+    JoinAccess::NestedLoop
+}
+
+fn index_join(
+    outer_alias: &str,
+    outer_columns: &[(String, DataType)],
+    inner_alias: &str,
+    inner_columns: &[(String, DataType)],
+    on: &Expr,
+    indexes: &[IndexChoice],
+    atoms: &[&Expr],
+) -> Option<JoinAccess> {
+    if indexes.is_empty() {
+        return None;
+    }
     let mut probes = Vec::new();
     for atom in atoms {
         let Some((outer_ordinal, inner_ordinal)) =
@@ -232,27 +285,35 @@ pub(crate) fn choose_join(
         else {
             continue;
         };
-        probes.push((index_pos, outer_ordinal, atom));
+        probes.push((index_pos, outer_ordinal, *atom));
     }
-    let Some((index_pos, outer_ordinal, atom)) =
-        probes.iter().min_by_key(|(index_pos, _, _)| *index_pos)
-    else {
-        return JoinAccess::NestedLoop;
-    };
+    let (index_pos, outer_ordinal, atom) =
+        probes.iter().min_by_key(|(index_pos, _, _)| *index_pos)?;
     let index = &indexes[*index_pos];
     let predicate = atom.render();
-    let residual = if predicate == on.render() {
-        None
-    } else {
-        Some(on.render())
-    };
-    JoinAccess::IndexNestedLoop {
+    let residual = residual(on, &predicate);
+    Some(JoinAccess::IndexNestedLoop {
         name: index.name.clone(),
         inner_ordinal: index.ordinal,
         outer_ordinal: *outer_ordinal,
         predicate,
         residual,
+    })
+}
+
+fn hash_join(on: &Expr, atom: &Expr, outer_ordinal: usize, inner_ordinal: usize) -> JoinAccess {
+    let predicate = atom.render();
+    JoinAccess::HashJoin {
+        outer_ordinal,
+        inner_ordinal,
+        predicate: predicate.clone(),
+        residual: residual(on, &predicate),
     }
+}
+
+fn residual(on: &Expr, predicate: &str) -> Option<String> {
+    let rendered = on.render();
+    (rendered != predicate).then_some(rendered)
 }
 
 fn equijoin_ordinals(
@@ -262,6 +323,43 @@ fn equijoin_ordinals(
     inner_alias: &str,
     inner_columns: &[(String, DataType)],
 ) -> Option<(usize, usize)> {
+    typed_equijoin(
+        expr,
+        outer_alias,
+        outer_columns,
+        inner_alias,
+        inner_columns,
+        true,
+    )
+    .map(|(outer, inner, _)| (outer, inner))
+}
+
+fn hash_ordinals(
+    expr: &Expr,
+    outer_alias: &str,
+    outer_columns: &[(String, DataType)],
+    inner_alias: &str,
+    inner_columns: &[(String, DataType)],
+) -> Option<(usize, usize)> {
+    typed_equijoin(
+        expr,
+        outer_alias,
+        outer_columns,
+        inner_alias,
+        inner_columns,
+        false,
+    )
+    .map(|(outer, inner, _)| (outer, inner))
+}
+
+fn typed_equijoin(
+    expr: &Expr,
+    outer_alias: &str,
+    outer_columns: &[(String, DataType)],
+    inner_alias: &str,
+    inner_columns: &[(String, DataType)],
+    integers_only: bool,
+) -> Option<(usize, usize, DataType)> {
     let Expr::Binary {
         left,
         op: BinOp::Eq,
@@ -270,17 +368,28 @@ fn equijoin_ordinals(
     else {
         return None;
     };
-    let left = column_side(left, outer_alias, outer_columns, inner_alias, inner_columns)?;
+    let left = column_side(
+        left,
+        outer_alias,
+        outer_columns,
+        inner_alias,
+        inner_columns,
+        integers_only,
+    )?;
     let right = column_side(
         right,
         outer_alias,
         outer_columns,
         inner_alias,
         inner_columns,
+        integers_only,
     )?;
-    match (left, right) {
+    if left.1 != right.1 {
+        return None;
+    }
+    match (left.0, right.0) {
         (ColumnSide::Outer(outer), ColumnSide::Inner(inner))
-        | (ColumnSide::Inner(inner), ColumnSide::Outer(outer)) => Some((outer, inner)),
+        | (ColumnSide::Inner(inner), ColumnSide::Outer(outer)) => Some((outer, inner, left.1)),
         (ColumnSide::Outer(_), ColumnSide::Outer(_))
         | (ColumnSide::Inner(_), ColumnSide::Inner(_)) => None,
     }
@@ -297,32 +406,35 @@ fn column_side(
     outer_columns: &[(String, DataType)],
     inner_alias: &str,
     inner_columns: &[(String, DataType)],
-) -> Option<ColumnSide> {
+    integers_only: bool,
+) -> Option<(ColumnSide, DataType)> {
     let Expr::Column { name, qualifier } = expr else {
         return None;
     };
+    let resolve = |columns: &[(String, DataType)]| -> Option<(usize, DataType)> {
+        let index = columns.iter().position(|(column, _)| column == name)?;
+        let data_type = columns[index].1;
+        if integers_only && data_type != DataType::Integer {
+            return None;
+        }
+        Some((index, data_type))
+    };
     if let Some(qualifier) = qualifier {
         if qualifier == outer_alias {
-            return integer_ordinal(outer_columns, name).map(ColumnSide::Outer);
+            let (ordinal, data_type) = resolve(outer_columns)?;
+            return Some((ColumnSide::Outer(ordinal), data_type));
         }
         if qualifier == inner_alias {
-            return integer_ordinal(inner_columns, name).map(ColumnSide::Inner);
+            let (ordinal, data_type) = resolve(inner_columns)?;
+            return Some((ColumnSide::Inner(ordinal), data_type));
         }
         return None;
     }
-    match (
-        integer_ordinal(outer_columns, name),
-        integer_ordinal(inner_columns, name),
-    ) {
-        (Some(outer), None) => Some(ColumnSide::Outer(outer)),
-        (None, Some(inner)) => Some(ColumnSide::Inner(inner)),
+    match (resolve(outer_columns), resolve(inner_columns)) {
+        (Some((outer, data_type)), None) => Some((ColumnSide::Outer(outer), data_type)),
+        (None, Some((inner, data_type))) => Some((ColumnSide::Inner(inner), data_type)),
         (Some(_), Some(_)) | (None, None) => None,
     }
-}
-
-fn integer_ordinal(columns: &[(String, DataType)], name: &str) -> Option<usize> {
-    let index = columns.iter().position(|(column, _)| column == name)?;
-    (columns[index].1 == DataType::Integer).then_some(index)
 }
 
 #[derive(Default)]
@@ -486,6 +598,10 @@ mod tests {
 
     fn integer(value: i64) -> Expr {
         Expr::Literal(Value::Integer(value))
+    }
+
+    fn boolean(value: bool) -> Expr {
+        Expr::Literal(Value::Boolean(value))
     }
 
     fn binary(left: Expr, op: BinOp, right: Expr) -> Expr {
@@ -711,7 +827,9 @@ mod tests {
                 assert_eq!(predicate, "users.id = orders.user_id");
                 assert_eq!(residual, None);
             }
-            JoinAccess::NestedLoop => panic!("expected an index nested loop"),
+            JoinAccess::NestedLoop | JoinAccess::HashJoin { .. } => {
+                panic!("expected an index nested loop")
+            }
         }
 
         let reversed = binary(
@@ -745,7 +863,9 @@ mod tests {
                     Some("users.id = orders.id AND users.id = orders.user_id")
                 );
             }
-            JoinAccess::NestedLoop => panic!("expected the earlier index"),
+            JoinAccess::NestedLoop | JoinAccess::HashJoin { .. } => {
+                panic!("expected the earlier index")
+            }
         }
     }
 
@@ -793,7 +913,22 @@ mod tests {
             BinOp::Eq,
             qualified("orders", "user_id"),
         );
-        assert!(matches!(join_path(&equality, &[]), JoinAccess::NestedLoop));
+        match join_path(&equality, &[]) {
+            JoinAccess::HashJoin {
+                outer_ordinal,
+                inner_ordinal,
+                predicate,
+                residual,
+            } => {
+                assert_eq!(outer_ordinal, 0);
+                assert_eq!(inner_ordinal, 1);
+                assert_eq!(predicate, "users.id = orders.user_id");
+                assert_eq!(residual, None);
+            }
+            JoinAccess::NestedLoop | JoinAccess::IndexNestedLoop { .. } => {
+                panic!("expected a hash join")
+            }
+        }
         let id_only = [IndexChoice {
             name: "idx_orders_id".to_string(),
             column: "id".to_string(),
@@ -801,7 +936,80 @@ mod tests {
         }];
         assert!(matches!(
             join_path(&equality, &id_only),
-            JoinAccess::NestedLoop
+            JoinAccess::HashJoin {
+                inner_ordinal: 1,
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn hash_join_accepts_each_scalar_equality_and_keeps_a_residual() {
+        let outer = vec![
+            ("id".to_string(), DataType::Integer),
+            ("name".to_string(), DataType::Text),
+            ("active".to_string(), DataType::Boolean),
+        ];
+        let inner = vec![
+            ("user_id".to_string(), DataType::Integer),
+            ("label".to_string(), DataType::Text),
+            ("paid".to_string(), DataType::Boolean),
+        ];
+        let text_eq = binary(
+            qualified("users", "name"),
+            BinOp::Eq,
+            qualified("orders", "label"),
+        );
+        match choose_join("users", &outer, "orders", &inner, &text_eq, &[]) {
+            JoinAccess::HashJoin {
+                outer_ordinal,
+                inner_ordinal,
+                ..
+            } => {
+                assert_eq!(outer_ordinal, 1);
+                assert_eq!(inner_ordinal, 1);
+            }
+            JoinAccess::NestedLoop | JoinAccess::IndexNestedLoop { .. } => {
+                panic!("expected a text hash join")
+            }
+        }
+        let flags = binary(
+            qualified("orders", "paid"),
+            BinOp::Eq,
+            qualified("users", "active"),
+        );
+        assert!(matches!(
+            choose_join("users", &outer, "orders", &inner, &flags, &[]),
+            JoinAccess::HashJoin {
+                outer_ordinal: 2,
+                inner_ordinal: 2,
+                ..
+            }
+        ));
+        let wider = binary(
+            binary(
+                qualified("users", "name"),
+                BinOp::Eq,
+                qualified("orders", "label"),
+            ),
+            BinOp::And,
+            binary(qualified("orders", "paid"), BinOp::Eq, boolean(true)),
+        );
+        match choose_join("users", &outer, "orders", &inner, &wider, &[]) {
+            JoinAccess::HashJoin {
+                predicate,
+                residual,
+                ..
+            } => {
+                assert_eq!(predicate, "users.name = orders.label");
+                assert_eq!(
+                    residual.as_deref(),
+                    Some("users.name = orders.label AND orders.paid = TRUE")
+                );
+            }
+            JoinAccess::NestedLoop | JoinAccess::IndexNestedLoop { .. } => {
+                panic!("expected a residual hash join")
+            }
+        }
     }
 }

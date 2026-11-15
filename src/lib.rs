@@ -5,9 +5,12 @@
 //! page file and holds an exclusive lock on it. It does not lock rows.
 //! `CREATE INDEX` stores an integer B+ tree. `SELECT` uses that tree for an
 //! equality or a bounded range on one indexed integer column, then checks the
-//! original `WHERE`. An `INNER JOIN` of two tables probes an integer index on
-//! the inner table when `ON` has a matching equality, and otherwise walks both
-//! tables in insertion order. Other filters scan the in-memory table.
+//! original `WHERE`. An `INNER JOIN` probes an integer index on the inner
+//! table when `ON` has a matching equality and the inner table is empty-probed
+//! or more than 64 times the outer table. Every other equality of two scalar
+//! columns builds an in-memory hash table on the smaller input.
+//! Other joins walk both tables in insertion order. Other filters scan the
+//! in-memory table.
 //!
 //! # Example
 //!

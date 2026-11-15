@@ -118,7 +118,7 @@ fn indexed_equality_matches_the_nested_loop_and_keeps_order() {
             "access".to_string(),
             "outer".to_string(),
             "inner".to_string(),
-            "index".to_string(),
+            "build".to_string(),
             "predicate".to_string(),
             "residual".to_string(),
             "filter".to_string(),
@@ -127,10 +127,10 @@ fn indexed_equality_matches_the_nested_loop_and_keeps_order() {
     assert_eq!(
         explained.rows,
         vec![vec![
-            text("IndexNestedLoopJoin"),
+            text("HashJoin"),
             text("users"),
             text("orders"),
-            text("idx_orders_user"),
+            text("users"),
             text("users.id = orders.user_id"),
             Value::Null,
             Value::Null,
@@ -155,8 +155,8 @@ fn reversed_equality_uses_the_same_index() {
         migrate_and_index(&path, &["CREATE INDEX idx_orders_user ON orders(user_id);"]);
     assert_eq!(rows(&mut database, sql), nested);
     let explained = query(&mut database, &format!("EXPLAIN {sql}"));
-    assert_eq!(explained.rows[0][0], text("IndexNestedLoopJoin"));
-    assert_eq!(explained.rows[0][3], text("idx_orders_user"));
+    assert_eq!(explained.rows[0][0], text("HashJoin"));
+    assert_eq!(explained.rows[0][3], text("users"));
     assert_eq!(explained.rows[0][4], text("orders.user_id = users.id"));
     assert_eq!(explained.rows[0][5], Value::Null);
 }
@@ -215,7 +215,7 @@ fn and_keeps_a_residual_predicate() {
     );
     assert_eq!(rows(&mut database, sql), nested);
     let explained = query(&mut database, &format!("EXPLAIN {sql}"));
-    assert_eq!(explained.rows[0][0], text("IndexNestedLoopJoin"));
+    assert_eq!(explained.rows[0][0], text("HashJoin"));
     assert_eq!(explained.rows[0][4], text("users.id = orders.user_id"));
     assert_eq!(
         explained.rows[0][5],
@@ -248,7 +248,7 @@ fn or_and_a_missing_index_stay_nested_loops() {
         &mut database,
         "EXPLAIN SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;",
     );
-    assert_eq!(explained.rows[0][0], text("NestedLoopJoin"));
+    assert_eq!(explained.rows[0][0], text("HashJoin"));
     assert_eq!(rows(&mut database, or_sql), nested);
     let or_plan = query(&mut database, &format!("EXPLAIN {or_sql}"));
     assert_eq!(or_plan.rows[0][0], text("NestedLoopJoin"));
@@ -274,14 +274,15 @@ fn several_indexes_prefer_catalog_order() {
         &mut database,
         "EXPLAIN SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;",
     );
-    assert_eq!(user.rows[0][3], text("idx_orders_user"));
+    assert_eq!(user.rows[0][0], text("HashJoin"));
+    assert_eq!(user.rows[0][4], text("users.id = orders.user_id"));
     let both = "SELECT users.name, orders.id
         FROM users JOIN orders
         ON users.id = orders.id AND users.id = orders.user_id;";
     assert!(rows(&mut database, both).is_empty());
     let explained = query(&mut database, &format!("EXPLAIN {both}"));
-    assert_eq!(explained.rows[0][0], text("IndexNestedLoopJoin"));
-    assert_eq!(explained.rows[0][3], text("idx_orders_id"));
+    assert_eq!(explained.rows[0][0], text("HashJoin"));
+    assert_eq!(explained.rows[0][4], text("users.id = orders.id"));
     assert_eq!(
         explained.rows[0][5],
         text("users.id = orders.id AND users.id = orders.user_id")
@@ -315,7 +316,8 @@ fn aliases_and_a_self_join_use_the_inner_index() {
     let explained = query(&mut database, &format!("EXPLAIN {aliased}"));
     assert_eq!(explained.rows[0][1], text("u (users)"));
     assert_eq!(explained.rows[0][2], text("o (orders)"));
-    assert_eq!(explained.rows[0][3], text("idx_orders_user"));
+    assert_eq!(explained.rows[0][0], text("HashJoin"));
+    assert_eq!(explained.rows[0][3], text("u (users)"));
     assert_eq!(explained.rows[0][4], text("u.id = o.user_id"));
     let hidden = failure(
         &mut database,
@@ -341,8 +343,8 @@ fn aliases_and_a_self_join_use_the_inner_index() {
         ]
     );
     let self_plan = query(&mut database, &format!("EXPLAIN {self_sql}"));
-    assert_eq!(self_plan.rows[0][0], text("IndexNestedLoopJoin"));
-    assert_eq!(self_plan.rows[0][3], text("idx_users_id"));
+    assert_eq!(self_plan.rows[0][0], text("HashJoin"));
+    assert_eq!(self_plan.rows[0][3], text("b (users)"));
     let single = query(
         &mut database,
         "EXPLAIN SELECT name FROM users WHERE id = 1;",
@@ -456,8 +458,8 @@ fn restart_keeps_the_indexed_join() {
         &mut database,
         "EXPLAIN SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;",
     );
-    assert_eq!(explained.rows[0][0], text("IndexNestedLoopJoin"));
-    assert_eq!(explained.rows[0][3], text("idx_orders_user"));
+    assert_eq!(explained.rows[0][0], text("HashJoin"));
+    assert_eq!(explained.rows[0][3], text("users"));
 }
 
 #[test]
@@ -544,7 +546,7 @@ fn explain_does_not_run_the_join_or_write() {
         &mut database,
         "EXPLAIN SELECT u.name FROM users AS u JOIN orders o ON u.id = o.user_id WHERE o.total > 15;",
     );
-    assert_eq!(explained.rows[0][0], text("IndexNestedLoopJoin"));
+    assert_eq!(explained.rows[0][0], text("HashJoin"));
     assert_eq!(explained.rows[0][6], text("o.total > 15"));
     assert_eq!(rows(&mut database, "SELECT name FROM users;"), before_rows);
     let ambiguous = failure(
@@ -641,7 +643,7 @@ fn indexed_joins_match_a_reference_model() {
     assert_eq!(rows(&mut database, either_sql), either);
     assert_eq!(
         query(&mut database, &format!("EXPLAIN {equality_sql}")).rows[0][0],
-        text("IndexNestedLoopJoin")
+        text("HashJoin")
     );
     assert_eq!(
         query(&mut database, &format!("EXPLAIN {either_sql}")).rows[0][0],
@@ -761,7 +763,7 @@ fn multi_row_changes_and_reopen_match_a_reference() {
     assert_eq!(rows(&mut database, sql), expected);
     assert_eq!(
         query(&mut database, &format!("EXPLAIN {sql}")).rows[0][0],
-        text("IndexNestedLoopJoin")
+        text("HashJoin")
     );
 }
 
@@ -841,7 +843,7 @@ fn measure_shape(
     assert_eq!(nested.sum, indexed.sum);
     assert!(indexed.matches as i64 >= expected_floor.min(rows));
     let explained = query(&mut database, &format!("EXPLAIN {sql}"));
-    assert_eq!(explained.rows[0][0], text("IndexNestedLoopJoin"));
+    assert_eq!(explained.rows[0][0], text("HashJoin"));
     let pairs = rows as u128 * rows as u128;
     let speedup = if indexed.warm_us == 0 {
         0.0

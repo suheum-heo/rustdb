@@ -534,8 +534,8 @@ fn restart_keeps_the_join_rows_and_uses_the_inner_index() {
             JOIN orders
             ON users.id = orders.user_id;",
     );
-    assert_eq!(explained.rows[0][0], text("IndexNestedLoopJoin"));
-    assert_eq!(explained.rows[0][3], text("idx_orders_user"));
+    assert_eq!(explained.rows[0][0], text("HashJoin"));
+    assert_eq!(explained.rows[0][3], text("users"));
     let single = query(
         &mut database,
         "EXPLAIN SELECT name FROM users WHERE id = 1;",
@@ -610,17 +610,21 @@ fn explain_names_the_nested_loop() {
             "access".to_string(),
             "outer".to_string(),
             "inner".to_string(),
-            "condition".to_string(),
+            "build".to_string(),
+            "predicate".to_string(),
+            "residual".to_string(),
             "filter".to_string(),
         ]
     );
     assert_eq!(
         explained.rows,
         vec![vec![
-            text("NestedLoopJoin"),
+            text("HashJoin"),
             text("users"),
             text("orders"),
+            text("users"),
             text("users.id = orders.user_id"),
+            Value::Null,
             Value::Null,
         ]]
     );
@@ -636,13 +640,30 @@ fn explain_names_the_nested_loop() {
     assert_eq!(
         filtered.rows,
         vec![vec![
-            text("NestedLoopJoin"),
+            text("HashJoin"),
             text("u (users)"),
             text("o (orders)"),
+            text("u (users)"),
             text("u.id = o.user_id"),
+            Value::Null,
             text("o.total > 15"),
         ]]
     );
+    let nested = query(
+        &mut database,
+        "EXPLAIN SELECT users.name FROM users JOIN orders ON users.id IS NULL;",
+    );
+    assert_eq!(
+        nested.columns,
+        vec![
+            "access".to_string(),
+            "outer".to_string(),
+            "inner".to_string(),
+            "condition".to_string(),
+            "filter".to_string(),
+        ]
+    );
+    assert_eq!(nested.rows[0][0], text("NestedLoopJoin"));
     let error = failure(
         &mut database,
         "EXPLAIN SELECT name FROM users JOIN orders ON users.id = orders.total AND orders.paid = 'no';",
@@ -1033,10 +1054,12 @@ fn explain_binds_without_running_or_writing() {
     assert_eq!(
         explained.rows,
         vec![vec![
-            text("NestedLoopJoin"),
+            text("HashJoin"),
             text("u (users)"),
             text("o (orders)"),
+            text("o (orders)"),
             text("u.id = o.user_id"),
+            Value::Null,
             text("o.total > 15"),
         ]]
     );

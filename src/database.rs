@@ -591,6 +591,7 @@ mod tests {
             .table_mut("orders")
             .unwrap()
             .forget_position_for_test(1);
+        let _force = crate::executor::ForceIndexJoin::new();
         let error = database
             .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
             .unwrap_err();
@@ -605,6 +606,7 @@ mod tests {
             .table_mut("orders")
             .unwrap()
             .move_position_for_test(1, 2);
+        let _force = crate::executor::ForceIndexJoin::new();
         let error = database
             .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
             .unwrap_err();
@@ -619,6 +621,7 @@ mod tests {
             .table_mut("orders")
             .unwrap()
             .overwrite_cell_for_test(0, 1, Value::Integer(99));
+        let _force = crate::executor::ForceIndexJoin::new();
         let error = database
             .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
             .unwrap_err();
@@ -632,6 +635,7 @@ mod tests {
         database
             .patch_root_leaf_entry("idx_orders_user", 2, Some(1), Some(1))
             .unwrap();
+        let _force = crate::executor::ForceIndexJoin::new();
         let error = database
             .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
             .unwrap_err();
@@ -643,6 +647,7 @@ mod tests {
     fn a_join_probe_rejects_a_corrupt_index_page() {
         let (dir, mut database) = joined_index("bad-page");
         database.corrupt_index_root_type("idx_orders_user").unwrap();
+        let _force = crate::executor::ForceIndexJoin::new();
         let error = database
             .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
             .unwrap_err();
@@ -656,6 +661,7 @@ mod tests {
         database
             .patch_root_leaf_entry("idx_orders_user", 0, Some(30), None)
             .unwrap();
+        let _force = crate::executor::ForceIndexJoin::new();
         let error = database
             .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
             .unwrap_err();
