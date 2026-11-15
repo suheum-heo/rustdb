@@ -6,10 +6,12 @@
 //! a column reference keeps the column's declared type even when the stored
 //! value is null.
 
+use std::fmt;
+
 use crate::ast::{AggregateCall, BinOp, Expr, SelectColumn};
 use crate::error::DbError;
 use crate::table::Table;
-use crate::value::{DataType, Value};
+use crate::value::{self, DataType, Value};
 
 /// One input of a statement, in the order its columns occupy in a joined row.
 struct Relation {
@@ -174,13 +176,50 @@ fn column_list(table: &Table) -> Vec<(String, DataType)> {
         .collect()
 }
 
+/// A type used while binding an expression.
+///
+/// [`DataType`] is what a table can store. [`ScalarType::Ratio`] exists only
+/// for an `AVG` result. It is never a column type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScalarType {
+    /// Signed 64-bit integer.
+    Integer,
+    /// Text.
+    Text,
+    /// Boolean.
+    Boolean,
+    /// Exact ratio produced by `AVG`.
+    Ratio,
+}
+
+impl From<DataType> for ScalarType {
+    fn from(data_type: DataType) -> Self {
+        match data_type {
+            DataType::Integer => Self::Integer,
+            DataType::Text => Self::Text,
+            DataType::Boolean => Self::Boolean,
+        }
+    }
+}
+
+impl fmt::Display for ScalarType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Integer => "INTEGER",
+            Self::Text => "TEXT",
+            Self::Boolean => "BOOLEAN",
+            Self::Ratio => "RATIO",
+        })
+    }
+}
+
 /// The type of a bound expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExprType {
     /// An untyped `NULL` literal.
     Null,
-    /// A column or a non-null literal.
-    Value(DataType),
+    /// A column, a non-null literal, or an aggregate result.
+    Value(ScalarType),
 }
 
 /// An expression whose columns are schema indexes.
@@ -204,8 +243,8 @@ pub(crate) enum BoundExpr {
 /// when the context is not `WHERE`.
 pub(crate) fn bind_filter(expr: &Expr, scope: &Scope, clause: &str) -> Result<BoundExpr, DbError> {
     let bound = bind(expr, scope)?;
-    match expr_type(&bound, &scope.types)? {
-        ExprType::Null | ExprType::Value(DataType::Boolean) => Ok(bound),
+    match expr_type(&bound, TypeList::Schema(&scope.types))? {
+        ExprType::Null | ExprType::Value(ScalarType::Boolean) => Ok(bound),
         ExprType::Value(found) => Err(DbError::TypeError(format!(
             "{clause} clause must evaluate to BOOLEAN, got {found}"
         ))),
@@ -220,17 +259,19 @@ pub(crate) fn bind_where(expr: &Expr, scope: &Scope) -> Result<BoundExpr, DbErro
 /// Bind `HAVING` against one completed group.
 ///
 /// `column` returns the group's slot and the column's declared type.
-/// `aggregate` returns the slot of a shared accumulator. That slot's type is
-/// `INTEGER`. The clause must be boolean, or an untyped null literal.
+/// `aggregate` returns the slot of a shared accumulator and that slot's
+/// result type. `COUNT` and `SUM` are integers. `AVG` is a ratio. `MIN` and
+/// `MAX` keep the argument type. The clause must be boolean, or an untyped
+/// null literal.
 pub(crate) fn bind_having(
     expr: &Expr,
     mut column: impl FnMut(&SelectColumn) -> Result<(usize, DataType), DbError>,
-    mut aggregate: impl FnMut(&AggregateCall) -> Result<usize, DbError>,
+    mut aggregate: impl FnMut(&AggregateCall) -> Result<(usize, ScalarType), DbError>,
 ) -> Result<BoundExpr, DbError> {
     let mut types = Vec::new();
     let bound = bind_having_expr(expr, &mut column, &mut aggregate, &mut types)?;
-    match expr_type(&bound, &types)? {
-        ExprType::Null | ExprType::Value(DataType::Boolean) => Ok(bound),
+    match expr_type(&bound, TypeList::Scalar(&types))? {
+        ExprType::Null | ExprType::Value(ScalarType::Boolean) => Ok(bound),
         ExprType::Value(found) => Err(DbError::TypeError(format!(
             "HAVING clause must evaluate to BOOLEAN, got {found}"
         ))),
@@ -238,13 +279,13 @@ pub(crate) fn bind_having(
 }
 
 type GroupColumnFn<'a> = dyn FnMut(&SelectColumn) -> Result<(usize, DataType), DbError> + 'a;
-type GroupAggregateFn<'a> = dyn FnMut(&AggregateCall) -> Result<usize, DbError> + 'a;
+type GroupAggregateFn<'a> = dyn FnMut(&AggregateCall) -> Result<(usize, ScalarType), DbError> + 'a;
 
 fn bind_having_expr(
     expr: &Expr,
     column: &mut GroupColumnFn<'_>,
     aggregate: &mut GroupAggregateFn<'_>,
-    types: &mut Vec<DataType>,
+    types: &mut Vec<ScalarType>,
 ) -> Result<BoundExpr, DbError> {
     match expr {
         Expr::Literal(value) => Ok(BoundExpr::Literal(value.clone())),
@@ -253,17 +294,17 @@ fn bind_having_expr(
                 name: name.clone(),
                 qualifier: qualifier.clone(),
             })?;
-            note_type(types, index, data_type);
+            note_type(types, index, ScalarType::from(data_type));
             Ok(BoundExpr::Column(index))
         }
         Expr::Aggregate(call) => {
-            let index = aggregate(call)?;
-            note_type(types, index, DataType::Integer);
+            let (index, scalar) = aggregate(call)?;
+            note_type(types, index, scalar);
             Ok(BoundExpr::Column(index))
         }
         Expr::Not(inner) => {
             let inner = bind_having_expr(inner, column, aggregate, types)?;
-            expect_boolean("NOT", expr_type(&inner, types)?)?;
+            expect_boolean("NOT", expr_type(&inner, TypeList::Scalar(types))?)?;
             Ok(BoundExpr::Not(Box::new(inner)))
         }
         Expr::IsNull(inner) => Ok(BoundExpr::IsNull(Box::new(bind_having_expr(
@@ -275,7 +316,7 @@ fn bind_having_expr(
         Expr::Binary { left, op, right } => {
             let left = bind_having_expr(left, column, aggregate, types)?;
             let right = bind_having_expr(right, column, aggregate, types)?;
-            check_binary(*op, &left, &right, types)?;
+            check_binary(*op, &left, &right, TypeList::Scalar(types))?;
             Ok(BoundExpr::Binary {
                 left: Box::new(left),
                 op: *op,
@@ -285,9 +326,9 @@ fn bind_having_expr(
     }
 }
 
-fn note_type(types: &mut Vec<DataType>, index: usize, data_type: DataType) {
+fn note_type(types: &mut Vec<ScalarType>, index: usize, data_type: ScalarType) {
     if types.len() <= index {
-        types.resize(index + 1, DataType::Integer);
+        types.resize(index + 1, ScalarType::Integer);
     }
     types[index] = data_type;
 }
@@ -300,14 +341,26 @@ pub(crate) fn bind_assignment(
     expected: DataType,
 ) -> Result<BoundExpr, DbError> {
     let bound = bind(expr, scope)?;
-    match expr_type(&bound, &scope.types)? {
+    match expr_type(&bound, TypeList::Schema(&scope.types))? {
         ExprType::Null => Ok(bound),
-        ExprType::Value(actual) if actual == expected => Ok(bound),
+        ExprType::Value(ScalarType::Ratio) => {
+            Err(DbError::Internal("ratio values are not stored".to_string()))
+        }
+        ExprType::Value(actual) if scalar_data_type(actual) == Some(expected) => Ok(bound),
         ExprType::Value(actual) => Err(DbError::TypeMismatch {
             column: column.to_string(),
             expected,
-            actual,
+            actual: scalar_data_type(actual).unwrap_or(DataType::Integer),
         }),
+    }
+}
+
+fn scalar_data_type(scalar: ScalarType) -> Option<DataType> {
+    match scalar {
+        ScalarType::Integer => Some(DataType::Integer),
+        ScalarType::Text => Some(DataType::Text),
+        ScalarType::Boolean => Some(DataType::Boolean),
+        ScalarType::Ratio => None,
     }
 }
 
@@ -403,7 +456,7 @@ fn bind(expr: &Expr, scope: &Scope) -> Result<BoundExpr, DbError> {
         }
         Expr::Not(inner) => {
             let inner = bind(inner, scope)?;
-            expect_boolean("NOT", expr_type(&inner, &scope.types)?)?;
+            expect_boolean("NOT", expr_type(&inner, TypeList::Schema(&scope.types))?)?;
             Ok(BoundExpr::Not(Box::new(inner)))
         }
         Expr::IsNull(inner) => Ok(BoundExpr::IsNull(Box::new(bind(inner, scope)?))),
@@ -411,7 +464,7 @@ fn bind(expr: &Expr, scope: &Scope) -> Result<BoundExpr, DbError> {
         Expr::Binary { left, op, right } => {
             let left = bind(left, scope)?;
             let right = bind(right, scope)?;
-            check_binary(*op, &left, &right, &scope.types)?;
+            check_binary(*op, &left, &right, TypeList::Schema(&scope.types))?;
             Ok(BoundExpr::Binary {
                 left: Box::new(left),
                 op: *op,
@@ -424,11 +477,17 @@ fn bind(expr: &Expr, scope: &Scope) -> Result<BoundExpr, DbError> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TypeList<'a> {
+    Schema(&'a [DataType]),
+    Scalar(&'a [ScalarType]),
+}
+
 fn check_binary(
     op: BinOp,
     left: &BoundExpr,
     right: &BoundExpr,
-    types: &[DataType],
+    types: TypeList<'_>,
 ) -> Result<(), DbError> {
     let left_type = expr_type(left, types)?;
     let right_type = expr_type(right, types)?;
@@ -443,6 +502,10 @@ fn check_binary(
         (ExprType::Null, ExprType::Value(data_type))
         | (ExprType::Value(data_type), ExprType::Null) => Some(data_type),
         (ExprType::Value(left), ExprType::Value(right)) if left == right => Some(left),
+        (ExprType::Value(ScalarType::Integer), ExprType::Value(ScalarType::Ratio))
+        | (ExprType::Value(ScalarType::Ratio), ExprType::Value(ScalarType::Integer)) => {
+            Some(ScalarType::Ratio)
+        }
         (ExprType::Value(left), ExprType::Value(right)) => {
             return Err(DbError::TypeError(format!(
                 "cannot apply operator '{}' to {left} and {right}",
@@ -450,7 +513,7 @@ fn check_binary(
             )));
         }
     };
-    if op.is_ordering() && matches!(resolved, Some(DataType::Boolean)) {
+    if op.is_ordering() && matches!(resolved, Some(ScalarType::Boolean)) {
         return Err(DbError::TypeError(format!(
             "operator '{}' is not supported for BOOLEAN",
             op.as_str()
@@ -461,33 +524,41 @@ fn check_binary(
 
 fn expect_boolean(op: &str, found: ExprType) -> Result<(), DbError> {
     match found {
-        ExprType::Null | ExprType::Value(DataType::Boolean) => Ok(()),
+        ExprType::Null | ExprType::Value(ScalarType::Boolean) => Ok(()),
         ExprType::Value(found) => Err(DbError::TypeError(format!(
             "operator '{op}' requires BOOLEAN operands, got {found}"
         ))),
     }
 }
 
-fn expr_type(expr: &BoundExpr, types: &[DataType]) -> Result<ExprType, DbError> {
+fn expr_type(expr: &BoundExpr, types: TypeList<'_>) -> Result<ExprType, DbError> {
     match expr {
         BoundExpr::Literal(Value::Null) => Ok(ExprType::Null),
-        BoundExpr::Literal(value) => {
-            Ok(ExprType::Value(value.data_type().ok_or_else(|| {
-                DbError::Internal("non-null literal has no type".to_string())
-            })?))
-        }
+        BoundExpr::Literal(Value::Ratio { .. }) => Ok(ExprType::Value(ScalarType::Ratio)),
+        BoundExpr::Literal(value) => Ok(ExprType::Value(ScalarType::from(
+            value
+                .data_type()
+                .ok_or_else(|| DbError::Internal("non-null literal has no type".to_string()))?,
+        ))),
         BoundExpr::Column(index) => {
-            let Some(data_type) = types.get(*index) else {
+            let Some(data_type) = lookup_type(types, *index) else {
                 return Err(DbError::Internal(format!(
                     "bound column index {index} is outside the schema"
                 )));
             };
-            Ok(ExprType::Value(*data_type))
+            Ok(ExprType::Value(data_type))
         }
         BoundExpr::Not(_)
         | BoundExpr::IsNull(_)
         | BoundExpr::IsNotNull(_)
-        | BoundExpr::Binary { .. } => Ok(ExprType::Value(DataType::Boolean)),
+        | BoundExpr::Binary { .. } => Ok(ExprType::Value(ScalarType::Boolean)),
+    }
+}
+
+fn lookup_type(types: TypeList<'_>, index: usize) -> Option<ScalarType> {
+    match types {
+        TypeList::Schema(types) => types.get(index).copied().map(ScalarType::from),
+        TypeList::Scalar(types) => types.get(index).copied(),
     }
 }
 
@@ -497,11 +568,18 @@ fn eval_not(value: Value) -> Result<Value, DbError> {
         Value::Boolean(value) => Ok(Value::Boolean(!value)),
         other => Err(DbError::Internal(format!(
             "NOT evaluated a {} value",
-            other
-                .data_type()
-                .map(|data_type| data_type.to_string())
-                .unwrap_or_else(|| "NULL".to_string())
+            scalar_name(&other)
         ))),
+    }
+}
+
+fn scalar_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "NULL",
+        Value::Integer(_) => "INTEGER",
+        Value::Text(_) => "TEXT",
+        Value::Boolean(_) => "BOOLEAN",
+        Value::Ratio { .. } => "RATIO",
     }
 }
 
@@ -522,15 +600,10 @@ fn eval_binary(op: BinOp, left: &Value, right: &Value) -> Result<Value, DbError>
         return Ok(Value::Null);
     }
 
-    let ordering = match (left, right) {
-        (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
-        (Value::Text(left), Value::Text(right)) => left.cmp(right),
-        (Value::Boolean(left), Value::Boolean(right)) => left.cmp(right),
-        _ => {
-            return Err(DbError::Internal(
-                "comparison values have different types".to_string(),
-            ));
-        }
+    let Some(ordering) = value::cmp_scalar(left, right) else {
+        return Err(DbError::Internal(
+            "comparison values have different types".to_string(),
+        ));
     };
     if op.is_ordering() && matches!(left, Value::Boolean(_)) {
         return Err(DbError::TypeError(format!(
@@ -562,10 +635,7 @@ fn as_truth(value: &Value) -> Result<Option<bool>, DbError> {
         Value::Boolean(value) => Ok(Some(*value)),
         other => Err(DbError::Internal(format!(
             "boolean operator evaluated a non-boolean {}",
-            other
-                .data_type()
-                .map(|data_type| data_type.to_string())
-                .unwrap_or_else(|| "NULL".to_string())
+            scalar_name(other)
         ))),
     }
 }

@@ -108,6 +108,8 @@ A value is a tag byte followed by a payload:
 
 `NULL` is a real tag. It is not an empty string, a zero, or a missing column. The row links are the insertion order of the rows that are still present. A page id of 0 is the null link because page 0 is the meta page.
 
+`AVG` can return a reduced ratio in a query result. That ratio is not one of these tags. The encoder rejects it, and a file written by this milestone still uses tags 0–3 only.
+
 The physical `(page, slot)` of a row stays put when an update fits in the existing cell. An update that needs a larger cell, or an insert or delete that changes the chain, can move that one row. Other rows keep their page and slot. The `u64` row id does not change. Deleted ids are not reused. Index leaves store that row id, not a position in a `Vec`.
 
 ## Index pages

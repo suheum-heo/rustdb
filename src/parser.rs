@@ -722,14 +722,23 @@ fn convert_projection(items: &[SqlSelectItem]) -> Result<Projection, DbError> {
     let mut columns = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            SqlSelectItem::UnnamedExpr(expr) => columns.push(select_item(expr)?),
+            SqlSelectItem::UnnamedExpr(expr) => columns.push(select_item(expr, None)?),
             SqlSelectItem::Wildcard(_) | SqlSelectItem::QualifiedWildcard(_, _) => {
                 return Err(DbError::unsupported(
                     "mixing * with other select items is not supported",
                 ));
             }
-            SqlSelectItem::ExprWithAlias { .. } | SqlSelectItem::ExprWithAliases { .. } => {
-                return Err(DbError::unsupported("column aliases are not supported"));
+            SqlSelectItem::ExprWithAlias { expr, alias } => {
+                let alias = normalize_ident(alias);
+                if alias.is_empty() {
+                    return Err(DbError::invalid("column alias must not be empty"));
+                }
+                columns.push(select_item(expr, Some(alias))?);
+            }
+            SqlSelectItem::ExprWithAliases { .. } => {
+                return Err(DbError::unsupported(
+                    "multiple column aliases are not supported",
+                ));
             }
         }
     }
@@ -770,14 +779,15 @@ fn wildcard_qualifier(kind: &SelectItemQualifiedWildcardKind) -> Result<String, 
     Ok(qualifier)
 }
 
-fn select_item(expr: &SqlExpr) -> Result<SelectItem, DbError> {
+fn select_item(expr: &SqlExpr, alias: Option<String>) -> Result<SelectItem, DbError> {
     if let Some(call) = aggregate_call(expr)? {
-        return Ok(SelectItem::Aggregate(call));
+        return Ok(SelectItem::Aggregate { call, alias });
     }
     match convert_expr(expr)? {
-        Expr::Column { name, qualifier } => {
-            Ok(SelectItem::Column(SelectColumn { name, qualifier }))
-        }
+        Expr::Column { name, qualifier } => Ok(SelectItem::Column {
+            column: SelectColumn { name, qualifier },
+            alias,
+        }),
         _ => Err(DbError::unsupported("SELECT expressions are not supported")),
     }
 }
@@ -813,6 +823,9 @@ fn aggregate_call(expr: &SqlExpr) -> Result<Option<AggregateCall>, DbError> {
     let kind = match name.as_str() {
         "count" => AggregateFunction::Count,
         "sum" => AggregateFunction::Sum,
+        "avg" => AggregateFunction::Avg,
+        "min" => AggregateFunction::Min,
+        "max" => AggregateFunction::Max,
         _ => return Err(DbError::unsupported("function calls are not supported")),
     };
     reject_aggregate_options(function)?;
@@ -879,12 +892,13 @@ fn aggregate_argument(
         ));
     };
     match argument {
-        FunctionArgExpr::Wildcard => {
-            if kind == AggregateFunction::Sum {
-                return Err(DbError::unsupported("SUM requires an INTEGER column"));
-            }
-            Ok(AggregateArg::Star)
-        }
+        FunctionArgExpr::Wildcard => match kind {
+            AggregateFunction::Count => Ok(AggregateArg::Star),
+            AggregateFunction::Sum => Err(DbError::unsupported("SUM requires an INTEGER column")),
+            AggregateFunction::Avg => Err(DbError::unsupported("AVG requires an INTEGER column")),
+            AggregateFunction::Min => Err(DbError::unsupported("MIN requires a column")),
+            AggregateFunction::Max => Err(DbError::unsupported("MAX requires a column")),
+        },
         FunctionArgExpr::QualifiedWildcard(_) | FunctionArgExpr::WildcardWithOptions(_) => {
             Err(DbError::unsupported("aggregate arguments must be columns"))
         }
@@ -997,7 +1011,7 @@ fn convert_expr_in(expr: &SqlExpr, clause: Option<&str>) -> Result<Expr, DbError
         SqlExpr::In { .. } => Err(DbError::unsupported("IN is not supported")),
         SqlExpr::Function(function) => {
             let name = function_name(&function.name).unwrap_or_default();
-            if matches!(name.as_str(), "count" | "sum") {
+            if matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max") {
                 let place = clause.unwrap_or("this expression");
                 return Err(DbError::unsupported(format!(
                     "aggregates are not allowed in {place}"
@@ -1361,10 +1375,13 @@ mod tests {
                 );
                 assert_eq!(
                     &query.projection,
-                    &Projection::Columns(vec![SelectItem::Column(SelectColumn {
-                        name: "name".to_string(),
-                        qualifier: None,
-                    })])
+                    &Projection::Columns(vec![SelectItem::Column {
+                        column: SelectColumn {
+                            name: "name".to_string(),
+                            qualifier: None,
+                        },
+                        alias: None,
+                    }])
                 );
                 assert!(query.selection.is_some());
             }
@@ -1440,14 +1457,20 @@ mod tests {
                 assert_eq!(
                     &query.projection,
                     &Projection::Columns(vec![
-                        SelectItem::Column(SelectColumn {
-                            name: "name".to_string(),
-                            qualifier: Some("u".to_string()),
-                        }),
-                        SelectItem::Column(SelectColumn {
-                            name: "total".to_string(),
-                            qualifier: Some("o".to_string()),
-                        }),
+                        SelectItem::Column {
+                            column: SelectColumn {
+                                name: "name".to_string(),
+                                qualifier: Some("u".to_string()),
+                            },
+                            alias: None,
+                        },
+                        SelectItem::Column {
+                            column: SelectColumn {
+                                name: "total".to_string(),
+                                qualifier: Some("o".to_string()),
+                            },
+                            alias: None,
+                        },
                     ])
                 );
             }

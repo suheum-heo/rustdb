@@ -191,12 +191,13 @@ fn definition_too_big() -> DbError {
 }
 
 fn encoded_value_len(value: &Value) -> Result<usize, DbError> {
-    Ok(match value {
-        Value::Null => 1,
-        Value::Integer(_) => 9,
-        Value::Boolean(_) => 2,
-        Value::Text(text) => 1 + 4 + text_len(text)?,
-    })
+    match value {
+        Value::Null => Ok(1),
+        Value::Integer(_) => Ok(9),
+        Value::Boolean(_) => Ok(2),
+        Value::Text(text) => Ok(1 + 4 + text_len(text)?),
+        Value::Ratio { .. } => Err(DbError::Internal("ratio values are not stored".to_string())),
+    }
 }
 
 fn encode_value(bytes: &mut Vec<u8>, value: &Value) -> Result<(), DbError> {
@@ -215,6 +216,9 @@ fn encode_value(bytes: &mut Vec<u8>, value: &Value) -> Result<(), DbError> {
         Value::Boolean(value) => {
             bytes.push(TAG_BOOLEAN);
             bytes.push(u8::from(*value));
+        }
+        Value::Ratio { .. } => {
+            return Err(DbError::Internal("ratio values are not stored".to_string()));
         }
     }
     Ok(())
@@ -498,5 +502,24 @@ mod tests {
         assert_eq!(entry.head, Link { page: 3, slot: 1 });
         assert_eq!(entry.name, "Users");
         assert_eq!(entry.columns, columns);
+    }
+
+    #[test]
+    fn a_ratio_is_not_a_record_tag() {
+        let error = encode_record(&StoredRecord {
+            row_id: 1,
+            prev: NULL_LINK,
+            next: NULL_LINK,
+            values: vec![Value::ratio(1, 3)],
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "internal error: ratio values are not stored"
+        );
+        assert_eq!(TAG_NULL, 0);
+        assert_eq!(TAG_INTEGER, 1);
+        assert_eq!(TAG_TEXT, 2);
+        assert_eq!(TAG_BOOLEAN, 3);
     }
 }

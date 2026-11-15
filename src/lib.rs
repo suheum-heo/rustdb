@@ -10,8 +10,10 @@
 //! or more than 64 times the outer table. Every other equality of two scalar
 //! columns builds an in-memory hash table on the smaller input.
 //! Other joins walk both tables in insertion order. A `SELECT` can `GROUP BY`
-//! columns of one table or of one `INNER JOIN` and compute `COUNT` and `SUM`.
-//! `HAVING` keeps a group only when it is TRUE. Other filters scan the
+//! columns of one table or of one `INNER JOIN` and compute `COUNT`, `SUM`,
+//! `AVG`, `MIN`, and `MAX`. `AVG` is an exact ratio and is not stored.
+//! `HAVING` keeps a group only when it is TRUE. A select-list alias is an
+//! output name and an `ORDER BY` name. Other filters scan the
 //! in-memory table.
 //!
 //! # Example

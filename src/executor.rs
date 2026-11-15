@@ -61,7 +61,7 @@ use crate::parser;
 use crate::plan::{self, AccessPath, JoinAccess};
 use crate::storage::IndexImage;
 use crate::table::Table;
-use crate::value::{DataType, Value};
+use crate::value::{self, DataType, Value};
 
 /// The outcome of one statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -844,15 +844,14 @@ impl Database {
         let indexes = self.index_images().to_vec();
         let table = self.table(&source.name)?;
         let scope = Scope::from_table(table, &source.alias);
-        let output_indexes = output_columns(&scope, projection)?;
-        let output_names = column_names(&scope, &output_indexes)?;
+        let outputs = output_columns(&scope, projection)?;
         let filter = bind_optional_where(selection, &scope)?;
-        let sort_keys = bind_order(&scope, order_by)?;
+        let sort_keys = bind_order(&scope, order_by, &outputs)?;
         let choices = index_choices(table, &indexes)?;
         let path = plan::choose(&source.alias, selection, &choices);
         Ok(PreparedSelect {
-            output_indexes,
-            output_names,
+            output_indexes: outputs.indexes,
+            output_names: outputs.names,
             filter,
             sort_keys,
             path,
@@ -878,9 +877,8 @@ impl Database {
         )?;
         let bound_on = expr::bind_filter(on, &scope, "ON")?;
         let filter = bind_optional_where(selection, &scope)?;
-        let sort_keys = bind_order(&scope, order_by)?;
-        let output_indexes = output_columns(&scope, projection)?;
-        let output_names = column_names(&scope, &output_indexes)?;
+        let outputs = output_columns(&scope, projection)?;
+        let sort_keys = bind_order(&scope, order_by, &outputs)?;
         let indexes = self.index_images().to_vec();
         let choices = index_choices(self.table(&inner.name)?, &indexes)?;
         let path = plan::choose_join(
@@ -895,8 +893,8 @@ impl Database {
             on: bound_on,
             filter,
             sort_keys,
-            output_indexes,
-            output_names,
+            output_indexes: outputs.indexes,
+            output_names: outputs.names,
             path,
         })
     }
@@ -1261,12 +1259,17 @@ enum AggFn {
     CountStar,
     CountColumn(usize),
     Sum(usize),
+    Avg(usize),
+    Min(usize),
+    Max(usize),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, PartialEq)]
 enum AccValue {
     Count(i64),
     Sum(Option<i64>),
+    Avg { sum: i128, count: i64 },
+    Extreme(Option<Value>),
 }
 
 struct AggGroup {
@@ -1292,12 +1295,13 @@ fn prepare_groups(
         ));
     };
     let mut aggs = Vec::new();
-    let mut outputs = Vec::with_capacity(items.len());
-    let mut output_names = Vec::with_capacity(items.len());
+    let mut outputs = OutputPlan::new();
     let mut aggregate_labels = Vec::new();
+    let mut explicit_aliases = HashSet::new();
     for item in items {
         match item {
-            SelectItem::Column(column) => {
+            SelectItem::Column { column, alias } => {
+                note_explicit_alias(&mut explicit_aliases, alias.as_deref())?;
                 let ordinal = scope.resolve(column)?;
                 let Some(slot) = group_ordinals.iter().position(|group| *group == ordinal) else {
                     return Err(DbError::invalid(format!(
@@ -1305,19 +1309,27 @@ fn prepare_groups(
                         column.name
                     )));
                 };
-                let Some(name) = scope.name_at(ordinal) else {
+                let Some(implicit) = scope.name_at(ordinal) else {
                     return Err(DbError::Internal(
                         "group column is outside the table".to_string(),
                     ));
                 };
-                output_names.push(name.to_string());
-                outputs.push(slot);
+                outputs.push(
+                    slot,
+                    alias.clone().unwrap_or_else(|| implicit.to_string()),
+                    alias.is_some(),
+                );
             }
-            SelectItem::Aggregate(call) => {
-                let slot = bind_aggregate(call, scope, &mut aggs)?;
+            SelectItem::Aggregate { call, alias } => {
+                note_explicit_alias(&mut explicit_aliases, alias.as_deref())?;
+                let (slot, _) = bind_aggregate(call, scope, &mut aggs)?;
                 aggregate_labels.push(call.render());
-                output_names.push(call.render());
-                outputs.push(group_ordinals.len() + slot);
+                let index = group_ordinals.len() + slot;
+                outputs.push(
+                    index,
+                    alias.clone().unwrap_or_else(|| call.render()),
+                    alias.is_some(),
+                );
             }
         }
     }
@@ -1329,9 +1341,9 @@ fn prepare_groups(
                 expr,
                 |column| grouped_column(scope, &group_ordinals, column),
                 |call| {
-                    let slot = bind_aggregate(call, scope, &mut aggs)?;
+                    let (slot, scalar) = bind_aggregate(call, scope, &mut aggs)?;
                     remember_aggregate(call, &mut aggregate_labels);
-                    Ok(group_width + slot)
+                    Ok((group_width + slot, scalar))
                 },
             )
         })
@@ -1339,9 +1351,11 @@ fn prepare_groups(
     let mut sort_keys = Vec::with_capacity(tail.order_by.len());
     for key in tail.order_by {
         let index = match &key.target {
-            OrderTarget::Column(column) => grouped_column(scope, &group_ordinals, column)?.0,
+            OrderTarget::Column(column) => order_output_index(column, &outputs, |column| {
+                Ok(grouped_column(scope, &group_ordinals, column)?.0)
+            })?,
             OrderTarget::Aggregate(call) => {
-                let slot = bind_aggregate(call, scope, &mut aggs)?;
+                let (slot, _) = bind_aggregate(call, scope, &mut aggs)?;
                 remember_aggregate(call, &mut aggregate_labels);
                 group_width + slot
             }
@@ -1361,8 +1375,8 @@ fn prepare_groups(
         group_ordinals,
         group_labels,
         aggs,
-        outputs,
-        output_names,
+        outputs: outputs.indexes,
+        output_names: outputs.names,
         aggregate_labels,
         sort_keys,
         filter,
@@ -1466,7 +1480,7 @@ fn is_aggregate_query(
         Projection::All | Projection::QualifiedAll { .. } => false,
         Projection::Columns(items) => items
             .iter()
-            .any(|item| matches!(item, SelectItem::Aggregate(_))),
+            .any(|item| matches!(item, SelectItem::Aggregate { .. })),
     }
 }
 
@@ -1474,38 +1488,81 @@ fn bind_aggregate(
     call: &AggregateCall,
     scope: &Scope,
     aggs: &mut Vec<AggFn>,
-) -> Result<usize, DbError> {
-    let function = match call.function {
+) -> Result<(usize, expr::ScalarType), DbError> {
+    let (function, scalar) = match call.function {
         AggregateFunction::Count => match &call.argument {
-            AggregateArg::Star => AggFn::CountStar,
-            AggregateArg::Column(column) => AggFn::CountColumn(scope.resolve(column)?),
+            AggregateArg::Star => (AggFn::CountStar, expr::ScalarType::Integer),
+            AggregateArg::Column(column) => (
+                AggFn::CountColumn(scope.resolve(column)?),
+                expr::ScalarType::Integer,
+            ),
         },
-        AggregateFunction::Sum => {
-            let AggregateArg::Column(column) = &call.argument else {
-                return Err(DbError::unsupported("SUM requires an INTEGER column"));
-            };
-            let ordinal = scope.resolve(column)?;
-            let Some(data_type) = scope.type_at(ordinal) else {
-                return Err(DbError::Internal(
-                    "aggregate column is outside the table".to_string(),
-                ));
-            };
-            if data_type != DataType::Integer {
-                return Err(DbError::TypeError(format!(
-                    "SUM requires INTEGER, not {data_type}"
-                )));
-            }
-            AggFn::Sum(ordinal)
-        }
+        AggregateFunction::Sum => (
+            integer_aggregate("SUM", call, scope, AggFn::Sum)?,
+            expr::ScalarType::Integer,
+        ),
+        AggregateFunction::Avg => (
+            integer_aggregate("AVG", call, scope, AggFn::Avg)?,
+            expr::ScalarType::Ratio,
+        ),
+        AggregateFunction::Min => extreme_aggregate("MIN", call, scope, true)?,
+        AggregateFunction::Max => extreme_aggregate("MAX", call, scope, false)?,
     };
     if let Some(slot) = aggs
         .iter()
         .position(|existing| agg_same(existing, &function))
     {
-        return Ok(slot);
+        return Ok((slot, scalar));
     }
     aggs.push(function);
-    Ok(aggs.len() - 1)
+    Ok((aggs.len() - 1, scalar))
+}
+
+fn integer_aggregate(
+    name: &str,
+    call: &AggregateCall,
+    scope: &Scope,
+    make: fn(usize) -> AggFn,
+) -> Result<AggFn, DbError> {
+    let ordinal = aggregate_column(&format!("{name} requires an INTEGER column"), call, scope)?;
+    let Some(data_type) = scope.type_at(ordinal) else {
+        return Err(DbError::Internal(
+            "aggregate column is outside the table".to_string(),
+        ));
+    };
+    if data_type != DataType::Integer {
+        return Err(DbError::TypeError(format!(
+            "{name} requires INTEGER, not {data_type}"
+        )));
+    }
+    Ok(make(ordinal))
+}
+
+fn extreme_aggregate(
+    name: &str,
+    call: &AggregateCall,
+    scope: &Scope,
+    min: bool,
+) -> Result<(AggFn, expr::ScalarType), DbError> {
+    let ordinal = aggregate_column(&format!("{name} requires a column"), call, scope)?;
+    let Some(data_type) = scope.type_at(ordinal) else {
+        return Err(DbError::Internal(
+            "aggregate column is outside the table".to_string(),
+        ));
+    };
+    let function = if min {
+        AggFn::Min(ordinal)
+    } else {
+        AggFn::Max(ordinal)
+    };
+    Ok((function, expr::ScalarType::from(data_type)))
+}
+
+fn aggregate_column(message: &str, call: &AggregateCall, scope: &Scope) -> Result<usize, DbError> {
+    let AggregateArg::Column(column) = &call.argument else {
+        return Err(DbError::unsupported(message));
+    };
+    scope.resolve(column)
 }
 
 fn agg_same(left: &AggFn, right: &AggFn) -> bool {
@@ -1513,6 +1570,9 @@ fn agg_same(left: &AggFn, right: &AggFn) -> bool {
         (AggFn::CountStar, AggFn::CountStar) => true,
         (AggFn::CountColumn(left), AggFn::CountColumn(right)) => left == right,
         (AggFn::Sum(left), AggFn::Sum(right)) => left == right,
+        (AggFn::Avg(left), AggFn::Avg(right)) => left == right,
+        (AggFn::Min(left), AggFn::Min(right)) => left == right,
+        (AggFn::Max(left), AggFn::Max(right)) => left == right,
         _ => false,
     }
 }
@@ -1654,6 +1714,8 @@ fn fresh_acc(aggs: &[AggFn]) -> Vec<AccValue> {
         .map(|agg| match agg {
             AggFn::CountStar | AggFn::CountColumn(_) => AccValue::Count(0),
             AggFn::Sum(_) => AccValue::Sum(None),
+            AggFn::Avg(_) => AccValue::Avg { sum: 0, count: 0 },
+            AggFn::Min(_) | AggFn::Max(_) => AccValue::Extreme(None),
         })
         .collect()
 }
@@ -1664,68 +1726,140 @@ fn update_acc(acc: &mut [AccValue], row: InputRow<'_>, aggs: &[AggFn]) -> Result
             "aggregate accumulator has the wrong width".to_string(),
         ));
     }
-    // A failing COUNT or SUM must not leave the earlier aggregates of this
-    // row applied. Eight covers every aggregate list the SQL surface builds
-    // in practice; a wider list stages on the heap and still commits together.
-    const STACK: usize = 8;
-    if acc.len() <= STACK {
-        let mut staged = [AccValue::Count(0); STACK];
-        staged[..acc.len()].copy_from_slice(acc);
-        apply_acc(&mut staged[..acc.len()], row, aggs)?;
-        acc.copy_from_slice(&staged[..acc.len()]);
-        return Ok(());
-    }
-    let mut staged = acc.to_vec();
-    apply_acc(&mut staged, row, aggs)?;
-    acc.copy_from_slice(&staged);
-    Ok(())
-}
-
-fn apply_acc(acc: &mut [AccValue], row: InputRow<'_>, aggs: &[AggFn]) -> Result<(), DbError> {
+    // Replacements stay in `pending` until every aggregate of this row succeeds.
+    // A text extreme is cloned only when it actually changes. Dropping `pending`
+    // leaves the committed slots untouched.
+    let mut pending = Vec::new();
     for (slot, agg) in aggs.iter().enumerate() {
-        match agg {
-            AggFn::CountStar => add_count(&mut acc[slot], "COUNT")?,
-            AggFn::CountColumn(ordinal) => {
-                if !cell(row, *ordinal)?.is_null() {
-                    add_count(&mut acc[slot], "COUNT")?;
-                }
-            }
-            AggFn::Sum(ordinal) => {
-                let value = match cell(row, *ordinal)? {
-                    Value::Null => continue,
-                    Value::Integer(value) => *value,
-                    _ => {
-                        return Err(DbError::Internal(
-                            "SUM received a non-integer value".to_string(),
-                        ));
-                    }
-                };
-                let AccValue::Sum(total) = &mut acc[slot] else {
-                    return Err(DbError::Internal(
-                        "SUM accumulator has the wrong shape".to_string(),
-                    ));
-                };
-                let base = total.unwrap_or(0);
-                *total = Some(
-                    base.checked_add(value)
-                        .ok_or_else(|| DbError::invalid("SUM overflows INTEGER"))?,
-                );
-            }
+        if let Some(next) = next_acc(&acc[slot], row, agg)? {
+            pending.push((slot, next));
         }
     }
+    for (slot, next) in pending {
+        acc[slot] = next;
+    }
     Ok(())
 }
 
-fn add_count(slot: &mut AccValue, name: &str) -> Result<(), DbError> {
+fn next_acc(
+    current: &AccValue,
+    row: InputRow<'_>,
+    agg: &AggFn,
+) -> Result<Option<AccValue>, DbError> {
+    match agg {
+        AggFn::CountStar => Ok(Some(bumped_count(current, "COUNT")?)),
+        AggFn::CountColumn(ordinal) => {
+            if cell(row, *ordinal)?.is_null() {
+                Ok(None)
+            } else {
+                Ok(Some(bumped_count(current, "COUNT")?))
+            }
+        }
+        AggFn::Sum(ordinal) => next_sum(current, row, *ordinal),
+        AggFn::Avg(ordinal) => next_avg(current, row, *ordinal),
+        AggFn::Min(ordinal) => next_extreme(current, row, *ordinal, true),
+        AggFn::Max(ordinal) => next_extreme(current, row, *ordinal, false),
+    }
+}
+
+fn next_sum(
+    current: &AccValue,
+    row: InputRow<'_>,
+    ordinal: usize,
+) -> Result<Option<AccValue>, DbError> {
+    let value = match cell(row, ordinal)? {
+        Value::Null => return Ok(None),
+        Value::Integer(value) => *value,
+        _ => {
+            return Err(DbError::Internal(
+                "SUM received a non-integer value".to_string(),
+            ));
+        }
+    };
+    let AccValue::Sum(total) = current else {
+        return Err(DbError::Internal(
+            "SUM accumulator has the wrong shape".to_string(),
+        ));
+    };
+    let base = total.unwrap_or(0);
+    Ok(Some(AccValue::Sum(Some(
+        base.checked_add(value)
+            .ok_or_else(|| DbError::invalid("SUM overflows INTEGER"))?,
+    ))))
+}
+
+fn next_avg(
+    current: &AccValue,
+    row: InputRow<'_>,
+    ordinal: usize,
+) -> Result<Option<AccValue>, DbError> {
+    let value = match cell(row, ordinal)? {
+        Value::Null => return Ok(None),
+        Value::Integer(value) => *value,
+        _ => {
+            return Err(DbError::Internal(
+                "AVG received a non-integer value".to_string(),
+            ));
+        }
+    };
+    let AccValue::Avg { sum, count } = current else {
+        return Err(DbError::Internal(
+            "AVG accumulator has the wrong shape".to_string(),
+        ));
+    };
+    let sum = sum
+        .checked_add(i128::from(value))
+        .ok_or_else(|| DbError::invalid("AVG overflows"))?;
+    let count = count
+        .checked_add(1)
+        .ok_or_else(|| DbError::invalid("AVG overflows INTEGER"))?;
+    Ok(Some(AccValue::Avg { sum, count }))
+}
+
+fn next_extreme(
+    current: &AccValue,
+    row: InputRow<'_>,
+    ordinal: usize,
+    min: bool,
+) -> Result<Option<AccValue>, DbError> {
+    let value = cell(row, ordinal)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let AccValue::Extreme(stored) = current else {
+        return Err(DbError::Internal(
+            "MIN/MAX accumulator has the wrong shape".to_string(),
+        ));
+    };
+    let replace = match stored {
+        None => true,
+        Some(stored) => {
+            let ordering = value::cmp_scalar(value, stored).ok_or_else(|| {
+                DbError::Internal("MIN/MAX values have different types".to_string())
+            })?;
+            if min {
+                ordering.is_lt()
+            } else {
+                ordering.is_gt()
+            }
+        }
+    };
+    if replace {
+        Ok(Some(AccValue::Extreme(Some(value.clone()))))
+    } else {
+        Ok(None)
+    }
+}
+
+fn bumped_count(slot: &AccValue, name: &str) -> Result<AccValue, DbError> {
     let AccValue::Count(count) = slot else {
         return Err(DbError::Internal(
             "COUNT accumulator has the wrong shape".to_string(),
         ));
     };
-    *count = count
-        .checked_add(1)
-        .ok_or_else(|| DbError::invalid(format!("{name} overflows INTEGER")))?;
-    Ok(())
+    Ok(AccValue::Count(count.checked_add(1).ok_or_else(|| {
+        DbError::invalid(format!("{name} overflows INTEGER"))
+    })?))
 }
 
 fn cell(row: InputRow<'_>, ordinal: usize) -> Result<&Value, DbError> {
@@ -1740,6 +1874,14 @@ fn materialize_group(key: &[Value], acc: &[AccValue]) -> Vec<Value> {
         row.push(match value {
             AccValue::Count(count) => Value::Integer(*count),
             AccValue::Sum(total) => total.map(Value::Integer).unwrap_or(Value::Null),
+            AccValue::Avg { sum, count } => {
+                if *count > 0 {
+                    Value::ratio(*sum, *count)
+                } else {
+                    Value::Null
+                }
+            }
+            AccValue::Extreme(value) => value.clone().unwrap_or(Value::Null),
         });
     }
     row
@@ -1769,6 +1911,14 @@ fn hash_group(row: InputRow<'_>, ordinals: &[usize]) -> Result<u64, DbError> {
                 3u8.hash(&mut hasher);
                 value.hash(&mut hasher);
             }
+            Value::Ratio {
+                numerator,
+                denominator,
+            } => {
+                4u8.hash(&mut hasher);
+                numerator.hash(&mut hasher);
+                denominator.hash(&mut hasher);
+            }
         }
     }
     Ok(hasher.finish())
@@ -1785,6 +1935,16 @@ fn group_equals(key: &[Value], row: InputRow<'_>, ordinals: &[usize]) -> Result<
             (Value::Integer(left), Value::Integer(right)) => left == right,
             (Value::Text(left), Value::Text(right)) => left == right,
             (Value::Boolean(left), Value::Boolean(right)) => left == right,
+            (
+                Value::Ratio {
+                    numerator: left_n,
+                    denominator: left_d,
+                },
+                Value::Ratio {
+                    numerator: right_n,
+                    denominator: right_d,
+                },
+            ) => left_n == right_n && left_d == right_d,
             _ => false,
         };
         if !same {
@@ -1834,33 +1994,91 @@ fn bind_optional_where(
         .transpose()
 }
 
-fn output_columns(scope: &Scope, projection: &Projection) -> Result<Vec<usize>, DbError> {
-    match projection {
-        Projection::All => Ok((0..scope.len()).collect()),
-        Projection::QualifiedAll { qualifier } => scope.columns_of(qualifier),
-        Projection::Columns(columns) => columns
-            .iter()
-            .map(|item| match item {
-                SelectItem::Column(column) => scope.resolve(column),
-                SelectItem::Aggregate(_) => Err(DbError::Internal(
-                    "aggregate select item in a non-aggregate query".to_string(),
-                )),
-            })
-            .collect(),
+struct OutputPlan {
+    indexes: Vec<usize>,
+    names: Vec<String>,
+    explicit: Vec<bool>,
+}
+
+impl OutputPlan {
+    fn new() -> Self {
+        Self {
+            indexes: Vec::new(),
+            names: Vec::new(),
+            explicit: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, index: usize, name: String, explicit: bool) {
+        self.indexes.push(index);
+        self.names.push(name);
+        self.explicit.push(explicit);
     }
 }
 
-fn column_names(scope: &Scope, indexes: &[usize]) -> Result<Vec<String>, DbError> {
-    let mut names = Vec::with_capacity(indexes.len());
-    for index in indexes {
-        let Some(name) = scope.name_at(*index) else {
-            return Err(DbError::Internal(format!(
-                "output column index {index} is outside the row"
-            )));
-        };
-        names.push(name.to_string());
+fn output_columns(scope: &Scope, projection: &Projection) -> Result<OutputPlan, DbError> {
+    let mut outputs = OutputPlan::new();
+    let mut explicit_aliases = HashSet::new();
+    match projection {
+        Projection::All => {
+            for index in 0..scope.len() {
+                let Some(name) = scope.name_at(index) else {
+                    return Err(DbError::Internal(
+                        "select column is outside the table".to_string(),
+                    ));
+                };
+                outputs.push(index, name.to_string(), false);
+            }
+        }
+        Projection::QualifiedAll { qualifier } => {
+            for index in scope.columns_of(qualifier)? {
+                let Some(name) = scope.name_at(index) else {
+                    return Err(DbError::Internal(
+                        "select column is outside the table".to_string(),
+                    ));
+                };
+                outputs.push(index, name.to_string(), false);
+            }
+        }
+        Projection::Columns(columns) => {
+            for item in columns {
+                match item {
+                    SelectItem::Column { column, alias } => {
+                        note_explicit_alias(&mut explicit_aliases, alias.as_deref())?;
+                        let index = scope.resolve(column)?;
+                        let Some(implicit) = scope.name_at(index) else {
+                            return Err(DbError::Internal(
+                                "select column is outside the table".to_string(),
+                            ));
+                        };
+                        outputs.push(
+                            index,
+                            alias.clone().unwrap_or_else(|| implicit.to_string()),
+                            alias.is_some(),
+                        );
+                    }
+                    SelectItem::Aggregate { .. } => {
+                        return Err(DbError::Internal(
+                            "aggregate select item in a non-aggregate query".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
     }
-    Ok(names)
+    Ok(outputs)
+}
+
+fn note_explicit_alias(seen: &mut HashSet<String>, alias: Option<&str>) -> Result<(), DbError> {
+    let Some(alias) = alias else {
+        return Ok(());
+    };
+    if !seen.insert(alias.to_string()) {
+        return Err(DbError::invalid(format!(
+            "duplicate column alias '{alias}'"
+        )));
+    }
+    Ok(())
 }
 
 fn project_row(row: &[Value], indexes: &[usize]) -> Result<Vec<Value>, DbError> {
@@ -1945,12 +2163,17 @@ fn assign_row(row: &[Value], assignments: &[BoundAssignment]) -> Result<Vec<Valu
                 "assignment index {index} is outside the row"
             )));
         };
+        value.ensure_persistent()?;
         *slot = value;
     }
     Ok(updated)
 }
 
-fn bind_order(scope: &Scope, keys: &[OrderKey]) -> Result<Vec<SortKey>, DbError> {
+fn bind_order(
+    scope: &Scope,
+    keys: &[OrderKey],
+    outputs: &OutputPlan,
+) -> Result<Vec<SortKey>, DbError> {
     let mut bound = Vec::with_capacity(keys.len());
     for key in keys {
         let OrderTarget::Column(column) = &key.target else {
@@ -1958,7 +2181,7 @@ fn bind_order(scope: &Scope, keys: &[OrderKey]) -> Result<Vec<SortKey>, DbError>
                 "ORDER BY aggregate requires GROUP BY or an aggregate select list",
             ));
         };
-        let index = scope.resolve(column)?;
+        let index = order_output_index(column, outputs, |column| scope.resolve(column))?;
         bound.push(SortKey {
             index,
             ascending: key.ascending,
@@ -1966,6 +2189,49 @@ fn bind_order(scope: &Scope, keys: &[OrderKey]) -> Result<Vec<SortKey>, DbError>
         });
     }
     Ok(bound)
+}
+
+/// Unqualified names prefer one explicit alias, then one implicit output name.
+///
+/// A qualified name never consults aliases. Two implicit names with the same
+/// text are ambiguous. A unique explicit alias wins over a source column and
+/// over another output that only has that text as its implicit name.
+fn order_output_index(
+    column: &SelectColumn,
+    outputs: &OutputPlan,
+    fallback: impl FnOnce(&SelectColumn) -> Result<usize, DbError>,
+) -> Result<usize, DbError> {
+    if column.qualifier.is_none() {
+        let explicit = output_hits(outputs, &column.name, true);
+        if explicit.len() > 1 {
+            return Err(ambiguous_column(&column.name));
+        }
+        if let [hit] = explicit.as_slice() {
+            return Ok(outputs.indexes[*hit]);
+        }
+        let implicit = output_hits(outputs, &column.name, false);
+        if implicit.len() > 1 {
+            return Err(ambiguous_column(&column.name));
+        }
+        if let [hit] = implicit.as_slice() {
+            return Ok(outputs.indexes[*hit]);
+        }
+    }
+    fallback(column)
+}
+
+fn output_hits(outputs: &OutputPlan, name: &str, explicit: bool) -> Vec<usize> {
+    outputs
+        .names
+        .iter()
+        .enumerate()
+        .filter(|(index, output)| output == &name && outputs.explicit[*index] == explicit)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn ambiguous_column(name: &str) -> DbError {
+    DbError::invalid(format!("column '{name}' is ambiguous"))
 }
 
 /// One equality key inside a hash bucket.
@@ -2327,6 +2593,16 @@ fn same_cell(left: &Value, right: &Value) -> bool {
         (Value::Integer(left), Value::Integer(right)) => left == right,
         (Value::Text(left), Value::Text(right)) => left == right,
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
+        (
+            Value::Ratio {
+                numerator: left_n,
+                denominator: left_d,
+            },
+            Value::Ratio {
+                numerator: right_n,
+                denominator: right_d,
+            },
+        ) => left_n == right_n && left_d == right_d,
         _ => false,
     }
 }
@@ -2344,6 +2620,7 @@ fn key_ref(value: &Value) -> Option<KeyRef<'_>> {
         Value::Integer(key) => Some(KeyRef::Integer(*key)),
         Value::Text(key) => Some(KeyRef::Text(key)),
         Value::Boolean(key) => Some(KeyRef::Boolean(*key)),
+        Value::Ratio { .. } => None,
     }
 }
 
@@ -2536,12 +2813,7 @@ fn compare_values(left: &Value, right: &Value, ascending: bool, nulls_first: boo
             }
         }
         (false, false) => {
-            let ordering = match (left, right) {
-                (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
-                (Value::Text(left), Value::Text(right)) => left.cmp(right),
-                (Value::Boolean(left), Value::Boolean(right)) => left.cmp(right),
-                _ => Ordering::Equal,
-            };
+            let ordering = value::cmp_scalar(left, right).unwrap_or(Ordering::Equal);
             if ascending {
                 ordering
             } else {
@@ -3016,16 +3288,17 @@ mod tests {
 
     #[test]
     fn count_overflow_is_an_error_and_the_accumulator_is_one_slot() {
-        let mut slot = AccValue::Count(i64::MAX);
-        let error = add_count(&mut slot, "COUNT").unwrap_err();
+        let slot = AccValue::Count(i64::MAX);
+        let error = bumped_count(&slot, "COUNT").unwrap_err();
         assert_eq!(error.to_string(), "COUNT overflows INTEGER");
         let AccValue::Count(count) = slot else {
             panic!("COUNT overflow changed the accumulator");
         };
         assert_eq!(count, i64::MAX);
-        // Count and Sum share one 16-byte slot: the `i64` and a tag that also
-        // distinguishes `Sum(None)`.
-        assert_eq!(std::mem::size_of::<AccValue>(), 16);
+        // AVG carries an i128, and MIN/MAX can own a string, so every slot is
+        // the width of that larger enum. The size is recorded, not assumed.
+        assert_eq!(std::mem::size_of::<AccValue>(), 48);
+        assert_eq!(std::mem::size_of::<Value>(), 32);
     }
 
     #[test]
@@ -3061,6 +3334,121 @@ mod tests {
             usize::MAX
         );
         assert_eq!(hash_table_bytes(usize::MAX, usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn a_failing_avg_does_not_replace_a_text_extreme() {
+        let mut acc = [
+            AccValue::Extreme(Some(Value::Text("mmm".to_string()))),
+            AccValue::Avg {
+                sum: 0,
+                count: i64::MAX,
+            },
+        ];
+        let row = [Value::Text("aaa".to_string()), Value::Integer(1)];
+        let error = update_acc(
+            &mut acc,
+            InputRow::One(&row),
+            &[AggFn::Min(0), AggFn::Avg(1)],
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "AVG overflows INTEGER");
+        assert!(matches!(&acc[0], AccValue::Extreme(Some(Value::Text(text))) if text == "mmm"));
+        assert!(matches!(acc[1], AccValue::Avg { count, .. } if count == i64::MAX));
+
+        let mut acc = [
+            AccValue::Extreme(Some(Value::Text("mmm".to_string()))),
+            AccValue::Avg { sum: 1, count: 1 },
+        ];
+        update_acc(
+            &mut acc,
+            InputRow::One(&[Value::Text("zzz".to_string()), Value::Integer(4)]),
+            &[AggFn::Min(0), AggFn::Avg(1)],
+        )
+        .unwrap();
+        assert!(matches!(&acc[0], AccValue::Extreme(Some(Value::Text(text))) if text == "mmm"));
+        assert!(matches!(
+            &acc[1],
+            AccValue::Avg { sum, count } if *sum == 5 && *count == 2
+        ));
+    }
+
+    #[test]
+    fn a_late_overflow_discards_pending_text_and_numeric_updates() {
+        let original = [
+            AccValue::Extreme(Some(Value::Text("mmm".to_string()))),
+            AccValue::Extreme(Some(Value::Text("mmm".to_string()))),
+            AccValue::Sum(Some(i64::MAX)),
+            AccValue::Avg { sum: 1, count: 1 },
+            AccValue::Count(4),
+        ];
+        let mut acc = original.clone();
+        let row = [
+            Value::Text("aaa".to_string()),
+            Value::Text("zzz".to_string()),
+            Value::Integer(1),
+        ];
+        let aggs = [
+            AggFn::Min(0),
+            AggFn::Max(1),
+            AggFn::Sum(2),
+            AggFn::Avg(2),
+            AggFn::CountStar,
+        ];
+        let error = update_acc(&mut acc, InputRow::One(&row), &aggs).unwrap_err();
+        assert_eq!(error.to_string(), "SUM overflows INTEGER");
+        assert_eq!(acc, original);
+
+        acc[2] = AccValue::Sum(Some(1));
+        acc[4] = AccValue::Count(i64::MAX);
+        let before_count = acc.clone();
+        let error = update_acc(&mut acc, InputRow::One(&row), &aggs).unwrap_err();
+        assert_eq!(error.to_string(), "COUNT overflows INTEGER");
+        assert_eq!(acc, before_count);
+
+        acc[3] = AccValue::Avg {
+            sum: 0,
+            count: i64::MAX,
+        };
+        acc[4] = AccValue::Count(1);
+        let before_avg = acc.clone();
+        let error = update_acc(&mut acc, InputRow::One(&row), &aggs).unwrap_err();
+        assert_eq!(error.to_string(), "AVG overflows INTEGER");
+        assert_eq!(acc, before_avg);
+
+        acc[3] = AccValue::Avg {
+            sum: i128::MAX,
+            count: 1,
+        };
+        let before_sum = acc.clone();
+        let error = update_acc(&mut acc, InputRow::One(&row), &aggs).unwrap_err();
+        assert_eq!(error.to_string(), "AVG overflows");
+        assert_eq!(acc, before_sum);
+
+        acc[2] = AccValue::Sum(Some(i64::MAX));
+        acc[3] = AccValue::Avg { sum: 1, count: 1 };
+        let nulls = [Value::Null, Value::Null, Value::Integer(1)];
+        let before_null = acc.clone();
+        let error = update_acc(&mut acc, InputRow::One(&nulls), &aggs).unwrap_err();
+        assert_eq!(error.to_string(), "SUM overflows INTEGER");
+        assert_eq!(acc, before_null);
+
+        acc[2] = AccValue::Sum(Some(1));
+        update_acc(
+            &mut acc,
+            InputRow::One(&[
+                Value::Text("aaa".to_string()),
+                Value::Text("zzz".to_string()),
+                Value::Integer(4),
+            ]),
+            &aggs,
+        )
+        .unwrap();
+        assert!(matches!(&acc[0], AccValue::Extreme(Some(Value::Text(text))) if text == "aaa"));
+        assert!(matches!(&acc[1], AccValue::Extreme(Some(Value::Text(text))) if text == "zzz"));
+        assert!(matches!(acc[2], AccValue::Sum(Some(5))));
+        assert!(matches!(acc[3], AccValue::Avg { sum: 5, count: 2 }));
+        assert!(matches!(acc[4], AccValue::Count(2)));
     }
 
     #[test]
@@ -3184,16 +3572,33 @@ mod tests {
             }),
         };
         let mut aggs = Vec::new();
-        let first = bind_aggregate(&sum, &scope, &mut aggs).unwrap();
-        let second = bind_aggregate(&sum, &scope, &mut aggs).unwrap();
-        let third = bind_aggregate(&qualified, &scope, &mut aggs).unwrap();
+        let first = bind_aggregate(&sum, &scope, &mut aggs).unwrap().0;
+        let second = bind_aggregate(&sum, &scope, &mut aggs).unwrap().0;
+        let third = bind_aggregate(&qualified, &scope, &mut aggs).unwrap().0;
         assert_eq!((first, second, third, aggs.len()), (0, 0, 0, 1));
         let count = AggregateCall {
             function: AggregateFunction::Count,
             argument: AggregateArg::Star,
         };
-        assert_eq!(bind_aggregate(&count, &scope, &mut aggs).unwrap(), 1);
+        assert_eq!(bind_aggregate(&count, &scope, &mut aggs).unwrap().0, 1);
         assert_eq!(aggs.len(), 2);
+        let avg = AggregateCall {
+            function: AggregateFunction::Avg,
+            argument: AggregateArg::Column(SelectColumn {
+                name: "n".to_string(),
+                qualifier: Some("items".to_string()),
+            }),
+        };
+        let again = AggregateCall {
+            function: AggregateFunction::Avg,
+            argument: AggregateArg::Column(SelectColumn {
+                name: "n".to_string(),
+                qualifier: None,
+            }),
+        };
+        assert_eq!(bind_aggregate(&avg, &scope, &mut aggs).unwrap().0, 2);
+        assert_eq!(bind_aggregate(&again, &scope, &mut aggs).unwrap().0, 2);
+        assert_eq!(aggs.len(), 3);
     }
 
     #[test]
@@ -4367,6 +4772,7 @@ mod tests {
                 out.push('\'');
                 out
             }
+            Value::Ratio { .. } => value.to_string(),
         }
     }
 
@@ -4564,7 +4970,7 @@ mod tests {
     fn join_group_bytes(groups: usize, key_cells: usize, aggs: usize) -> usize {
         let value = std::mem::size_of::<Value>();
         let vector = std::mem::size_of::<Vec<Value>>();
-        let accumulator = 16usize;
+        let accumulator = std::mem::size_of::<AccValue>();
         let keys = groups.saturating_mul(vector.saturating_add(key_cells.saturating_mul(value)));
         let acc = groups.saturating_mul(vector.saturating_add(aggs.saturating_mul(accumulator)));
         let map_entry = std::mem::size_of::<u64>()
@@ -4572,5 +4978,197 @@ mod tests {
             + std::mem::size_of::<usize>();
         keys.saturating_add(acc)
             .saturating_add(groups.saturating_mul(map_entry))
+    }
+
+    #[test]
+    #[ignore = "release profile of AVG, MIN, and MAX"]
+    fn profile_milestone12() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone12 cpu={cpu} mem_bytes={mem} rustc={rustc} acc_bytes={} value_bytes={}",
+            std::mem::size_of::<AccValue>(),
+            std::mem::size_of::<Value>()
+        );
+        for rows in [1_000_i64, 10_000, 100_000] {
+            let mut database = Database::new();
+            load_avg_profile(&mut database, rows);
+            profile_avg_shape(
+                &mut database,
+                rows,
+                "sum",
+                "SELECT SUM(salary) FROM staff;",
+                true,
+                1,
+                1,
+            );
+            profile_avg_shape(
+                &mut database,
+                rows,
+                "avg",
+                "SELECT AVG(salary) FROM staff;",
+                true,
+                1,
+                1,
+            );
+            profile_avg_shape(
+                &mut database,
+                rows,
+                "sum_avg",
+                "SELECT SUM(salary), AVG(salary) FROM staff;",
+                true,
+                1,
+                2,
+            );
+            profile_avg_shape(
+                &mut database,
+                rows,
+                "low_card",
+                "SELECT bucket, AVG(salary), MIN(salary), MAX(salary), MIN(name) FROM staff GROUP BY bucket;",
+                false,
+                10,
+                4,
+            );
+            profile_avg_shape(
+                &mut database,
+                rows,
+                "high_card",
+                "SELECT id, AVG(salary) FROM staff GROUP BY id;",
+                false,
+                usize::try_from(rows).unwrap_or(usize::MAX),
+                1,
+            );
+            let threshold = rows / 2;
+            profile_avg_shape(
+                &mut database,
+                rows,
+                "having",
+                &format!(
+                    "SELECT bucket, AVG(salary) FROM staff GROUP BY bucket HAVING AVG(salary) > {threshold};"
+                ),
+                false,
+                10,
+                1,
+            );
+            profile_avg_shape(
+                &mut database,
+                rows,
+                "join",
+                "SELECT u.bucket, AVG(o.amount), MIN(o.amount), MAX(o.amount)
+                 FROM users u JOIN orders o ON u.id = o.user_id
+                 GROUP BY u.bucket;",
+                false,
+                10,
+                3,
+            );
+        }
+    }
+
+    fn profile_avg_shape(
+        database: &mut Database,
+        rows: i64,
+        shape: &str,
+        sql: &str,
+        scalar: bool,
+        accumulated: usize,
+        aggs: usize,
+    ) {
+        let mut samples = Vec::with_capacity(6);
+        let mut returned = 0;
+        let mut checksum = 0i64;
+        for _ in 0..6 {
+            let started = std::time::Instant::now();
+            let result = query(database, sql);
+            samples.push(started.elapsed().as_micros());
+            checksum = 0;
+            for row in &result.rows {
+                for cell in row {
+                    checksum = checksum.wrapping_add(profile_cell(cell));
+                }
+            }
+            returned = result.rows.len();
+            std::hint::black_box(&result.rows);
+        }
+        let cold = samples[0];
+        let mut warm = samples[1..].to_vec();
+        warm.sort_unstable();
+        let warm = warm[warm.len() / 2];
+        let bytes = if scalar {
+            std::mem::size_of::<Vec<AccValue>>()
+                .saturating_add(aggs.saturating_mul(std::mem::size_of::<AccValue>()))
+        } else {
+            join_group_bytes(accumulated, 1, aggs)
+        };
+        println!(
+            "milestone12 shape={shape} rows={rows} returned={returned} groups={accumulated} aggs={aggs} bytes={bytes} checksum={checksum} cold_us={cold} warm_us={warm}"
+        );
+    }
+
+    fn profile_cell(value: &Value) -> i64 {
+        match value {
+            Value::Null => 0,
+            Value::Integer(value) => *value,
+            Value::Boolean(value) => i64::from(*value),
+            Value::Text(text) => i64::try_from(text.len()).unwrap_or(i64::MAX),
+            Value::Ratio {
+                numerator,
+                denominator,
+            } => (*numerator as i64).wrapping_add(*denominator),
+        }
+    }
+
+    fn load_avg_profile(database: &mut Database, rows: i64) {
+        database
+            .execute(
+                "CREATE TABLE staff (id INT, name TEXT, bucket INT, salary INT, active BOOLEAN);",
+            )
+            .unwrap();
+        database
+            .execute("CREATE TABLE users (id INT, bucket INT);")
+            .unwrap();
+        database
+            .execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        let mut start = 0_i64;
+        while start < rows {
+            let end = (start + 499).min(rows - 1);
+            let mut staff = String::from("INSERT INTO staff VALUES ");
+            let mut users = String::from("INSERT INTO users VALUES ");
+            for id in start..=end {
+                if id != start {
+                    staff.push(',');
+                    users.push(',');
+                }
+                staff.push_str(&format!(
+                    "({id}, 'n{id}', {}, {id}, {})",
+                    id % 10,
+                    id % 2 == 0
+                ));
+                users.push_str(&format!("({id}, {})", id % 10));
+            }
+            database.execute(&staff).unwrap();
+            database.execute(&users).unwrap();
+            start = end + 1;
+        }
+        let orders = rows.saturating_mul(4);
+        let mut start = 0_i64;
+        while start < orders {
+            let end = (start + 499).min(orders - 1);
+            let mut sql = String::from("INSERT INTO orders VALUES ");
+            for id in start..=end {
+                if id != start {
+                    sql.push(',');
+                }
+                let user = id % rows;
+                if id % 2 == 0 {
+                    sql.push_str(&format!("({user}, NULL)"));
+                } else {
+                    sql.push_str(&format!("({user}, {id})"));
+                }
+            }
+            database.execute(&sql).unwrap();
+            start = end + 1;
+        }
     }
 }
