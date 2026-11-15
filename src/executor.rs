@@ -13,15 +13,20 @@
 //! unless the query overrides that with `NULLS FIRST` or `NULLS LAST`.
 //! `UPDATE` and `DELETE` still read every row of one table.
 //!
-//! An `INNER JOIN` walks the outer table in insertion order and, for each outer
-//! row, the inner table in insertion order. The catalog stores tables in one
-//! map, so the scan copies the smaller input and borrows the other. A self-join
-//! copies one side for the same reason. A pair is kept only when `ON` is TRUE.
-//! `WHERE` then runs on that pair. Pairs that fail are not concatenated. With
-//! no `ORDER BY`, a match is projected immediately and `LIMIT` stores only the
-//! rows it will return; later pairs are still evaluated. `ORDER BY` keeps the
-//! joined row until the sort. The join does not read an index and does not
-//! write the database.
+//! An `INNER JOIN` walks the outer table in insertion order. For each outer
+//! row it reads inner candidates, then keeps a pair only when `ON` is TRUE.
+//! `WHERE` then runs on that pair. When the inner table has an integer index
+//! on one side of an equality in `ON`, those candidates come from that index
+//! and are put back into insertion order. The original `ON` is still
+//! evaluated. A NULL outer key skips the probe, because that equality is not
+//! TRUE. Any other shape reads the inner table from front to back. The catalog
+//! stores tables in one map, so the nested loop copies the smaller input and
+//! borrows the other. A self-join copies one side for the same reason. The
+//! index path copies the outer rows, because each probe needs to borrow the
+//! database mutably. Pairs that fail are not concatenated. With no `ORDER BY`,
+//! a match is projected immediately and `LIMIT` stores only the rows it will
+//! return; later pairs are still evaluated. `ORDER BY` keeps the joined row
+//! until the sort. The join does not write the database.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -31,7 +36,7 @@ use crate::database::{Database, DurableChange};
 use crate::error::DbError;
 use crate::expr::{self, BoundExpr, Scope};
 use crate::parser;
-use crate::plan::{self, AccessPath};
+use crate::plan::{self, AccessPath, JoinAccess};
 use crate::storage::IndexImage;
 use crate::table::Table;
 use crate::value::{DataType, Value};
@@ -103,6 +108,13 @@ struct PreparedJoin {
     sort_keys: Vec<SortKey>,
     output_indexes: Vec<usize>,
     output_names: Vec<String>,
+    path: JoinAccess,
+}
+
+struct IndexProbe {
+    index: String,
+    inner_ordinal: usize,
+    outer_ordinal: usize,
 }
 
 impl Database {
@@ -298,6 +310,23 @@ impl Database {
             tail.selection,
             tail.order_by,
         )?;
+        if let JoinAccess::IndexNestedLoop {
+            name,
+            inner_ordinal,
+            outer_ordinal,
+            ..
+        } = &prepared.path
+        {
+            let probe = IndexProbe {
+                index: name.clone(),
+                inner_ordinal: *inner_ordinal,
+                outer_ordinal: *outer_ordinal,
+            };
+            // Probes borrow the database, so the outer rows cannot stay borrowed
+            // from the catalog. The copy is not updated.
+            let outer_rows = self.table(&outer.name)?.rows().to_vec();
+            return self.index_nested_loop(&inner.name, &probe, &outer_rows, prepared, tail.limit);
+        }
         // `tables` is one map, so two row slices cannot be borrowed together.
         // A self-join is the same entry. Copy the smaller input and borrow the
         // other. The copy is not updated: a join does not write either table.
@@ -342,26 +371,61 @@ impl Database {
                 }))
             }
             QueryFrom::Join { outer, inner, on } => {
-                self.prepare_join(outer, inner, on, projection, selection.as_ref(), order_by)?;
+                let prepared =
+                    self.prepare_join(outer, inner, on, projection, selection.as_ref(), order_by)?;
                 let filter = selection
                     .as_ref()
                     .map(|expr| Value::Text(expr.render()))
                     .unwrap_or(Value::Null);
+                let (columns, row) = match &prepared.path {
+                    JoinAccess::NestedLoop => (
+                        vec![
+                            "access".to_string(),
+                            "outer".to_string(),
+                            "inner".to_string(),
+                            "condition".to_string(),
+                            "filter".to_string(),
+                        ],
+                        vec![
+                            Value::Text("NestedLoopJoin".to_string()),
+                            Value::Text(outer.explain_name()),
+                            Value::Text(inner.explain_name()),
+                            Value::Text(on.render()),
+                            filter,
+                        ],
+                    ),
+                    JoinAccess::IndexNestedLoop {
+                        name,
+                        predicate,
+                        residual,
+                        ..
+                    } => (
+                        vec![
+                            "access".to_string(),
+                            "outer".to_string(),
+                            "inner".to_string(),
+                            "index".to_string(),
+                            "predicate".to_string(),
+                            "residual".to_string(),
+                            "filter".to_string(),
+                        ],
+                        vec![
+                            Value::Text("IndexNestedLoopJoin".to_string()),
+                            Value::Text(outer.explain_name()),
+                            Value::Text(inner.explain_name()),
+                            Value::Text(name.clone()),
+                            Value::Text(predicate.clone()),
+                            residual
+                                .as_ref()
+                                .map(|text| Value::Text(text.clone()))
+                                .unwrap_or(Value::Null),
+                            filter,
+                        ],
+                    ),
+                };
                 Ok(StatementResult::Query(QueryResult {
-                    columns: vec![
-                        "access".to_string(),
-                        "outer".to_string(),
-                        "inner".to_string(),
-                        "condition".to_string(),
-                        "filter".to_string(),
-                    ],
-                    rows: vec![vec![
-                        Value::Text("NestedLoopJoin".to_string()),
-                        Value::Text(outer.explain_name()),
-                        Value::Text(inner.explain_name()),
-                        Value::Text(on.render()),
-                        filter,
-                    ]],
+                    columns,
+                    rows: vec![row],
                 }))
             }
         }
@@ -403,18 +467,34 @@ impl Database {
     ) -> Result<PreparedJoin, DbError> {
         let outer_columns = Scope::columns(self.table(&outer.name)?);
         let inner_columns = Scope::columns(self.table(&inner.name)?);
-        let scope = Scope::try_join(&outer.alias, outer_columns, &inner.alias, inner_columns)?;
-        let on = expr::bind_filter(on, &scope, "ON")?;
+        let scope = Scope::try_join(
+            &outer.alias,
+            outer_columns.clone(),
+            &inner.alias,
+            inner_columns.clone(),
+        )?;
+        let bound_on = expr::bind_filter(on, &scope, "ON")?;
         let filter = bind_optional_where(selection, &scope)?;
         let sort_keys = bind_order(&scope, order_by)?;
         let output_indexes = output_columns(&scope, projection)?;
         let output_names = column_names(&scope, &output_indexes)?;
-        Ok(PreparedJoin {
+        let indexes = self.index_images().to_vec();
+        let choices = index_choices(self.table(&inner.name)?, &indexes)?;
+        let path = plan::choose_join(
+            &outer.alias,
+            &outer_columns,
+            &inner.alias,
+            &inner_columns,
             on,
+            &choices,
+        );
+        Ok(PreparedJoin {
+            on: bound_on,
             filter,
             sort_keys,
             output_indexes,
             output_names,
+            path,
         })
     }
 
@@ -478,7 +558,27 @@ impl Database {
             plan::Bounds::Equal(key) => (Some(key), None, None),
             plan::Bounds::Range { low, high } => (None, low, high),
         };
-        let (root, entries) = self.read_indexed_keys(&index_name, equal, low, high)?;
+        self.indexed_positions(table_name, &index_name, ordinal, equal, low, high)
+    }
+
+    /// Row positions for one index lookup, in insertion order.
+    ///
+    /// Each returned row id must exist, must sit at that position, and must
+    /// store `key` in the indexed column. A repeated row id is corrupt. An
+    /// empty tree is corrupt when the table still stores an integer in that
+    /// column. A broken leaf link fails the lookup. Positions are sorted so
+    /// duplicate keys keep insertion order. The caller does not replace a
+    /// failed lookup with a scan of the table.
+    fn indexed_positions(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        ordinal: usize,
+        equal: Option<i64>,
+        low: Option<i64>,
+        high: Option<i64>,
+    ) -> Result<Vec<usize>, DbError> {
+        let (root, entries) = self.read_indexed_keys(index_name, equal, low, high)?;
 
         let table = self.table(table_name)?;
         if root == 0 {
@@ -487,7 +587,7 @@ impl Database {
                 .iter()
                 .any(|row| matches!(row.get(ordinal), Some(Value::Integer(_))));
             if stored {
-                return Err(corrupt_index(&index_name));
+                return Err(corrupt_index(index_name));
             }
             return Ok(Vec::new());
         }
@@ -496,21 +596,122 @@ impl Database {
         let mut seen = HashSet::with_capacity(entries.len());
         for (key, row_id) in entries {
             if !seen.insert(row_id) {
-                return Err(corrupt_index(&index_name));
+                return Err(corrupt_index(index_name));
             }
             let Some(position) = table.position(row_id) else {
-                return Err(corrupt_index(&index_name));
+                return Err(corrupt_index(index_name));
             };
             if table.row_id_at(position) != Some(row_id) {
-                return Err(corrupt_index(&index_name));
+                return Err(corrupt_index(index_name));
             }
             match table.rows().get(position).and_then(|row| row.get(ordinal)) {
                 Some(Value::Integer(stored)) if *stored == key => positions.push(position),
-                _ => return Err(corrupt_index(&index_name)),
+                _ => return Err(corrupt_index(index_name)),
             }
         }
         positions.sort_unstable();
         Ok(positions)
+    }
+
+    fn index_nested_loop(
+        &mut self,
+        inner_name: &str,
+        probe: &IndexProbe,
+        outer_rows: &[Vec<Value>],
+        prepared: PreparedJoin,
+        limit: Option<u64>,
+    ) -> Result<StatementResult, DbError> {
+        let limit_n = limit.map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+        if prepared.sort_keys.is_empty() {
+            let mut projected = Vec::new();
+            for outer_row in outer_rows {
+                self.visit_inner_matches(inner_name, probe, outer_row, &prepared, |inner_row| {
+                    if limit_n.is_some_and(|limit_n| projected.len() >= limit_n) {
+                        return Ok(());
+                    }
+                    projected.push(project_pair(
+                        outer_row,
+                        inner_row,
+                        &prepared.output_indexes,
+                    )?);
+                    Ok(())
+                })?;
+            }
+            return Ok(StatementResult::Query(QueryResult {
+                columns: prepared.output_names,
+                rows: projected,
+            }));
+        }
+
+        let mut joined = Vec::new();
+        for outer_row in outer_rows {
+            self.visit_inner_matches(inner_name, probe, outer_row, &prepared, |inner_row| {
+                let mut row = Vec::with_capacity(outer_row.len().saturating_add(inner_row.len()));
+                row.extend_from_slice(outer_row);
+                row.extend_from_slice(inner_row);
+                joined.push(row);
+                Ok(())
+            })?;
+        }
+        finish_rows(
+            joined,
+            &prepared.sort_keys,
+            limit,
+            &prepared.output_indexes,
+            prepared.output_names,
+        )
+    }
+
+    /// Probe `probe` for one outer row and visit each inner match in insertion order.
+    ///
+    /// A NULL outer key produces no candidates. The full `ON` and `WHERE` still
+    /// run on every candidate the index returns.
+    fn visit_inner_matches(
+        &mut self,
+        inner_name: &str,
+        probe: &IndexProbe,
+        outer_row: &[Value],
+        prepared: &PreparedJoin,
+        mut visit: impl FnMut(&[Value]) -> Result<(), DbError>,
+    ) -> Result<(), DbError> {
+        let key = match outer_row.get(probe.outer_ordinal) {
+            Some(Value::Integer(key)) => *key,
+            Some(Value::Null) => return Ok(()),
+            Some(other) => {
+                return Err(DbError::Internal(format!(
+                    "indexed join key is {other}, not an integer"
+                )));
+            }
+            None => {
+                return Err(DbError::Internal(
+                    "indexed join key is outside the outer row".to_string(),
+                ));
+            }
+        };
+        let positions = self.indexed_positions(
+            inner_name,
+            &probe.index,
+            probe.inner_ordinal,
+            Some(key),
+            None,
+            None,
+        )?;
+        let table = self.table(inner_name)?;
+        for position in positions {
+            let Some(inner_row) = table.rows().get(position) else {
+                return Err(DbError::Internal(format!(
+                    "index position {position} is outside table '{inner_name}'"
+                )));
+            };
+            if !expr::pair_matches(Some(&prepared.on), outer_row, inner_row)? {
+                continue;
+            }
+            if !expr::pair_matches(prepared.filter.as_ref(), outer_row, inner_row)? {
+                continue;
+            }
+            visit(inner_row)?;
+        }
+        Ok(())
     }
 
     fn update(

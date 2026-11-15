@@ -1,22 +1,12 @@
 //! Index-aware `SELECT`, `EXPLAIN`, and agreement with a sequential scan.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use rustdb::{Database, StatementResult, Value};
 
-fn temporary(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "rustdb-m6-{label}-{}-{}-{n}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+#[path = "support/temp_dir.rs"]
+mod temp_dir;
+
+fn temporary(label: &str) -> (temp_dir::KeepDir, std::path::PathBuf) {
+    let dir = temp_dir::KeepDir::new(label);
     let path = dir.join("db");
     (dir, path)
 }
@@ -62,7 +52,7 @@ fn text(value: &Value) -> String {
     }
 }
 
-fn open_pair() -> (std::path::PathBuf, Database, std::path::PathBuf, Database) {
+fn open_pair() -> (temp_dir::KeepDir, Database, temp_dir::KeepDir, Database) {
     let (indexed_dir, indexed_path) = temporary("indexed");
     let (plain_dir, plain_path) = temporary("plain");
     let mut indexed = Database::open(&indexed_path).unwrap();

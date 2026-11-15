@@ -4,6 +4,9 @@ use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 
+#[path = "support/temp_dir.rs"]
+mod temp_dir;
+
 /// One test at a time. `flock` survives `fork` until the child execs, so a
 /// sibling `Command::spawn` can keep another test's lock after that test
 /// drops its database.
@@ -49,16 +52,7 @@ fn child_stderr(child: &mut Child) -> String {
 #[test]
 fn a_second_process_cannot_open_a_locked_database() {
     let _gate = one_test_at_a_time();
-    let dir = std::env::temp_dir().join(format!(
-        "rustdb-lock-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = temp_dir::KeepDir::new("lock-second");
     let path = dir.join("db");
     drop(rustdb::Database::open(&path).unwrap());
 
@@ -87,16 +81,7 @@ fn a_second_process_cannot_open_a_locked_database() {
 #[test]
 fn a_second_open_in_this_process_is_rejected_and_the_lock_file_stays() {
     let _gate = one_test_at_a_time();
-    let dir = std::env::temp_dir().join(format!(
-        "rustdb-lock-same-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = temp_dir::KeepDir::new("lock-same");
     let path = dir.join("db");
     let database = rustdb::Database::open(&path).unwrap();
     for _ in 0..30 {
@@ -120,16 +105,7 @@ fn a_second_open_in_this_process_is_rejected_and_the_lock_file_stays() {
 #[test]
 fn migration_waits_behind_an_open_database() {
     let _gate = one_test_at_a_time();
-    let dir = std::env::temp_dir().join(format!(
-        "rustdb-lock-migrate-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = temp_dir::KeepDir::new("lock-migrate");
     let path = dir.join("db");
     let database = rustdb::Database::open(&path).unwrap();
     let error = rustdb::Database::migrate(&path).unwrap_err();
@@ -147,16 +123,7 @@ fn migration_waits_behind_an_open_database() {
 #[test]
 fn renaming_the_database_file_keeps_the_other_process_lock() {
     let _gate = one_test_at_a_time();
-    let dir = std::env::temp_dir().join(format!(
-        "rustdb-lock-rename-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = temp_dir::KeepDir::new("lock-rename");
     let path = dir.join("db");
     drop(rustdb::Database::open(&path).unwrap());
 
@@ -188,16 +155,7 @@ fn renaming_the_database_file_keeps_the_other_process_lock() {
 #[test]
 fn a_child_that_has_execed_does_not_keep_the_lock() {
     let _gate = one_test_at_a_time();
-    let dir = std::env::temp_dir().join(format!(
-        "rustdb-lock-exec-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = temp_dir::KeepDir::new("lock-exec");
     let path = dir.join("db");
     let database = rustdb::Database::open(&path).unwrap();
     let mut child = Command::new("sleep").arg("30").spawn().unwrap();

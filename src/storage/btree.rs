@@ -153,6 +153,12 @@ pub(crate) fn delete(
 }
 
 /// Row ids for one integer key, in row-id order.
+///
+/// A right sibling that this scan follows must point back, and the keys must
+/// stay strictly ordered across that boundary. A chain that ends before the
+/// tree's rightmost leaf is corrupt, so a broken link cannot truncate the
+/// result. Leaves this scan does not visit are not checked here. Open walks
+/// the whole tree.
 pub(crate) fn find_equal(store: &mut dyn Nodes, root: u32, key: i64) -> Result<Vec<u64>, DbError> {
     let mut out = Vec::new();
     if root == 0 {
@@ -175,10 +181,10 @@ pub(crate) fn find_equal(store: &mut dyn Nodes, root: u32, key: i64) -> Result<V
                 break;
             }
         }
-        if passed || leaf.right == 0 {
-            break;
+        match advance_leaf(store, root, leaf_id, &leaf, passed)? {
+            Some(next) => leaf_id = next,
+            None => break,
         }
-        leaf_id = leaf.right;
     }
     Ok(out)
 }
@@ -216,12 +222,45 @@ pub(crate) fn find_range(
             }
             out.push(*entry);
         }
-        if passed || leaf.right == 0 {
-            break;
+        match advance_leaf(store, root, leaf_id, &leaf, passed)? {
+            Some(next) => leaf_id = next,
+            None => break,
         }
-        leaf_id = leaf.right;
     }
     Ok(out)
+}
+
+/// The next leaf, or `None` when this leaf finishes the scan.
+///
+/// `passed` means the caller already saw a key past the requested range, so
+/// the right sibling is not part of the result and is not inspected.
+fn advance_leaf(
+    store: &mut dyn Nodes,
+    root: u32,
+    leaf_id: u32,
+    leaf: &Leaf,
+    passed: bool,
+) -> Result<Option<u32>, DbError> {
+    if passed {
+        return Ok(None);
+    }
+    if leaf.right == 0 {
+        if rightmost_leaf(store, root)? != leaf_id {
+            return Err(corrupt(leaf_id));
+        }
+        return Ok(None);
+    }
+    let next_id = leaf.right;
+    let next = decode_leaf(&store.read_node(next_id)?)?;
+    require_strict_order(&next, next_id)?;
+    if next.left != leaf_id {
+        return Err(corrupt(next_id));
+    }
+    match (leaf.entries.last(), next.entries.first()) {
+        (Some(last), Some(first)) if cmp_entry(*last, *first) == Ordering::Less => {}
+        _ => return Err(corrupt(next_id)),
+    }
+    Ok(Some(next_id))
 }
 
 /// Minimum and maximum integer keys, or `None` when the tree is empty.
@@ -799,6 +838,11 @@ fn leftmost_leaf(store: &mut dyn Nodes, root: u32) -> Result<u32, DbError> {
     Err(corrupt(root))
 }
 
+#[cfg(test)]
+pub(crate) fn leftmost_leaf_id(store: &mut dyn Nodes, root: u32) -> Result<u32, DbError> {
+    leftmost_leaf(store, root)
+}
+
 fn require_strict_order(leaf: &Leaf, leaf_id: u32) -> Result<(), DbError> {
     let mut previous = None;
     for entry in &leaf.entries {
@@ -1328,6 +1372,24 @@ mod tests {
             model.remove(&(-7, row));
         }
         assert_tree(&mut store, root, &model, production());
+    }
+
+    #[test]
+    fn a_broken_sibling_does_not_return_part_of_a_duplicate_run() {
+        let mut store = Mem::new();
+        let mut root = 0;
+        for row in 1..=300 {
+            root = insert(&mut store, root, 7, row, production()).unwrap();
+        }
+        root = insert(&mut store, root, 8, 301, production()).unwrap();
+        assert_eq!(find_equal(&mut store, root, 7).unwrap().len(), 300);
+        let left = leftmost_leaf(&mut store, root).unwrap();
+        let mut page = store.read_node(left).unwrap();
+        crate::storage::page::set_next_page(&mut page, 0);
+        store.write_node(left, page).unwrap();
+        let error = find_equal(&mut store, root, 7).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(find_equal(&mut store, root, 8).unwrap(), vec![301]);
     }
 
     #[test]

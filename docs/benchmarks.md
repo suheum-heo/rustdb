@@ -242,6 +242,36 @@ The same harness was run immediately before and after that copy change. The tabl
 
 The 4,000-row identity still copies 288,000 bytes after the change because only one of the two equal inputs is copied; before the change that case copied 576,000 bytes. Result bytes stayed 7,200, 72,000, and 288,000. From 1,000 to 4,000 rows the pair count grows by 16× and the later warm time grows from 6,673 µs to 93,058 µs, about 14×. That is the `N × M` term. Halving the copied input does not move the time in a consistent direction: the 4,000-row warm sample went from 90,669 µs to 93,058 µs. Pair evaluation dominates the copy. Nothing in these numbers is an index lookup.
 
+## Milestone 8 index nested-loop join
+
+Measured on 14 November 2026. The database is a file. Rows are loaded, the file is migrated, and the nested-loop samples run before `CREATE INDEX idx_rhs_id ON rhs(id)`. The index samples run after that statement. Index build time is not included. Each input is `lhs (id INT, note INT)` and `rhs (id INT, note INT)`. Identity rows use `id = note = 0..N-1` on both sides, so the join returns `N` rows. The duplicate shape sets each right id to `id % 50`. Keys `0..49` match, and the other left keys match nothing. Both shapes return `N` rows. The timed statement is `SELECT lhs.id, rhs.note FROM lhs JOIN rhs ON lhs.id = rhs.id`. The checksum is the sum of the returned left ids, and the run checks that both paths produce it. `std::hint::black_box` consumes that sum and the row count.
+
+```bash
+cargo test --release --test milestone8 profile_index_nested_loop_join -- --ignored --nocapture
+```
+
+| Item | Value |
+| --- | --- |
+| Machine | Apple M5, 16 GiB RAM (`hw.memsize` 17,179,869,184), `arm64` |
+| Compiler | `rustc 1.100.0 (0ef1bc386 2026-11-09)` |
+| Build | `cargo test --release --offline --test milestone8 profile_index_nested_loop_join -- --ignored --nocapture` |
+| Algorithm | Nested loop, then one equality probe per outer row. No cost comparison. |
+
+The warm time is the median of five repeats. The cold time is the first sample. Speedup is nested warm divided by index warm. Result bytes are the returned rows, `matches × 72`. Both paths copy one input of `N` rows before comparing. These counts are not process RSS.
+
+| Shape | N | Pairs | Matches | Nested cold | Nested warm | Index cold | Index warm | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| identity | 100 | 10,000 | 100 | 428 µs | 111 µs | 196 µs | 76 µs | 1.46× |
+| duplicate | 100 | 10,000 | 100 | 193 µs | 112 µs | 262 µs | 98 µs | 1.14× |
+| identity | 1,000 | 1,000,000 | 1,000 | 9,490 µs | 8,735 µs | 1,077 µs | 805 µs | 10.85× |
+| duplicate | 1,000 | 1,000,000 | 1,000 | 8,493 µs | 6,558 µs | 1,160 µs | 904 µs | 7.25× |
+| identity | 4,000 | 16,000,000 | 4,000 | 108,798 µs | 98,952 µs | 3,627 µs | 2,966 µs | 33.36× |
+| duplicate | 4,000 | 16,000,000 | 4,000 | 101,350 µs | 97,905 µs | 4,380 µs | 3,750 µs | 26.11× |
+| identity | 10,000 | 100,000,000 | 10,000 | 616,276 µs | 622,670 µs | 10,341 µs | 7,982 µs | 78.01× |
+| duplicate | 10,000 | 100,000,000 | 10,000 | 639,049 µs | 614,805 µs | 12,746 µs | 11,404 µs | 53.91× |
+
+From 1,000 to 10,000 identity rows the pair count grows by 100× and the nested warm time grows from 8,735 µs to 622,670 µs, about 71×. The index warm time grows from 805 µs to 7,982 µs, about 10×, which tracks the outer row count rather than `N × M`. Both shapes return `N` rows. On this run the index warm time is lower at every measured point, including 100 identity rows (76 µs against 111 µs). An earlier run on this machine measured that same 100-row identity case at 125 µs against 99 µs, a 0.79× speedup. The planner still chooses the index. There is no cost model.
+
 ## Limitations
 
 - One machine and one load per size in each session. The five scan, update, and insert samples are repeats on that same file, so they share cache and allocator state.
@@ -255,3 +285,4 @@ The 4,000-row identity still copies 288,000 bytes after the change because only 
 - The standalone tree times use an in-memory page map. They do not include the pager, the redo log, or `fsync`.
 - The Milestone 6 tables are one release run each. The warm time is the median of nine repeats on one open file. The cold time is one sample after clearing the pager cache. A sequential `SELECT` does not read heap pages, because open has already loaded the heap into memory. The later `all` plan still reads the index endpoints on the cold sample before scanning memory.
 - The Milestone 7 rows are two release runs on one in-memory database, taken immediately before and after the scan stopped copying both inputs. The warm time is the median of five repeats. The cold time is the first sample. The copied-byte column counts the row vectors that the scan clones. It is not process RSS. The join does not read an index, so the pair count is `N × M` for every shape. The 4,000-row times differ by a few percent between the runs; that spread is larger than the cost of the removed copy.
+- The Milestone 8 rows are one release run on a file database, retaken after the sibling-link check. The nested-loop samples run before the index exists. The index samples run after `CREATE INDEX`, with the tree in the pager cache after the cold sample. The warm time is the median of five repeats. The cold time is the first sample. Both paths are checked against the same checksum. On this run the index is faster at every measured point. An earlier run on the same machine measured the 100-row identity join slower on the index path (125 µs against 99 µs).

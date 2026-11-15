@@ -1,10 +1,15 @@
-//! Access paths for a single-table `SELECT`.
+//! Access paths for `SELECT`.
 //!
 //! This is not a cost-based optimizer. An integer comparison, or an `AND` of
 //! comparisons on one indexed column, may become an index scan. The original
 //! `WHERE` is still evaluated on every candidate. `OR`, `IS NULL`, `IS NOT
 //! NULL`, and any predicate that is not an integer comparison stay a sequential
 //! scan. A predicate that contains `OR` anywhere is a sequential scan.
+//!
+//! A two-table `INNER JOIN` uses the same rule for `OR`. It probes an integer
+//! index on the inner table only when `ON` contains an equality between an
+//! outer integer column and that indexed column. The original `ON` stays the
+//! residual predicate. Anything else is a nested loop.
 //!
 //! A range also stays a sequential scan when it covers every `i64`, or every
 //! key currently stored in the chosen index. That decision uses the predicate
@@ -15,7 +20,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{BinOp, Expr};
-use crate::value::Value;
+use crate::value::{DataType, Value};
 
 /// One integer index the planner may use.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +173,156 @@ pub(crate) fn choose(table: &str, selection: Option<&Expr>, indexes: &[IndexChoi
         },
         None => AccessPath::SeqScan,
     }
+}
+
+/// How an `INNER JOIN` finds candidate pairs.
+///
+/// [`JoinAccess::IndexNestedLoop`] still evaluates the original `ON`. `residual`
+/// is that text when `ON` is wider than the equality used for the probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JoinAccess {
+    /// Compare every outer row with every inner row.
+    NestedLoop,
+    /// For each outer row, look up one integer key in an inner index.
+    IndexNestedLoop {
+        /// Index that supplies the inner candidates.
+        name: String,
+        /// Schema position of the indexed inner column.
+        inner_ordinal: usize,
+        /// Schema position of the outer join key.
+        outer_ordinal: usize,
+        /// The equality that supplies the probe key.
+        predicate: String,
+        /// Original `ON` text when it is not exactly `predicate`.
+        residual: Option<String>,
+    },
+}
+
+/// Pick a join path. There is no cost comparison.
+///
+/// An equality wins only when one side is an outer integer column and the
+/// other is an inner column that has an index. Reversed operands are the same
+/// equality. `AND` may hide that equality among other predicates. The earliest
+/// matching index in `indexes` wins, and `indexes` is catalog order. `OR`
+/// anywhere, a missing index, a non-equality, or a comparison that is not
+/// between those two sides stays a nested loop.
+pub(crate) fn choose_join(
+    outer_alias: &str,
+    outer_columns: &[(String, DataType)],
+    inner_alias: &str,
+    inner_columns: &[(String, DataType)],
+    on: &Expr,
+    indexes: &[IndexChoice],
+) -> JoinAccess {
+    if indexes.is_empty() || contains_or(on) {
+        return JoinAccess::NestedLoop;
+    }
+    let mut atoms = Vec::new();
+    flatten_and(on, &mut atoms);
+    let mut probes = Vec::new();
+    for atom in atoms {
+        let Some((outer_ordinal, inner_ordinal)) =
+            equijoin_ordinals(atom, outer_alias, outer_columns, inner_alias, inner_columns)
+        else {
+            continue;
+        };
+        let Some(index_pos) = indexes
+            .iter()
+            .position(|index| index.ordinal == inner_ordinal)
+        else {
+            continue;
+        };
+        probes.push((index_pos, outer_ordinal, atom));
+    }
+    let Some((index_pos, outer_ordinal, atom)) =
+        probes.iter().min_by_key(|(index_pos, _, _)| *index_pos)
+    else {
+        return JoinAccess::NestedLoop;
+    };
+    let index = &indexes[*index_pos];
+    let predicate = atom.render();
+    let residual = if predicate == on.render() {
+        None
+    } else {
+        Some(on.render())
+    };
+    JoinAccess::IndexNestedLoop {
+        name: index.name.clone(),
+        inner_ordinal: index.ordinal,
+        outer_ordinal: *outer_ordinal,
+        predicate,
+        residual,
+    }
+}
+
+fn equijoin_ordinals(
+    expr: &Expr,
+    outer_alias: &str,
+    outer_columns: &[(String, DataType)],
+    inner_alias: &str,
+    inner_columns: &[(String, DataType)],
+) -> Option<(usize, usize)> {
+    let Expr::Binary {
+        left,
+        op: BinOp::Eq,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    let left = column_side(left, outer_alias, outer_columns, inner_alias, inner_columns)?;
+    let right = column_side(
+        right,
+        outer_alias,
+        outer_columns,
+        inner_alias,
+        inner_columns,
+    )?;
+    match (left, right) {
+        (ColumnSide::Outer(outer), ColumnSide::Inner(inner))
+        | (ColumnSide::Inner(inner), ColumnSide::Outer(outer)) => Some((outer, inner)),
+        (ColumnSide::Outer(_), ColumnSide::Outer(_))
+        | (ColumnSide::Inner(_), ColumnSide::Inner(_)) => None,
+    }
+}
+
+enum ColumnSide {
+    Outer(usize),
+    Inner(usize),
+}
+
+fn column_side(
+    expr: &Expr,
+    outer_alias: &str,
+    outer_columns: &[(String, DataType)],
+    inner_alias: &str,
+    inner_columns: &[(String, DataType)],
+) -> Option<ColumnSide> {
+    let Expr::Column { name, qualifier } = expr else {
+        return None;
+    };
+    if let Some(qualifier) = qualifier {
+        if qualifier == outer_alias {
+            return integer_ordinal(outer_columns, name).map(ColumnSide::Outer);
+        }
+        if qualifier == inner_alias {
+            return integer_ordinal(inner_columns, name).map(ColumnSide::Inner);
+        }
+        return None;
+    }
+    match (
+        integer_ordinal(outer_columns, name),
+        integer_ordinal(inner_columns, name),
+    ) {
+        (Some(outer), None) => Some(ColumnSide::Outer(outer)),
+        (None, Some(inner)) => Some(ColumnSide::Inner(inner)),
+        (Some(_), Some(_)) | (None, None) => None,
+    }
+}
+
+fn integer_ordinal(columns: &[(String, DataType)], name: &str) -> Option<usize> {
+    let index = columns.iter().position(|(column, _)| column == name)?;
+    (columns[index].1 == DataType::Integer).then_some(index)
 }
 
 #[derive(Default)]
@@ -486,6 +641,167 @@ mod tests {
                 high: None,
             },
             None
+        ));
+    }
+
+    fn qualified(table: &str, name: &str) -> Expr {
+        Expr::Column {
+            name: name.to_string(),
+            qualifier: Some(table.to_string()),
+        }
+    }
+
+    struct JoinTables {
+        outer: Vec<(String, DataType)>,
+        inner: Vec<(String, DataType)>,
+    }
+
+    fn users_and_orders() -> JoinTables {
+        JoinTables {
+            outer: vec![
+                ("id".to_string(), DataType::Integer),
+                ("name".to_string(), DataType::Text),
+            ],
+            inner: vec![
+                ("id".to_string(), DataType::Integer),
+                ("user_id".to_string(), DataType::Integer),
+                ("total".to_string(), DataType::Integer),
+            ],
+        }
+    }
+
+    fn order_indexes() -> Vec<IndexChoice> {
+        vec![
+            IndexChoice {
+                name: "idx_orders_id".to_string(),
+                column: "id".to_string(),
+                ordinal: 0,
+            },
+            IndexChoice {
+                name: "idx_orders_user".to_string(),
+                column: "user_id".to_string(),
+                ordinal: 1,
+            },
+        ]
+    }
+
+    fn join_path(on: &Expr, indexes: &[IndexChoice]) -> JoinAccess {
+        let tables = users_and_orders();
+        choose_join("users", &tables.outer, "orders", &tables.inner, on, indexes)
+    }
+
+    #[test]
+    fn join_equality_uses_the_inner_index_in_catalog_order() {
+        let on = binary(
+            qualified("users", "id"),
+            BinOp::Eq,
+            qualified("orders", "user_id"),
+        );
+        match join_path(&on, &order_indexes()) {
+            JoinAccess::IndexNestedLoop {
+                name,
+                inner_ordinal,
+                outer_ordinal,
+                predicate,
+                residual,
+            } => {
+                assert_eq!(name, "idx_orders_user");
+                assert_eq!(inner_ordinal, 1);
+                assert_eq!(outer_ordinal, 0);
+                assert_eq!(predicate, "users.id = orders.user_id");
+                assert_eq!(residual, None);
+            }
+            JoinAccess::NestedLoop => panic!("expected an index nested loop"),
+        }
+
+        let reversed = binary(
+            qualified("orders", "user_id"),
+            BinOp::Eq,
+            qualified("users", "id"),
+        );
+        assert!(matches!(
+            join_path(&reversed, &order_indexes()),
+            JoinAccess::IndexNestedLoop { name, .. } if name == "idx_orders_user"
+        ));
+
+        let both = binary(
+            binary(
+                qualified("users", "id"),
+                BinOp::Eq,
+                qualified("orders", "id"),
+            ),
+            BinOp::And,
+            binary(
+                qualified("users", "id"),
+                BinOp::Eq,
+                qualified("orders", "user_id"),
+            ),
+        );
+        match join_path(&both, &order_indexes()) {
+            JoinAccess::IndexNestedLoop { name, residual, .. } => {
+                assert_eq!(name, "idx_orders_id");
+                assert_eq!(
+                    residual.as_deref(),
+                    Some("users.id = orders.id AND users.id = orders.user_id")
+                );
+            }
+            JoinAccess::NestedLoop => panic!("expected the earlier index"),
+        }
+    }
+
+    #[test]
+    fn join_without_a_safe_equality_scans_both_tables() {
+        let tables = users_and_orders();
+        let indexes = order_indexes();
+        let or = binary(
+            binary(
+                qualified("users", "id"),
+                BinOp::Eq,
+                qualified("orders", "user_id"),
+            ),
+            BinOp::Or,
+            binary(qualified("orders", "total"), BinOp::Gt, integer(10)),
+        );
+        assert!(matches!(
+            choose_join(
+                "users",
+                &tables.outer,
+                "orders",
+                &tables.inner,
+                &or,
+                &indexes
+            ),
+            JoinAccess::NestedLoop
+        ));
+
+        let range = binary(
+            qualified("orders", "user_id"),
+            BinOp::Gt,
+            qualified("users", "id"),
+        );
+        assert!(matches!(
+            join_path(&range, &indexes),
+            JoinAccess::NestedLoop
+        ));
+        let nulls = Expr::IsNull(Box::new(qualified("orders", "user_id")));
+        assert!(matches!(
+            join_path(&nulls, &indexes),
+            JoinAccess::NestedLoop
+        ));
+        let equality = binary(
+            qualified("users", "id"),
+            BinOp::Eq,
+            qualified("orders", "user_id"),
+        );
+        assert!(matches!(join_path(&equality, &[]), JoinAccess::NestedLoop));
+        let id_only = [IndexChoice {
+            name: "idx_orders_id".to_string(),
+            column: "id".to_string(),
+            ordinal: 0,
+        }];
+        assert!(matches!(
+            join_path(&equality, &id_only),
+            JoinAccess::NestedLoop
         ));
     }
 }
