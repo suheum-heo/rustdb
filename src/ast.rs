@@ -62,24 +62,32 @@ pub(crate) enum Statement {
         selection: Option<Expr>,
     },
     /// A `SELECT` from one table, or an `INNER JOIN` of two tables.
-    Select {
-        /// Input tables.
-        from: QueryFrom,
-        /// Output columns.
-        projection: Projection,
-        /// Optional filter. Absent means every joined row. Applied after `ON`
-        /// and before grouping.
-        selection: Option<Expr>,
-        /// Grouping columns. Empty means no `GROUP BY`.
-        group_by: Vec<SelectColumn>,
-        /// Sort keys. Empty means insertion order, or first-seen group order
-        /// for an aggregate query.
-        order_by: Vec<OrderKey>,
-        /// Maximum rows after filtering and sorting.
-        limit: Option<u64>,
-    },
+    ///
+    /// Boxed so the query tree does not inflate every other statement.
+    Select(Box<SelectQuery>),
     /// `EXPLAIN` of one `SELECT`. The query is planned and not executed.
     Explain(Box<Statement>),
+}
+
+/// One `SELECT`, including grouping and `HAVING`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectQuery {
+    /// Input tables.
+    pub(crate) from: QueryFrom,
+    /// Output columns.
+    pub(crate) projection: Projection,
+    /// Optional filter. Absent means every joined row. Applied after `ON`
+    /// and before grouping.
+    pub(crate) selection: Option<Expr>,
+    /// Grouping columns. Empty means no `GROUP BY`.
+    pub(crate) group_by: Vec<SelectColumn>,
+    /// Filter applied to each completed group. Absent means every group.
+    pub(crate) having: Option<Expr>,
+    /// Sort keys. Empty means insertion order, or first-seen group order
+    /// for an aggregate query.
+    pub(crate) order_by: Vec<OrderKey>,
+    /// Maximum rows after filtering and sorting.
+    pub(crate) limit: Option<u64>,
 }
 
 /// The `FROM` clause of a `SELECT`.
@@ -235,7 +243,7 @@ impl SelectColumn {
     }
 }
 
-/// A scalar expression that can appear in `WHERE` or `VALUES`.
+/// A scalar expression that can appear in `WHERE`, `HAVING`, or `VALUES`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Expr {
     /// A constant.
@@ -262,6 +270,9 @@ pub(crate) enum Expr {
     IsNull(Box<Expr>),
     /// `IS NOT NULL`.
     IsNotNull(Box<Expr>),
+    /// `COUNT` or `SUM`. Produced for `HAVING`. A select-list aggregate stays
+    /// a [`SelectItem`].
+    Aggregate(AggregateCall),
 }
 
 /// Operators supported in `WHERE`.
@@ -331,6 +342,7 @@ fn write_expr(expr: &Expr, parent: u8, out: &mut String) {
             out.push(' ');
             write_expr(right, mine.saturating_add(1), out);
         }
+        Expr::Aggregate(call) => out.push_str(&call.render()),
     }
     if mine < parent {
         out.push(')');
@@ -343,7 +355,7 @@ fn expr_precedence(expr: &Expr) -> u8 {
         Expr::Binary { op: BinOp::And, .. } => 2,
         Expr::Not(_) => 3,
         Expr::Binary { .. } | Expr::IsNull(_) | Expr::IsNotNull(_) => 4,
-        Expr::Literal(_) | Expr::Column { .. } => 5,
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Aggregate(_) => 5,
     }
 }
 

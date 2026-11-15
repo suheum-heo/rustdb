@@ -20,7 +20,7 @@ use sqlparser::parser::Parser;
 
 use crate::ast::{
     AggregateArg, AggregateCall, AggregateFunction, Assignment, BinOp, Expr, OrderKey, OrderTarget,
-    Projection, QueryFrom, SelectColumn, SelectItem, Statement, TableRef,
+    Projection, QueryFrom, SelectColumn, SelectItem, SelectQuery, Statement, TableRef,
 };
 use crate::error::DbError;
 use crate::schema::Column;
@@ -132,7 +132,7 @@ fn convert_explain(input: ExplainInput) -> Result<Statement, DbError> {
         return Err(DbError::unsupported("EXPLAIN options are not supported"));
     }
     let inner = convert_statement(*input.statement)?;
-    if !matches!(inner, Statement::Select { .. }) {
+    if !matches!(inner, Statement::Select(_)) {
         return Err(DbError::unsupported("EXPLAIN is only supported for SELECT"));
     }
     Ok(Statement::Explain(Box::new(inner)))
@@ -545,30 +545,16 @@ fn convert_select(
         .map(|expr| convert_expr_in(expr, Some("WHERE")))
         .transpose()?;
     let group_by = convert_group_by(&select.group_by)?;
-    if matches!(table, QueryFrom::Join { .. })
-        && (!group_by.is_empty() || projection_has_aggregate(&projection))
-    {
-        return Err(DbError::unsupported(
-            "aggregates over JOIN are not supported",
-        ));
-    }
-    Ok(Statement::Select {
+    let having = select.having.as_ref().map(convert_having).transpose()?;
+    Ok(Statement::Select(Box::new(SelectQuery {
         from: table,
         projection,
         selection,
         group_by,
+        having,
         order_by,
         limit,
-    })
-}
-
-fn projection_has_aggregate(projection: &Projection) -> bool {
-    match projection {
-        Projection::All | Projection::QualifiedAll { .. } => false,
-        Projection::Columns(items) => items
-            .iter()
-            .any(|item| matches!(item, SelectItem::Aggregate(_))),
-    }
+    })))
 }
 
 fn reject_select_clauses(select: &Select) -> Result<(), DbError> {
@@ -580,9 +566,6 @@ fn reject_select_clauses(select: &Select) -> Result<(), DbError> {
     }
     if !matches!(select.flavor, SelectFlavor::Standard) {
         return Err(DbError::unsupported("this SELECT syntax is not supported"));
-    }
-    if select.having.is_some() {
-        return Err(DbError::unsupported("HAVING is not supported"));
     }
     if select.qualify.is_some() {
         return Err(DbError::unsupported("QUALIFY is not supported"));
@@ -953,6 +936,41 @@ fn function_name(name: &ObjectName) -> Result<String, DbError> {
 
 fn convert_expr(expr: &SqlExpr) -> Result<Expr, DbError> {
     convert_expr_in(expr, None)
+}
+
+fn convert_having(expr: &SqlExpr) -> Result<Expr, DbError> {
+    match expr {
+        SqlExpr::Nested(inner) => convert_having(inner),
+        SqlExpr::Identifier(ident) => Ok(Expr::Column {
+            name: normalize_ident(ident),
+            qualifier: None,
+        }),
+        SqlExpr::CompoundIdentifier(parts) => convert_compound(parts),
+        SqlExpr::Value(value) => convert_literal(&value.value),
+        SqlExpr::UnaryOp { op, expr } => match op {
+            UnaryOperator::Plus | UnaryOperator::Minus => convert_unary(*op, expr, Some("HAVING")),
+            UnaryOperator::Not => Ok(Expr::Not(Box::new(convert_having(expr)?))),
+            _ => Err(DbError::unsupported("this unary operator is not supported")),
+        },
+        SqlExpr::BinaryOp { left, op, right } => Ok(Expr::Binary {
+            left: Box::new(convert_having(left)?),
+            op: convert_operator(op)?,
+            right: Box::new(convert_having(right)?),
+        }),
+        SqlExpr::IsNull(inner) => Ok(Expr::IsNull(Box::new(convert_having(inner)?))),
+        SqlExpr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(convert_having(inner)?))),
+        SqlExpr::Between { .. } => Err(DbError::unsupported("BETWEEN is not supported")),
+        SqlExpr::Like { .. } | SqlExpr::ILike { .. } => {
+            Err(DbError::unsupported("LIKE is not supported"))
+        }
+        SqlExpr::In { .. } => Err(DbError::unsupported("IN is not supported")),
+        SqlExpr::Function(_) => match aggregate_call(expr)? {
+            Some(call) => Ok(Expr::Aggregate(call)),
+            None => Err(DbError::unsupported("function calls are not supported")),
+        },
+        SqlExpr::Subquery(_) => Err(DbError::unsupported("subqueries are not supported")),
+        _ => Err(DbError::unsupported("this expression is not supported")),
+    }
 }
 
 fn convert_expr_in(expr: &SqlExpr, clause: Option<&str>) -> Result<Expr, DbError> {
@@ -1333,27 +1351,22 @@ mod tests {
             parse("SELECT Name FROM Users WHERE Age >= 25 AND active = TRUE;").unwrap();
         assert_eq!(statements.len(), 1);
         match &statements[0] {
-            Statement::Select {
-                from,
-                projection,
-                selection,
-                ..
-            } => {
+            Statement::Select(query) => {
                 assert_eq!(
-                    from,
+                    &query.from,
                     &QueryFrom::Table(TableRef {
                         name: "users".to_string(),
                         alias: "users".to_string(),
                     })
                 );
                 assert_eq!(
-                    projection,
+                    &query.projection,
                     &Projection::Columns(vec![SelectItem::Column(SelectColumn {
                         name: "name".to_string(),
                         qualifier: None,
                     })])
                 );
-                assert!(selection.is_some());
+                assert!(query.selection.is_some());
             }
             other => panic!("expected select, got {other:?}"),
         }
@@ -1388,18 +1401,16 @@ mod tests {
         let statements =
             parse("SELECT name FROM users ORDER BY age DESC, name ASC LIMIT 5;").unwrap();
         match &statements[0] {
-            Statement::Select {
-                order_by, limit, ..
-            } => {
-                assert_eq!(order_by.len(), 2);
-                let OrderTarget::Column(column) = &order_by[0].target else {
+            Statement::Select(query) => {
+                assert_eq!(query.order_by.len(), 2);
+                let OrderTarget::Column(column) = &query.order_by[0].target else {
                     panic!("expected a column");
                 };
                 assert_eq!(column.name, "age");
-                assert!(!order_by[0].ascending);
-                assert!(order_by[1].ascending);
-                assert_eq!(order_by[0].nulls_first, None);
-                assert_eq!(*limit, Some(5));
+                assert!(!query.order_by[0].ascending);
+                assert!(query.order_by[1].ascending);
+                assert_eq!(query.order_by[0].nulls_first, None);
+                assert_eq!(query.limit, Some(5));
             }
             other => panic!("expected select, got {other:?}"),
         }
@@ -1417,18 +1428,17 @@ mod tests {
             parse("SELECT u.name, o.total FROM users AS u JOIN orders o ON u.id = o.user_id;")
                 .unwrap();
         match &statements[0] {
-            Statement::Select {
-                from: QueryFrom::Join { outer, inner, on },
-                projection,
-                ..
-            } => {
+            Statement::Select(query) => {
+                let QueryFrom::Join { outer, inner, on } = &query.from else {
+                    panic!("expected a join");
+                };
                 assert_eq!(outer.name, "users");
                 assert_eq!(outer.alias, "u");
                 assert_eq!(inner.name, "orders");
                 assert_eq!(inner.alias, "o");
                 assert_eq!(on.render(), "u.id = o.user_id");
                 assert_eq!(
-                    projection,
+                    &query.projection,
                     &Projection::Columns(vec![
                         SelectItem::Column(SelectColumn {
                             name: "name".to_string(),

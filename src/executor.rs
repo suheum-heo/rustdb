@@ -6,6 +6,7 @@
 //! database publishes that result only after the statement succeeds.
 //!
 //! `SELECT` applies `WHERE`, then `ORDER BY`, then `LIMIT`, then projection.
+//! An aggregate query groups after `WHERE` and applies `HAVING` before the sort.
 //! An indexed integer comparison on one table may supply candidate rows first.
 //! The original `WHERE` is still applied to those candidates. Sort keys may name
 //! columns that are not in the select list. Equal keys keep the order produced
@@ -13,13 +14,18 @@
 //! unless the query overrides that with `NULLS FIRST` or `NULLS LAST`.
 //! `UPDATE` and `DELETE` still read every row of one table.
 //!
-//! A single-table `SELECT` may group rows. `WHERE` runs first. `COUNT(*)`
-//! counts every remaining row, `COUNT(column)` skips NULL, and `SUM` adds
-//! non-NULL integers with checked arithmetic. An empty input with no
-//! `GROUP BY` returns one row. `GROUP BY` keeps NULL keys in one group and
-//! emits groups in first-seen order. A group hash mixes a type tag with each
-//! key, and a shared fingerprint still compares the stored cells, so unequal
-//! tuples stay apart. `ORDER BY` and `LIMIT` run after that.
+//! A `SELECT` may group rows from one table or from one `INNER JOIN`. `WHERE`
+//! runs first. `COUNT(*)` counts every remaining row, `COUNT(column)` skips
+//! NULL, and `SUM` adds non-NULL integers with checked arithmetic. An empty
+//! input with no `GROUP BY` returns one row. `GROUP BY` keeps NULL keys in one
+//! group and emits groups in first-seen order. A group hash mixes a type tag
+//! with each key, and a shared fingerprint still compares the stored cells, so
+//! unequal tuples stay apart. The same aggregate call shares one accumulator
+//! across the select list, `HAVING`, and `ORDER BY`. `HAVING` then keeps a
+//! group only when it evaluates to TRUE. `ORDER BY` and `LIMIT` run after
+//! that. A joined aggregate consumes each kept pair as it is produced and does
+//! not store the pair. When a hash join builds the outer table, it still
+//! buffers match positions so that first-seen order stays outer-then-inner.
 //!
 //! An `INNER JOIN` walks the outer table in insertion order. For each outer
 //! row it reads inner candidates, then keeps a pair only when `ON` is TRUE.
@@ -111,10 +117,12 @@ struct PreparedSelect {
     path: AccessPath,
 }
 
+#[derive(Clone, Copy)]
 struct SelectTail<'a> {
     projection: &'a Projection,
     selection: Option<&'a Expr>,
     group_by: &'a [SelectColumn],
+    having: Option<&'a Expr>,
     order_by: &'a [OrderKey],
     limit: Option<u64>,
 }
@@ -218,20 +226,16 @@ impl Database {
                 selection,
             } => self.update(&table, &assignments, selection.as_ref()),
             Statement::Delete { table, selection } => self.delete(&table, selection.as_ref()),
-            Statement::Select {
-                from,
-                projection,
-                selection,
-                group_by,
-                order_by,
-                limit,
-            } => self.query(
-                &from,
-                &projection,
-                selection.as_ref(),
-                &group_by,
-                &order_by,
-                limit,
+            Statement::Select(query) => self.query(
+                &query.from,
+                SelectTail {
+                    projection: &query.projection,
+                    selection: query.selection.as_ref(),
+                    group_by: &query.group_by,
+                    having: query.having.as_ref(),
+                    order_by: &query.order_by,
+                    limit: query.limit,
+                },
             ),
             Statement::Explain(inner) => self.explain(inner.as_ref()),
         }
@@ -240,26 +244,13 @@ impl Database {
     fn query(
         &mut self,
         from: &QueryFrom,
-        projection: &Projection,
-        selection: Option<&Expr>,
-        group_by: &[SelectColumn],
-        order_by: &[OrderKey],
-        limit: Option<u64>,
+        tail: SelectTail<'_>,
     ) -> Result<StatementResult, DbError> {
-        let tail = SelectTail {
-            projection,
-            selection,
-            group_by,
-            order_by,
-            limit,
-        };
-        if is_aggregate_query(projection, group_by, order_by) {
-            let QueryFrom::Table(source) = from else {
-                return Err(DbError::unsupported(
-                    "aggregates over JOIN are not supported",
-                ));
+        if is_aggregate_query(tail.projection, tail.group_by, tail.having, tail.order_by) {
+            return match from {
+                QueryFrom::Table(source) => self.aggregate_table(source, tail),
+                QueryFrom::Join { outer, inner, on } => self.aggregate_join(outer, inner, on, tail),
             };
-            return self.aggregate_table(source, tail);
         }
         match from {
             QueryFrom::Table(source) => self.query_table(source, tail),
@@ -328,13 +319,7 @@ impl Database {
         source: &TableRef,
         tail: SelectTail<'_>,
     ) -> Result<StatementResult, DbError> {
-        let mut plan = self.prepare_aggregate(
-            source,
-            tail.projection,
-            tail.selection,
-            tail.group_by,
-            tail.order_by,
-        )?;
+        let mut plan = self.prepare_aggregate(source, tail)?;
         plan.path = self.settle_path(plan.path)?;
         let positions = match &plan.path {
             AccessPath::SeqScan => None,
@@ -342,164 +327,38 @@ impl Database {
         };
         let table = self.table(&source.name)?;
         let grouped = collect_groups(table.rows(), positions.as_deref(), &plan)?;
-        finish_rows(
-            grouped,
-            &plan.sort_keys,
-            tail.limit,
-            &plan.outputs,
-            plan.output_names,
-        )
+        finish_aggregate(grouped, plan, tail.limit)
     }
 
     fn explain_aggregate(
         &mut self,
         source: &TableRef,
-        projection: &Projection,
-        selection: Option<&Expr>,
-        group_by: &[SelectColumn],
-        order_by: &[OrderKey],
+        tail: SelectTail<'_>,
     ) -> Result<StatementResult, DbError> {
-        let mut plan = self.prepare_aggregate(source, projection, selection, group_by, order_by)?;
+        let mut plan = self.prepare_aggregate(source, tail)?;
         plan.path = self.settle_path(plan.path)?;
         let (scan, index, bounds) = plan::describe(&plan.path);
-        let groups = if plan.group_labels.is_empty() {
-            Value::Null
-        } else {
-            Value::Text(plan.group_labels.join(", "))
-        };
-        let aggregates = if plan.aggregate_labels.is_empty() {
-            Value::Null
-        } else {
-            Value::Text(plan.aggregate_labels.join(", "))
-        };
-        let filter = selection
-            .map(|expr| Value::Text(expr.render()))
-            .unwrap_or(Value::Null);
-        Ok(StatementResult::Query(QueryResult {
-            columns: vec![
-                "access".to_string(),
-                "groups".to_string(),
-                "aggregates".to_string(),
-                "scan".to_string(),
-                "index".to_string(),
-                "bounds".to_string(),
-                "filter".to_string(),
-            ],
-            rows: vec![vec![
-                Value::Text(plan.access.clone()),
-                groups,
-                aggregates,
-                scan,
-                index,
-                bounds,
-                filter,
-            ]],
-        }))
+        Ok(StatementResult::Query(aggregate_explain_row(
+            &plan,
+            scan,
+            index,
+            bounds,
+            tail.selection,
+            tail.having,
+        )))
     }
 
     fn prepare_aggregate(
         &self,
         source: &TableRef,
-        projection: &Projection,
-        selection: Option<&Expr>,
-        group_by: &[SelectColumn],
-        order_by: &[OrderKey],
+        tail: SelectTail<'_>,
     ) -> Result<AggPlan, DbError> {
         let indexes = self.index_images().to_vec();
         let table = self.table(&source.name)?;
         let scope = Scope::from_table(table, &source.alias);
-        let filter = bind_optional_where(selection, &scope)?;
-        let mut group_ordinals = Vec::with_capacity(group_by.len());
-        let mut group_labels = Vec::with_capacity(group_by.len());
-        for column in group_by {
-            group_ordinals.push(scope.resolve(column)?);
-            group_labels.push(column.render());
-        }
-        let Projection::Columns(items) = projection else {
-            return Err(DbError::unsupported(
-                "SELECT * is not supported with GROUP BY or aggregates",
-            ));
-        };
-        let mut aggs = Vec::new();
-        let mut outputs = Vec::with_capacity(items.len());
-        let mut output_names = Vec::with_capacity(items.len());
-        let mut aggregate_labels = Vec::new();
-        for item in items {
-            match item {
-                SelectItem::Column(column) => {
-                    let ordinal = scope.resolve(column)?;
-                    let Some(slot) = group_ordinals.iter().position(|group| *group == ordinal)
-                    else {
-                        return Err(DbError::invalid(format!(
-                            "column '{}' must appear in GROUP BY",
-                            column.name
-                        )));
-                    };
-                    let Some(name) = scope.name_at(ordinal) else {
-                        return Err(DbError::Internal(
-                            "group column is outside the table".to_string(),
-                        ));
-                    };
-                    output_names.push(name.to_string());
-                    outputs.push(slot);
-                }
-                SelectItem::Aggregate(call) => {
-                    let slot = bind_aggregate(call, &scope, &mut aggs)?;
-                    aggregate_labels.push(call.render());
-                    output_names.push(call.render());
-                    outputs.push(group_ordinals.len() + slot);
-                }
-            }
-        }
-        let group_width = group_ordinals.len();
-        let mut sort_keys = Vec::with_capacity(order_by.len());
-        for key in order_by {
-            let index = match &key.target {
-                OrderTarget::Column(column) => {
-                    let ordinal = scope.resolve(column)?;
-                    let Some(slot) = group_ordinals.iter().position(|group| *group == ordinal)
-                    else {
-                        return Err(DbError::invalid(format!(
-                            "column '{}' must appear in GROUP BY",
-                            column.name
-                        )));
-                    };
-                    slot
-                }
-                OrderTarget::Aggregate(call) => {
-                    let slot = bind_aggregate(call, &scope, &mut aggs)?;
-                    let label = call.render();
-                    if !aggregate_labels.contains(&label) {
-                        aggregate_labels.push(label);
-                    }
-                    group_width + slot
-                }
-            };
-            sort_keys.push(SortKey {
-                index,
-                ascending: key.ascending,
-                nulls_first: key.nulls_first.unwrap_or(!key.ascending),
-            });
-        }
         let choices = index_choices(table, &indexes)?;
-        let path = plan::choose(&source.alias, selection, &choices);
-        let access = if group_ordinals.is_empty() {
-            "Aggregate"
-        } else {
-            "HashAggregate"
-        };
-        Ok(AggPlan {
-            group_ordinals,
-            group_labels,
-            aggs,
-            outputs,
-            output_names,
-            aggregate_labels,
-            sort_keys,
-            filter,
-            path,
-            access: access.to_string(),
-        })
+        let path = plan::choose(&source.alias, tail.selection, &choices);
+        prepare_groups(&scope, tail, path)
     }
 
     fn query_join(
@@ -554,55 +413,305 @@ impl Database {
                 self.hash_join(outer, inner, keys, prepared, tail.limit)
             }
             JoinAccess::NestedLoop => {
-                // `tables` is one map, so two row slices cannot be borrowed together.
-                // A self-join is the same entry. Copy the smaller input and borrow the
-                // other. The copy is not updated: a join does not write either table.
-                let outer_len = self.table(&outer.name)?.rows().len();
-                let inner_len = self.table(&inner.name)?.rows().len();
-                let copy_inner = outer.name == inner.name || inner_len <= outer_len;
-                if copy_inner {
-                    let inner_rows = self.table(&inner.name)?.rows().to_vec();
-                    let outer_rows = self.table(&outer.name)?.rows();
-                    scan_join(outer_rows, &inner_rows, prepared, tail.limit)
-                } else {
-                    let outer_rows = self.table(&outer.name)?.rows().to_vec();
-                    let inner_rows = self.table(&inner.name)?.rows();
-                    scan_join(&outer_rows, inner_rows, prepared, tail.limit)
-                }
+                self.with_copied_side(outer, inner, |outer_rows, inner_rows, _| {
+                    scan_join(outer_rows, inner_rows, prepared, tail.limit)
+                })
             }
         }
     }
 
+    fn aggregate_join(
+        &mut self,
+        outer: &TableRef,
+        inner: &TableRef,
+        on: &Expr,
+        tail: SelectTail<'_>,
+    ) -> Result<StatementResult, DbError> {
+        let limit = tail.limit;
+        let (plan, prepared) = self.plan_join_aggregate(outer, inner, on, tail)?;
+        let mut sink = GroupSink::new(&plan);
+        self.feed_join(outer, inner, &prepared, &mut sink)?;
+        finish_aggregate(sink.finish()?, plan, limit)
+    }
+
+    fn plan_join_aggregate(
+        &self,
+        outer: &TableRef,
+        inner: &TableRef,
+        on: &Expr,
+        tail: SelectTail<'_>,
+    ) -> Result<(AggPlan, PreparedJoin), DbError> {
+        let outer_columns = Scope::columns(self.table(&outer.name)?);
+        let inner_columns = Scope::columns(self.table(&inner.name)?);
+        let scope = Scope::try_join(
+            &outer.alias,
+            outer_columns.clone(),
+            &inner.alias,
+            inner_columns.clone(),
+        )?;
+        let bound_on = expr::bind_filter(on, &scope, "ON")?;
+        let indexes = self.index_images().to_vec();
+        let choices = index_choices(self.table(&inner.name)?, &indexes)?;
+        let mut path = plan::choose_join(
+            &outer.alias,
+            &outer_columns,
+            &inner.alias,
+            &inner_columns,
+            on,
+            &choices,
+        );
+        #[cfg(test)]
+        if force_nested_join() {
+            path = JoinAccess::NestedLoop;
+        }
+        let outer_len = self.table(&outer.name)?.rows().len();
+        let inner_len = self.table(&inner.name)?.rows().len();
+        path = finish_join_path(path, outer_len, inner_len);
+        let mut plan = prepare_groups(&scope, tail, AccessPath::SeqScan)?;
+        let filter = plan.filter.take();
+        let prepared = PreparedJoin {
+            on: bound_on,
+            filter,
+            sort_keys: Vec::new(),
+            output_indexes: Vec::new(),
+            output_names: Vec::new(),
+            path,
+        };
+        Ok((plan, prepared))
+    }
+
+    fn feed_join(
+        &mut self,
+        outer: &TableRef,
+        inner: &TableRef,
+        prepared: &PreparedJoin,
+        sink: &mut GroupSink<'_>,
+    ) -> Result<(), DbError> {
+        #[cfg(test)]
+        if materialize_aggregate() {
+            let mut pairs = Vec::new();
+            self.visit_join_pairs(outer, inner, prepared, |outer_row, inner_row| {
+                pairs.push(concat_pair(outer_row, inner_row));
+                Ok(())
+            })?;
+            for pair in &pairs {
+                sink.push(InputRow::One(pair))?;
+            }
+            return Ok(());
+        }
+        self.visit_join_pairs(outer, inner, prepared, |outer_row, inner_row| {
+            sink.push(InputRow::Pair(outer_row, inner_row))
+        })
+    }
+
+    fn visit_join_pairs(
+        &mut self,
+        outer: &TableRef,
+        inner: &TableRef,
+        prepared: &PreparedJoin,
+        mut visit: impl FnMut(&[Value], &[Value]) -> Result<(), DbError>,
+    ) -> Result<(), DbError> {
+        match feed_kind(&prepared.path) {
+            FeedKind::Index {
+                name,
+                inner_ordinal,
+                outer_ordinal,
+            } => {
+                let probe = IndexProbe {
+                    index: name,
+                    inner_ordinal,
+                    outer_ordinal,
+                };
+                let outer_rows = self.table(&outer.name)?.rows().to_vec();
+                self.visit_index_pairs(&inner.name, &probe, &outer_rows, prepared, visit)
+            }
+            FeedKind::Hash {
+                outer_ordinal,
+                inner_ordinal,
+            } => {
+                let keys = HashKeys {
+                    outer_ordinal,
+                    inner_ordinal,
+                };
+                self.with_copied_side(outer, inner, |outer_rows, inner_rows, build_inner| {
+                    visit_hash_pairs(
+                        outer_rows,
+                        inner_rows,
+                        keys,
+                        build_inner,
+                        prepared,
+                        |outer_row, inner_row| visit(outer_row, inner_row),
+                    )
+                })
+            }
+            FeedKind::Nested => self.with_copied_side(outer, inner, |outer_rows, inner_rows, _| {
+                visit_nested_pairs(outer_rows, inner_rows, prepared, |outer_row, inner_row| {
+                    visit(outer_row, inner_row)
+                })
+            }),
+        }
+    }
+
+    /// Copy the smaller input so the other can be borrowed from the catalog.
+    ///
+    /// A self-join copies the only table and uses that copy for both sides.
+    /// The bool is true when the copy is the inner table, which is also the
+    /// hash-join build side for equal sizes.
+    fn with_copied_side<T>(
+        &self,
+        outer: &TableRef,
+        inner: &TableRef,
+        body: impl FnOnce(&[Vec<Value>], &[Vec<Value>], bool) -> Result<T, DbError>,
+    ) -> Result<T, DbError> {
+        if outer.name == inner.name {
+            let rows = self.table(&outer.name)?.rows().to_vec();
+            return body(&rows, &rows, true);
+        }
+        let outer_len = self.table(&outer.name)?.rows().len();
+        let inner_len = self.table(&inner.name)?.rows().len();
+        if inner_len <= outer_len {
+            let inner_rows = self.table(&inner.name)?.rows().to_vec();
+            let outer_rows = self.table(&outer.name)?.rows();
+            body(outer_rows, &inner_rows, true)
+        } else {
+            let outer_rows = self.table(&outer.name)?.rows().to_vec();
+            let inner_rows = self.table(&inner.name)?.rows();
+            body(&outer_rows, inner_rows, false)
+        }
+    }
+
+    fn explain_aggregate_join(
+        &self,
+        outer: &TableRef,
+        inner: &TableRef,
+        on: &Expr,
+        tail: SelectTail<'_>,
+    ) -> Result<StatementResult, DbError> {
+        let (plan, prepared) = self.plan_join_aggregate(outer, inner, on, tail)?;
+        let filter = tail
+            .selection
+            .map(Expr::render)
+            .map(Value::Text)
+            .unwrap_or(Value::Null);
+        let having = tail
+            .having
+            .map(Expr::render)
+            .map(Value::Text)
+            .unwrap_or(Value::Null);
+        let groups = text_list(&plan.group_labels);
+        let aggregates = text_list(&plan.aggregate_labels);
+        let (join, build, index, predicate, residual) = match &prepared.path {
+            JoinAccess::NestedLoop => (
+                "NestedLoopJoin",
+                Value::Null,
+                Value::Null,
+                Value::Text(on.render()),
+                Value::Null,
+            ),
+            JoinAccess::HashJoin {
+                predicate,
+                residual,
+                ..
+            } => {
+                let outer_len = self.table(&outer.name)?.rows().len();
+                let inner_len = self.table(&inner.name)?.rows().len();
+                let build = if inner_len <= outer_len {
+                    inner.explain_name()
+                } else {
+                    outer.explain_name()
+                };
+                (
+                    "HashJoin",
+                    Value::Text(build),
+                    Value::Null,
+                    Value::Text(predicate.clone()),
+                    residual
+                        .as_ref()
+                        .map(|text| Value::Text(text.clone()))
+                        .unwrap_or(Value::Null),
+                )
+            }
+            JoinAccess::IndexNestedLoop {
+                name,
+                predicate,
+                residual,
+                ..
+            } => (
+                "IndexNestedLoopJoin",
+                Value::Null,
+                Value::Text(name.clone()),
+                Value::Text(predicate.clone()),
+                residual
+                    .as_ref()
+                    .map(|text| Value::Text(text.clone()))
+                    .unwrap_or(Value::Null),
+            ),
+        };
+        Ok(StatementResult::Query(QueryResult {
+            columns: vec![
+                "access".to_string(),
+                "groups".to_string(),
+                "aggregates".to_string(),
+                "having".to_string(),
+                "join".to_string(),
+                "outer".to_string(),
+                "inner".to_string(),
+                "build".to_string(),
+                "index".to_string(),
+                "predicate".to_string(),
+                "residual".to_string(),
+                "filter".to_string(),
+            ],
+            rows: vec![vec![
+                Value::Text(plan.access),
+                groups,
+                aggregates,
+                having,
+                Value::Text(join.to_string()),
+                Value::Text(outer.explain_name()),
+                Value::Text(inner.explain_name()),
+                build,
+                index,
+                predicate,
+                residual,
+                filter,
+            ]],
+        }))
+    }
+
     fn explain(&mut self, statement: &Statement) -> Result<StatementResult, DbError> {
-        let Statement::Select {
-            from,
-            projection,
-            selection,
-            group_by,
-            order_by,
-            ..
-        } = statement
-        else {
+        let Statement::Select(query) = statement else {
             return Err(DbError::unsupported("EXPLAIN is only supported for SELECT"));
         };
-        if is_aggregate_query(projection, group_by, order_by) {
-            let QueryFrom::Table(source) = from else {
-                return Err(DbError::unsupported(
-                    "aggregates over JOIN are not supported",
-                ));
+        let tail = SelectTail {
+            projection: &query.projection,
+            selection: query.selection.as_ref(),
+            group_by: &query.group_by,
+            having: query.having.as_ref(),
+            order_by: &query.order_by,
+            limit: None,
+        };
+        if is_aggregate_query(
+            &query.projection,
+            &query.group_by,
+            query.having.as_ref(),
+            &query.order_by,
+        ) {
+            return match &query.from {
+                QueryFrom::Table(source) => self.explain_aggregate(source, tail),
+                QueryFrom::Join { outer, inner, on } => {
+                    self.explain_aggregate_join(outer, inner, on, tail)
+                }
             };
-            return self.explain_aggregate(
-                source,
-                projection,
-                selection.as_ref(),
-                group_by,
-                order_by,
-            );
         }
-        match from {
+        match &query.from {
             QueryFrom::Table(source) => {
-                let mut prepared =
-                    self.prepare_select(source, projection, selection.as_ref(), order_by)?;
+                let mut prepared = self.prepare_select(
+                    source,
+                    &query.projection,
+                    query.selection.as_ref(),
+                    &query.order_by,
+                )?;
                 prepared.path = self.settle_path(prepared.path)?;
                 let (access, index, bounds) = plan::describe(&prepared.path);
                 Ok(StatementResult::Query(QueryResult {
@@ -615,12 +724,23 @@ impl Database {
                 }))
             }
             QueryFrom::Join { outer, inner, on } => {
-                let mut prepared =
-                    self.prepare_join(outer, inner, on, projection, selection.as_ref(), order_by)?;
+                let mut prepared = self.prepare_join(
+                    outer,
+                    inner,
+                    on,
+                    &query.projection,
+                    query.selection.as_ref(),
+                    &query.order_by,
+                )?;
+                #[cfg(test)]
+                if force_nested_join() {
+                    prepared.path = JoinAccess::NestedLoop;
+                }
                 let outer_len = self.table(&outer.name)?.rows().len();
                 let inner_len = self.table(&inner.name)?.rows().len();
                 prepared.path = finish_join_path(prepared.path, outer_len, inner_len);
-                let filter = selection
+                let filter = query
+                    .selection
                     .as_ref()
                     .map(|expr| Value::Text(expr.render()))
                     .unwrap_or(Value::Null);
@@ -907,19 +1027,20 @@ impl Database {
         let limit_n = limit.map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
         if prepared.sort_keys.is_empty() {
             let mut projected = Vec::new();
-            for outer_row in outer_rows {
-                self.visit_inner_matches(inner_name, probe, outer_row, &prepared, |inner_row| {
+            let outputs = prepared.output_indexes.clone();
+            self.visit_index_pairs(
+                inner_name,
+                probe,
+                outer_rows,
+                &prepared,
+                |outer_row, inner_row| {
                     if limit_n.is_some_and(|limit_n| projected.len() >= limit_n) {
                         return Ok(());
                     }
-                    projected.push(project_pair(
-                        outer_row,
-                        inner_row,
-                        &prepared.output_indexes,
-                    )?);
+                    projected.push(project_pair(outer_row, inner_row, &outputs)?);
                     Ok(())
-                })?;
-            }
+                },
+            )?;
             return Ok(StatementResult::Query(QueryResult {
                 columns: prepared.output_names,
                 rows: projected,
@@ -927,15 +1048,16 @@ impl Database {
         }
 
         let mut joined = Vec::new();
-        for outer_row in outer_rows {
-            self.visit_inner_matches(inner_name, probe, outer_row, &prepared, |inner_row| {
-                let mut row = Vec::with_capacity(outer_row.len().saturating_add(inner_row.len()));
-                row.extend_from_slice(outer_row);
-                row.extend_from_slice(inner_row);
-                joined.push(row);
+        self.visit_index_pairs(
+            inner_name,
+            probe,
+            outer_rows,
+            &prepared,
+            |outer_row, inner_row| {
+                joined.push(concat_pair(outer_row, inner_row));
                 Ok(())
-            })?;
-        }
+            },
+        )?;
         finish_rows(
             joined,
             &prepared.sort_keys,
@@ -943,6 +1065,22 @@ impl Database {
             &prepared.output_indexes,
             prepared.output_names,
         )
+    }
+
+    fn visit_index_pairs(
+        &mut self,
+        inner_name: &str,
+        probe: &IndexProbe,
+        outer_rows: &[Vec<Value>],
+        prepared: &PreparedJoin,
+        mut visit: impl FnMut(&[Value], &[Value]) -> Result<(), DbError>,
+    ) -> Result<(), DbError> {
+        for outer_row in outer_rows {
+            self.visit_inner_matches(inner_name, probe, outer_row, prepared, |inner_row| {
+                visit(outer_row, inner_row)
+            })?;
+        }
+        Ok(())
     }
 
     /// Probe `probe` for one outer row and visit each inner match in insertion order.
@@ -1005,23 +1143,9 @@ impl Database {
         prepared: PreparedJoin,
         limit: Option<u64>,
     ) -> Result<StatementResult, DbError> {
-        if outer.name == inner.name {
-            let rows = self.table(&outer.name)?.rows().to_vec();
-            return run_hash_join(&rows, &rows, keys, true, prepared, limit);
-        }
-        let outer_len = self.table(&outer.name)?.rows().len();
-        let inner_len = self.table(&inner.name)?.rows().len();
-        // Equal sizes build the inner table. The probe then walks the outer
-        // table and emits each bucket in insertion order.
-        if inner_len <= outer_len {
-            let inner_rows = self.table(&inner.name)?.rows().to_vec();
-            let outer_rows = self.table(&outer.name)?.rows();
-            run_hash_join(outer_rows, &inner_rows, keys, true, prepared, limit)
-        } else {
-            let outer_rows = self.table(&outer.name)?.rows().to_vec();
-            let inner_rows = self.table(&inner.name)?.rows();
-            run_hash_join(&outer_rows, inner_rows, keys, false, prepared, limit)
-        }
+        self.with_copied_side(outer, inner, |outer_rows, inner_rows, build_inner| {
+            run_hash_join(outer_rows, inner_rows, keys, build_inner, prepared, limit)
+        })
     }
 
     fn update(
@@ -1084,7 +1208,7 @@ fn durable_change(statement: &Statement) -> DurableChange {
         | Statement::Update { table, .. }
         | Statement::Delete { table, .. } => DurableChange::Write(table.clone()),
         Statement::CreateIndex { .. } | Statement::DropIndex { .. } => DurableChange::Index,
-        Statement::Select { .. } | Statement::Explain(_) => DurableChange::None,
+        Statement::Select(_) | Statement::Explain(_) => DurableChange::None,
     }
 }
 
@@ -1128,6 +1252,7 @@ struct AggPlan {
     aggregate_labels: Vec<String>,
     sort_keys: Vec<SortKey>,
     filter: Option<BoundExpr>,
+    having: Option<BoundExpr>,
     path: AccessPath,
     access: String,
 }
@@ -1138,6 +1263,7 @@ enum AggFn {
     Sum(usize),
 }
 
+#[derive(Clone, Copy)]
 enum AccValue {
     Count(i64),
     Sum(Option<i64>),
@@ -1148,12 +1274,186 @@ struct AggGroup {
     acc: Vec<AccValue>,
 }
 
+fn prepare_groups(
+    scope: &Scope,
+    tail: SelectTail<'_>,
+    path: AccessPath,
+) -> Result<AggPlan, DbError> {
+    let filter = bind_optional_where(tail.selection, scope)?;
+    let mut group_ordinals = Vec::with_capacity(tail.group_by.len());
+    let mut group_labels = Vec::with_capacity(tail.group_by.len());
+    for column in tail.group_by {
+        group_ordinals.push(scope.resolve(column)?);
+        group_labels.push(column.render());
+    }
+    let Projection::Columns(items) = tail.projection else {
+        return Err(DbError::unsupported(
+            "SELECT * is not supported with GROUP BY or aggregates",
+        ));
+    };
+    let mut aggs = Vec::new();
+    let mut outputs = Vec::with_capacity(items.len());
+    let mut output_names = Vec::with_capacity(items.len());
+    let mut aggregate_labels = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Column(column) => {
+                let ordinal = scope.resolve(column)?;
+                let Some(slot) = group_ordinals.iter().position(|group| *group == ordinal) else {
+                    return Err(DbError::invalid(format!(
+                        "column '{}' must appear in GROUP BY",
+                        column.name
+                    )));
+                };
+                let Some(name) = scope.name_at(ordinal) else {
+                    return Err(DbError::Internal(
+                        "group column is outside the table".to_string(),
+                    ));
+                };
+                output_names.push(name.to_string());
+                outputs.push(slot);
+            }
+            SelectItem::Aggregate(call) => {
+                let slot = bind_aggregate(call, scope, &mut aggs)?;
+                aggregate_labels.push(call.render());
+                output_names.push(call.render());
+                outputs.push(group_ordinals.len() + slot);
+            }
+        }
+    }
+    let group_width = group_ordinals.len();
+    let having = tail
+        .having
+        .map(|expr| {
+            expr::bind_having(
+                expr,
+                |column| grouped_column(scope, &group_ordinals, column),
+                |call| {
+                    let slot = bind_aggregate(call, scope, &mut aggs)?;
+                    remember_aggregate(call, &mut aggregate_labels);
+                    Ok(group_width + slot)
+                },
+            )
+        })
+        .transpose()?;
+    let mut sort_keys = Vec::with_capacity(tail.order_by.len());
+    for key in tail.order_by {
+        let index = match &key.target {
+            OrderTarget::Column(column) => grouped_column(scope, &group_ordinals, column)?.0,
+            OrderTarget::Aggregate(call) => {
+                let slot = bind_aggregate(call, scope, &mut aggs)?;
+                remember_aggregate(call, &mut aggregate_labels);
+                group_width + slot
+            }
+        };
+        sort_keys.push(SortKey {
+            index,
+            ascending: key.ascending,
+            nulls_first: key.nulls_first.unwrap_or(!key.ascending),
+        });
+    }
+    let access = if group_ordinals.is_empty() {
+        "Aggregate"
+    } else {
+        "HashAggregate"
+    };
+    Ok(AggPlan {
+        group_ordinals,
+        group_labels,
+        aggs,
+        outputs,
+        output_names,
+        aggregate_labels,
+        sort_keys,
+        filter,
+        having,
+        path,
+        access: access.to_string(),
+    })
+}
+
+fn grouped_column(
+    scope: &Scope,
+    group_ordinals: &[usize],
+    column: &SelectColumn,
+) -> Result<(usize, DataType), DbError> {
+    let ordinal = scope.resolve(column)?;
+    let Some(slot) = group_ordinals.iter().position(|group| *group == ordinal) else {
+        return Err(DbError::invalid(format!(
+            "column '{}' must appear in GROUP BY",
+            column.name
+        )));
+    };
+    let Some(data_type) = scope.type_at(ordinal) else {
+        return Err(DbError::Internal(
+            "group column is outside the table".to_string(),
+        ));
+    };
+    Ok((slot, data_type))
+}
+
+fn remember_aggregate(call: &AggregateCall, labels: &mut Vec<String>) {
+    let label = call.render();
+    if !labels.iter().any(|existing| existing == &label) {
+        labels.push(label);
+    }
+}
+
+fn aggregate_explain_row(
+    plan: &AggPlan,
+    scan: Value,
+    index: Value,
+    bounds: Value,
+    selection: Option<&Expr>,
+    having: Option<&Expr>,
+) -> QueryResult {
+    let filter = selection
+        .map(Expr::render)
+        .map(Value::Text)
+        .unwrap_or(Value::Null);
+    let having = having
+        .map(Expr::render)
+        .map(Value::Text)
+        .unwrap_or(Value::Null);
+    QueryResult {
+        columns: vec![
+            "access".to_string(),
+            "groups".to_string(),
+            "aggregates".to_string(),
+            "scan".to_string(),
+            "index".to_string(),
+            "bounds".to_string(),
+            "filter".to_string(),
+            "having".to_string(),
+        ],
+        rows: vec![vec![
+            Value::Text(plan.access.clone()),
+            text_list(&plan.group_labels),
+            text_list(&plan.aggregate_labels),
+            scan,
+            index,
+            bounds,
+            filter,
+            having,
+        ]],
+    }
+}
+
+fn text_list(labels: &[String]) -> Value {
+    if labels.is_empty() {
+        Value::Null
+    } else {
+        Value::Text(labels.join(", "))
+    }
+}
+
 fn is_aggregate_query(
     projection: &Projection,
     group_by: &[SelectColumn],
+    having: Option<&Expr>,
     order_by: &[OrderKey],
 ) -> bool {
-    if !group_by.is_empty() {
+    if having.is_some() || !group_by.is_empty() {
         return true;
     }
     if order_by
@@ -1222,20 +1522,104 @@ fn collect_groups(
     positions: Option<&[usize]>,
     plan: &AggPlan,
 ) -> Result<Vec<Vec<Value>>, DbError> {
-    if plan.group_ordinals.is_empty() {
-        let mut acc = fresh_acc(&plan.aggs);
-        let mut visit = |row: &[Value]| update_acc(&mut acc, row, &plan.aggs);
-        visit_filtered(rows, positions, plan.filter.as_ref(), &mut visit)?;
-        return Ok(vec![materialize_group(&[], &acc)]);
-    }
-    let mut groups: Vec<AggGroup> = Vec::new();
-    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
-    let mut visit = |row: &[Value]| absorb_row(row, plan, &mut groups, &mut buckets);
+    let mut sink = GroupSink::new(plan);
+    let mut visit = |row: &[Value]| sink.push(InputRow::One(row));
     visit_filtered(rows, positions, plan.filter.as_ref(), &mut visit)?;
-    Ok(groups
-        .into_iter()
-        .map(|group| materialize_group(&group.key, &group.acc))
-        .collect())
+    sink.finish()
+}
+
+/// One input row, or one joined pair, without concatenating the pair.
+#[derive(Clone, Copy)]
+enum InputRow<'a> {
+    One(&'a [Value]),
+    Pair(&'a [Value], &'a [Value]),
+}
+
+impl<'a> InputRow<'a> {
+    fn get(self, index: usize) -> Option<&'a Value> {
+        match self {
+            Self::One(row) => row.get(index),
+            Self::Pair(outer, inner) => {
+                if index < outer.len() {
+                    outer.get(index)
+                } else {
+                    inner.get(index - outer.len())
+                }
+            }
+        }
+    }
+}
+
+struct GroupSink<'a> {
+    plan: &'a AggPlan,
+    scalar: Option<Vec<AccValue>>,
+    groups: Vec<AggGroup>,
+    buckets: HashMap<u64, Vec<usize>>,
+}
+
+impl<'a> GroupSink<'a> {
+    fn new(plan: &'a AggPlan) -> Self {
+        let scalar = if plan.group_ordinals.is_empty() {
+            Some(fresh_acc(&plan.aggs))
+        } else {
+            None
+        };
+        Self {
+            plan,
+            scalar,
+            groups: Vec::new(),
+            buckets: HashMap::new(),
+        }
+    }
+
+    fn push(&mut self, row: InputRow<'_>) -> Result<(), DbError> {
+        if let Some(acc) = &mut self.scalar {
+            return update_acc(acc, row, &self.plan.aggs);
+        }
+        absorb_row(row, self.plan, &mut self.groups, &mut self.buckets)
+    }
+
+    fn finish(self) -> Result<Vec<Vec<Value>>, DbError> {
+        if let Some(acc) = self.scalar {
+            return Ok(vec![materialize_group(&[], &acc)]);
+        }
+        Ok(self
+            .groups
+            .into_iter()
+            .map(|group| materialize_group(&group.key, &group.acc))
+            .collect())
+    }
+}
+
+fn absorb_row(
+    row: InputRow<'_>,
+    plan: &AggPlan,
+    groups: &mut Vec<AggGroup>,
+    buckets: &mut HashMap<u64, Vec<usize>>,
+) -> Result<(), DbError> {
+    let hash = hash_group(row, &plan.group_ordinals)?;
+    let mut matched = None;
+    if let Some(slots) = buckets.get(&hash) {
+        for &slot in slots {
+            if group_equals(&groups[slot].key, row, &plan.group_ordinals)? {
+                matched = Some(slot);
+                break;
+            }
+        }
+    }
+    if let Some(slot) = matched {
+        return update_acc(&mut groups[slot].acc, row, &plan.aggs);
+    }
+    let mut key = Vec::with_capacity(plan.group_ordinals.len());
+    for &ordinal in &plan.group_ordinals {
+        key.push(cell(row, ordinal)?.clone());
+    }
+    let mut acc = fresh_acc(&plan.aggs);
+    update_acc(&mut acc, row, &plan.aggs)?;
+    let slot = groups.len();
+    groups.push(AggGroup { key, acc });
+    buckets.entry(hash).or_default().push(slot);
+    Ok(())
 }
 
 fn visit_filtered(
@@ -1265,39 +1649,6 @@ fn visit_filtered(
     Ok(())
 }
 
-fn absorb_row(
-    row: &[Value],
-    plan: &AggPlan,
-    groups: &mut Vec<AggGroup>,
-    buckets: &mut HashMap<u64, Vec<usize>>,
-) -> Result<(), DbError> {
-    let hash = hash_group(row, &plan.group_ordinals)?;
-    let found = buckets.get(&hash).and_then(|slots| {
-        slots
-            .iter()
-            .copied()
-            .find(|&slot| group_equals(&groups[slot].key, row, &plan.group_ordinals))
-    });
-    if let Some(slot) = found {
-        return update_acc(&mut groups[slot].acc, row, &plan.aggs);
-    }
-    let mut key = Vec::with_capacity(plan.group_ordinals.len());
-    for &ordinal in &plan.group_ordinals {
-        let Some(value) = row.get(ordinal) else {
-            return Err(DbError::Internal(
-                "group column is outside the row".to_string(),
-            ));
-        };
-        key.push(value.clone());
-    }
-    let mut acc = fresh_acc(&plan.aggs);
-    update_acc(&mut acc, row, &plan.aggs)?;
-    let slot = groups.len();
-    groups.push(AggGroup { key, acc });
-    buckets.entry(hash).or_default().push(slot);
-    Ok(())
-}
-
 fn fresh_acc(aggs: &[AggFn]) -> Vec<AccValue> {
     aggs.iter()
         .map(|agg| match agg {
@@ -1307,7 +1658,30 @@ fn fresh_acc(aggs: &[AggFn]) -> Vec<AccValue> {
         .collect()
 }
 
-fn update_acc(acc: &mut [AccValue], row: &[Value], aggs: &[AggFn]) -> Result<(), DbError> {
+fn update_acc(acc: &mut [AccValue], row: InputRow<'_>, aggs: &[AggFn]) -> Result<(), DbError> {
+    if acc.len() != aggs.len() {
+        return Err(DbError::Internal(
+            "aggregate accumulator has the wrong width".to_string(),
+        ));
+    }
+    // A failing COUNT or SUM must not leave the earlier aggregates of this
+    // row applied. Eight covers every aggregate list the SQL surface builds
+    // in practice; a wider list stages on the heap and still commits together.
+    const STACK: usize = 8;
+    if acc.len() <= STACK {
+        let mut staged = [AccValue::Count(0); STACK];
+        staged[..acc.len()].copy_from_slice(acc);
+        apply_acc(&mut staged[..acc.len()], row, aggs)?;
+        acc.copy_from_slice(&staged[..acc.len()]);
+        return Ok(());
+    }
+    let mut staged = acc.to_vec();
+    apply_acc(&mut staged, row, aggs)?;
+    acc.copy_from_slice(&staged);
+    Ok(())
+}
+
+fn apply_acc(acc: &mut [AccValue], row: InputRow<'_>, aggs: &[AggFn]) -> Result<(), DbError> {
     for (slot, agg) in aggs.iter().enumerate() {
         match agg {
             AggFn::CountStar => add_count(&mut acc[slot], "COUNT")?,
@@ -1354,7 +1728,7 @@ fn add_count(slot: &mut AccValue, name: &str) -> Result<(), DbError> {
     Ok(())
 }
 
-fn cell(row: &[Value], ordinal: usize) -> Result<&Value, DbError> {
+fn cell(row: InputRow<'_>, ordinal: usize) -> Result<&Value, DbError> {
     row.get(ordinal)
         .ok_or_else(|| DbError::Internal("aggregate column is outside the row".to_string()))
 }
@@ -1371,7 +1745,7 @@ fn materialize_group(key: &[Value], acc: &[AccValue]) -> Vec<Value> {
     row
 }
 
-fn hash_group(row: &[Value], ordinals: &[usize]) -> Result<u64, DbError> {
+fn hash_group(row: InputRow<'_>, ordinals: &[usize]) -> Result<u64, DbError> {
     #[cfg(test)]
     if let Some(forced) = FORCED_HASH.with(std::cell::Cell::get) {
         for &ordinal in ordinals {
@@ -1400,22 +1774,55 @@ fn hash_group(row: &[Value], ordinals: &[usize]) -> Result<u64, DbError> {
     Ok(hasher.finish())
 }
 
-fn group_equals(key: &[Value], row: &[Value], ordinals: &[usize]) -> bool {
+fn group_equals(key: &[Value], row: InputRow<'_>, ordinals: &[usize]) -> Result<bool, DbError> {
     if key.len() != ordinals.len() {
-        return false;
+        return Ok(false);
     }
-    key.iter().zip(ordinals).all(|(stored, &ordinal)| {
-        let Some(value) = row.get(ordinal) else {
-            return false;
-        };
-        match (stored, value) {
+    for (stored, &ordinal) in key.iter().zip(ordinals) {
+        let value = cell(row, ordinal)?;
+        let same = match (stored, value) {
             (Value::Null, Value::Null) => true,
             (Value::Integer(left), Value::Integer(right)) => left == right,
             (Value::Text(left), Value::Text(right)) => left == right,
             (Value::Boolean(left), Value::Boolean(right)) => left == right,
             _ => false,
+        };
+        if !same {
+            return Ok(false);
         }
-    })
+    }
+    Ok(true)
+}
+
+fn finish_aggregate(
+    groups: Vec<Vec<Value>>,
+    plan: AggPlan,
+    limit: Option<u64>,
+) -> Result<StatementResult, DbError> {
+    let groups = apply_having(groups, plan.having.as_ref())?;
+    finish_rows(
+        groups,
+        &plan.sort_keys,
+        limit,
+        &plan.outputs,
+        plan.output_names,
+    )
+}
+
+fn apply_having(
+    groups: Vec<Vec<Value>>,
+    having: Option<&BoundExpr>,
+) -> Result<Vec<Vec<Value>>, DbError> {
+    let Some(having) = having else {
+        return Ok(groups);
+    };
+    let mut kept = Vec::new();
+    for group in groups {
+        if expr::row_matches(Some(having), &group)? {
+            kept.push(group);
+        }
+    }
+    Ok(kept)
 }
 
 fn bind_optional_where(
@@ -1663,37 +2070,59 @@ fn run_hash_join(
     limit: Option<u64>,
 ) -> Result<StatementResult, DbError> {
     let limit_n = limit.map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+    if prepared.sort_keys.is_empty() {
+        let mut projected = Vec::new();
+        let outputs = prepared.output_indexes.clone();
+        visit_hash_pairs(
+            outer_rows,
+            inner_rows,
+            keys,
+            build_inner,
+            &prepared,
+            |outer_row, inner_row| {
+                if limit_n.is_some_and(|limit_n| projected.len() >= limit_n) {
+                    return Ok(());
+                }
+                projected.push(project_pair(outer_row, inner_row, &outputs)?);
+                Ok(())
+            },
+        )?;
+        return Ok(StatementResult::Query(QueryResult {
+            columns: prepared.output_names,
+            rows: projected,
+        }));
+    }
+    let mut joined = Vec::new();
+    visit_hash_pairs(
+        outer_rows,
+        inner_rows,
+        keys,
+        build_inner,
+        &prepared,
+        |outer_row, inner_row| {
+            joined.push(concat_pair(outer_row, inner_row));
+            Ok(())
+        },
+    )?;
+    finish_rows(
+        joined,
+        &prepared.sort_keys,
+        limit,
+        &prepared.output_indexes,
+        prepared.output_names,
+    )
+}
+
+fn visit_hash_pairs(
+    outer_rows: &[Vec<Value>],
+    inner_rows: &[Vec<Value>],
+    keys: HashKeys,
+    build_inner: bool,
+    prepared: &PreparedJoin,
+    mut visit: impl FnMut(&[Value], &[Value]) -> Result<(), DbError>,
+) -> Result<(), DbError> {
     if build_inner {
         let table = build_hash(inner_rows, keys.inner_ordinal, hash_key)?;
-        if prepared.sort_keys.is_empty() {
-            let mut projected = Vec::new();
-            for outer_row in outer_rows {
-                visit_hash_hits(
-                    outer_row,
-                    inner_rows,
-                    keys.outer_ordinal,
-                    &table,
-                    keys.inner_ordinal,
-                    &prepared,
-                    |inner_row| {
-                        if limit_n.is_some_and(|limit_n| projected.len() >= limit_n) {
-                            return Ok(());
-                        }
-                        projected.push(project_pair(
-                            outer_row,
-                            inner_row,
-                            &prepared.output_indexes,
-                        )?);
-                        Ok(())
-                    },
-                )?;
-            }
-            return Ok(StatementResult::Query(QueryResult {
-                columns: prepared.output_names,
-                rows: projected,
-            }));
-        }
-        let mut joined = Vec::new();
         for outer_row in outer_rows {
             visit_hash_hits(
                 outer_row,
@@ -1701,22 +2130,15 @@ fn run_hash_join(
                 keys.outer_ordinal,
                 &table,
                 keys.inner_ordinal,
-                &prepared,
-                |inner_row| {
-                    joined.push(concat_pair(outer_row, inner_row));
-                    Ok(())
-                },
+                prepared,
+                |inner_row| visit(outer_row, inner_row),
             )?;
         }
-        return finish_rows(
-            joined,
-            &prepared.sort_keys,
-            limit,
-            &prepared.output_indexes,
-            prepared.output_names,
-        );
+        return Ok(());
     }
-
+    // The probe walks the inner table, so matches arrive inner-major. Keep one
+    // pair of positions per kept match, not the rows, and emit them
+    // outer-then-inner. The buffer grows with the match count.
     let table = build_hash(outer_rows, keys.outer_ordinal, hash_key)?;
     let mut pairs = Vec::new();
     for (inner_pos, inner_row) in inner_rows.iter().enumerate() {
@@ -1737,43 +2159,17 @@ fn run_hash_join(
                     "hash join position is outside the build side".to_string(),
                 ));
             };
-            if !pair_kept(&prepared, outer_row, inner_row)? {
+            if !pair_kept(prepared, outer_row, inner_row)? {
                 continue;
             }
             pairs.push((outer_pos, inner_pos));
         }
     }
     pairs.sort_unstable();
-    if prepared.sort_keys.is_empty() {
-        if let Some(limit_n) = limit_n
-            && pairs.len() > limit_n
-        {
-            pairs.truncate(limit_n);
-        }
-        let mut projected = Vec::with_capacity(pairs.len());
-        for (outer_pos, inner_pos) in pairs {
-            projected.push(project_pair(
-                &outer_rows[outer_pos],
-                &inner_rows[inner_pos],
-                &prepared.output_indexes,
-            )?);
-        }
-        return Ok(StatementResult::Query(QueryResult {
-            columns: prepared.output_names,
-            rows: projected,
-        }));
-    }
-    let mut joined = Vec::with_capacity(pairs.len());
     for (outer_pos, inner_pos) in pairs {
-        joined.push(concat_pair(&outer_rows[outer_pos], &inner_rows[inner_pos]));
+        visit(&outer_rows[outer_pos], &inner_rows[inner_pos])?;
     }
-    finish_rows(
-        joined,
-        &prepared.sort_keys,
-        limit,
-        &prepared.output_indexes,
-        prepared.output_names,
-    )
+    Ok(())
 }
 
 fn visit_hash_hits(
@@ -1988,45 +2384,24 @@ fn scan_join(
     let limit_n = limit.map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
     if prepared.sort_keys.is_empty() {
         let mut projected = Vec::new();
-        for outer_row in outer_rows {
-            for inner_row in inner_rows {
-                if !expr::pair_matches(Some(&prepared.on), outer_row, inner_row)? {
-                    continue;
-                }
-                if !expr::pair_matches(prepared.filter.as_ref(), outer_row, inner_row)? {
-                    continue;
-                }
-                if limit_n.is_some_and(|limit_n| projected.len() >= limit_n) {
-                    continue;
-                }
-                projected.push(project_pair(
-                    outer_row,
-                    inner_row,
-                    &prepared.output_indexes,
-                )?);
+        let outputs = prepared.output_indexes.clone();
+        visit_nested_pairs(outer_rows, inner_rows, &prepared, |outer_row, inner_row| {
+            if limit_n.is_some_and(|limit_n| projected.len() >= limit_n) {
+                return Ok(());
             }
-        }
+            projected.push(project_pair(outer_row, inner_row, &outputs)?);
+            Ok(())
+        })?;
         return Ok(StatementResult::Query(QueryResult {
             columns: prepared.output_names,
             rows: projected,
         }));
     }
-
     let mut joined = Vec::new();
-    for outer_row in outer_rows {
-        for inner_row in inner_rows {
-            if !expr::pair_matches(Some(&prepared.on), outer_row, inner_row)? {
-                continue;
-            }
-            if !expr::pair_matches(prepared.filter.as_ref(), outer_row, inner_row)? {
-                continue;
-            }
-            let mut row = Vec::with_capacity(outer_row.len().saturating_add(inner_row.len()));
-            row.extend_from_slice(outer_row);
-            row.extend_from_slice(inner_row);
-            joined.push(row);
-        }
-    }
+    visit_nested_pairs(outer_rows, inner_rows, &prepared, |outer_row, inner_row| {
+        joined.push(concat_pair(outer_row, inner_row));
+        Ok(())
+    })?;
     finish_rows(
         joined,
         &prepared.sort_keys,
@@ -2034,6 +2409,60 @@ fn scan_join(
         &prepared.output_indexes,
         prepared.output_names,
     )
+}
+
+fn visit_nested_pairs(
+    outer_rows: &[Vec<Value>],
+    inner_rows: &[Vec<Value>],
+    prepared: &PreparedJoin,
+    mut visit: impl FnMut(&[Value], &[Value]) -> Result<(), DbError>,
+) -> Result<(), DbError> {
+    for outer_row in outer_rows {
+        for inner_row in inner_rows {
+            if !pair_kept(prepared, outer_row, inner_row)? {
+                continue;
+            }
+            visit(outer_row, inner_row)?;
+        }
+    }
+    Ok(())
+}
+
+enum FeedKind {
+    Index {
+        name: String,
+        inner_ordinal: usize,
+        outer_ordinal: usize,
+    },
+    Hash {
+        outer_ordinal: usize,
+        inner_ordinal: usize,
+    },
+    Nested,
+}
+
+fn feed_kind(path: &JoinAccess) -> FeedKind {
+    match path {
+        JoinAccess::IndexNestedLoop {
+            name,
+            inner_ordinal,
+            outer_ordinal,
+            ..
+        } => FeedKind::Index {
+            name: name.clone(),
+            inner_ordinal: *inner_ordinal,
+            outer_ordinal: *outer_ordinal,
+        },
+        JoinAccess::HashJoin {
+            outer_ordinal,
+            inner_ordinal,
+            ..
+        } => FeedKind::Hash {
+            outer_ordinal: *outer_ordinal,
+            inner_ordinal: *inner_ordinal,
+        },
+        JoinAccess::NestedLoop => FeedKind::Nested,
+    }
 }
 
 fn finish_rows(
@@ -2128,11 +2557,36 @@ thread_local! {
     /// When set, every non-NULL key hashes to this value.
     static FORCED_HASH: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static FORCE_INDEX_JOIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MATERIALIZE_AGGREGATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 fn force_nested_join() -> bool {
     FORCE_NESTED_JOIN.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn materialize_aggregate() -> bool {
+    MATERIALIZE_AGGREGATE.with(std::cell::Cell::get)
+}
+
+/// Stores every joined pair before grouping, for the life of the guard.
+#[cfg(test)]
+struct MaterializeAggregate;
+
+#[cfg(test)]
+impl MaterializeAggregate {
+    fn new() -> Self {
+        MATERIALIZE_AGGREGATE.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for MaterializeAggregate {
+    fn drop(&mut self) {
+        MATERIALIZE_AGGREGATE.with(|flag| flag.set(false));
+    }
 }
 
 /// Puts every key in one hash bucket for the life of the guard.
@@ -2575,6 +3029,41 @@ mod tests {
     }
 
     #[test]
+    fn a_failing_row_does_not_change_accumulators_already_stored() {
+        let mut acc = [
+            AccValue::Count(3),
+            AccValue::Sum(Some(i64::MAX - 1)),
+            AccValue::Sum(Some(4)),
+        ];
+        let row = [Value::Integer(2), Value::Integer(9)];
+        let error = update_acc(
+            &mut acc,
+            InputRow::One(&row),
+            &[AggFn::CountStar, AggFn::Sum(0), AggFn::Sum(1)],
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "SUM overflows INTEGER");
+        assert!(matches!(acc[0], AccValue::Count(3)));
+        assert!(matches!(acc[1], AccValue::Sum(Some(value)) if value == i64::MAX - 1));
+        assert!(matches!(acc[2], AccValue::Sum(Some(4))));
+
+        update_acc(
+            &mut acc,
+            InputRow::One(&[Value::Integer(1), Value::Null]),
+            &[AggFn::CountStar, AggFn::Sum(0), AggFn::Sum(1)],
+        )
+        .unwrap();
+        assert!(matches!(acc[0], AccValue::Count(4)));
+        assert!(matches!(acc[1], AccValue::Sum(Some(i64::MAX))));
+        assert!(matches!(acc[2], AccValue::Sum(Some(4))));
+        assert_eq!(
+            join_group_bytes(usize::MAX, usize::MAX, usize::MAX),
+            usize::MAX
+        );
+        assert_eq!(hash_table_bytes(usize::MAX, usize::MAX), usize::MAX);
+    }
+
+    #[test]
     fn a_forced_group_hash_collision_does_not_merge_unequal_groups() {
         let distinct = [
             vec![
@@ -2601,20 +3090,20 @@ mod tests {
             vec![Value::Null, Value::Null, Value::Null],
         ];
         assert_ne!(
-            hash_group(&distinct[0], &[0, 1, 2]).unwrap(),
-            hash_group(&distinct[1], &[0, 1, 2]).unwrap()
+            hash_group(InputRow::One(&distinct[0]), &[0, 1, 2]).unwrap(),
+            hash_group(InputRow::One(&distinct[1]), &[0, 1, 2]).unwrap()
         );
         {
             let _force = ForceHashCollision::new();
-            let forced = hash_group(&distinct[0], &[0, 1, 2]).unwrap();
+            let forced = hash_group(InputRow::One(&distinct[0]), &[0, 1, 2]).unwrap();
             for row in &distinct {
-                assert_eq!(hash_group(row, &[0, 1, 2]).unwrap(), forced);
+                assert_eq!(hash_group(InputRow::One(row), &[0, 1, 2]).unwrap(), forced);
             }
-            assert!(hash_group(&distinct[0], &[9]).is_err());
+            assert!(hash_group(InputRow::One(&distinct[0]), &[9]).is_err());
         }
         assert_ne!(
-            hash_group(&distinct[0], &[0, 1, 2]).unwrap(),
-            hash_group(&distinct[1], &[0, 1, 2]).unwrap()
+            hash_group(InputRow::One(&distinct[0]), &[0, 1, 2]).unwrap(),
+            hash_group(InputRow::One(&distinct[1]), &[0, 1, 2]).unwrap()
         );
 
         let mut db = Database::new();
@@ -2705,5 +3194,1383 @@ mod tests {
         };
         assert_eq!(bind_aggregate(&count, &scope, &mut aggs).unwrap(), 1);
         assert_eq!(aggs.len(), 2);
+    }
+
+    #[test]
+    fn join_aggregates_agree_across_join_algorithms() {
+        let grouped = "SELECT u.name, COUNT(*), COUNT(o.amount), SUM(o.amount)
+            FROM users u JOIN orders o ON u.id = o.user_id
+            WHERE o.paid = TRUE
+            GROUP BY u.name
+            HAVING COUNT(*) >= 1
+            ORDER BY SUM(o.amount) DESC, u.name ASC;";
+        let mut memory = Database::new();
+        load_algorithm_shop(&mut memory, 2, 6);
+        let hash_rows = query(&mut memory, grouped).rows;
+        let nested_rows = {
+            let _force = ForceNestedJoin::new();
+            query(&mut memory, grouped).rows
+        };
+        assert_eq!(nested_rows, hash_rows);
+        let streamed = hash_rows;
+        let materialized = {
+            let _guard = MaterializeAggregate::new();
+            query(&mut memory, grouped).rows
+        };
+        assert_eq!(materialized, streamed);
+
+        let mut wide = Database::new();
+        load_algorithm_shop(&mut wide, 6, 2);
+        let hash_rows = query(&mut wide, grouped).rows;
+        let nested_rows = {
+            let _force = ForceNestedJoin::new();
+            query(&mut wide, grouped).rows
+        };
+        assert_eq!(nested_rows, hash_rows);
+
+        let dir = crate::test_dir::TestDir::new("join-agg-algorithms");
+        let path = dir.join("db");
+        let mut database = Database::open(&path).unwrap();
+        load_algorithm_shop(&mut database, 4, 6);
+        let hash_rows = query(&mut database, grouped).rows;
+        let nested_rows = {
+            let _force = ForceNestedJoin::new();
+            query(&mut database, grouped).rows
+        };
+        assert_eq!(nested_rows, hash_rows);
+        drop(database);
+        Database::migrate(&path).unwrap();
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE INDEX idx_orders_user ON orders(user_id);")
+            .unwrap();
+        let indexed = {
+            let _force = ForceIndexJoin::new();
+            query(&mut database, grouped).rows
+        };
+        let nested_rows = {
+            let _force = ForceNestedJoin::new();
+            query(&mut database, grouped).rows
+        };
+        assert_eq!(indexed, hash_rows);
+        assert_eq!(nested_rows, hash_rows);
+        let explained = {
+            let _force = ForceIndexJoin::new();
+            query(&mut database, &format!("EXPLAIN {grouped}"))
+        };
+        assert_eq!(
+            explained.rows[0][4],
+            Value::Text("IndexNestedLoopJoin".to_string())
+        );
+        assert_eq!(
+            explained.rows[0][8],
+            Value::Text("idx_orders_user".to_string())
+        );
+    }
+
+    fn load_algorithm_shop(database: &mut Database, users: i64, orders: i64) {
+        database
+            .execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        database
+            .execute("CREATE TABLE orders (user_id INT, amount INT, paid BOOLEAN);")
+            .unwrap();
+        let mut sql = String::from("INSERT INTO users VALUES ");
+        for id in 0..users {
+            if id > 0 {
+                sql.push(',');
+            }
+            if id == users - 1 {
+                sql.push_str("(NULL, 'tail')");
+            } else {
+                sql.push_str(&format!("({id}, 'u{id}')"));
+            }
+        }
+        database.execute(&sql).unwrap();
+        let mut sql = String::from("INSERT INTO orders VALUES ");
+        for id in 0..orders {
+            if id > 0 {
+                sql.push(',');
+            }
+            let user = if id % 5 == 0 {
+                "NULL".to_string()
+            } else {
+                ((id % users.max(1)) % (users - 1).max(1)).to_string()
+            };
+            let amount = if id % 3 == 0 {
+                "NULL".to_string()
+            } else {
+                id.to_string()
+            };
+            let paid = if id % 4 == 0 { "FALSE" } else { "TRUE" };
+            sql.push_str(&format!("({user}, {amount}, {paid})"));
+        }
+        database.execute(&sql).unwrap();
+    }
+
+    /// Seeds compared with the independent join reference in this review.
+    const REVIEW_SEEDS: [u64; 6] = [0x0a99, 0x51c0, 0xc0ff, 0x5eed, 0xa11c, 0x11ab];
+
+    #[test]
+    fn integer_join_aggregates_match_a_reference_on_both_build_sides() {
+        let (outer, inner) = outer_build_shop();
+        let grouped = aggregate_sql(
+            "u.name, COUNT(*), COUNT(o.amount), SUM(o.amount)",
+            "users u",
+            "orders o",
+            "u.id = o.user_id",
+            "",
+            "u.name",
+            "",
+        );
+        let expected = project_groups(&aggregate_equijoin(
+            &outer,
+            &inner,
+            0,
+            0,
+            None,
+            false,
+            1,
+            |row, _| vec![row[1].clone()],
+        ));
+        assert_eq!(
+            expected,
+            vec![
+                vec![
+                    Value::Text("Ada".to_string()),
+                    Value::Integer(20),
+                    Value::Integer(10),
+                    Value::Integer(30),
+                ],
+                vec![
+                    Value::Text("Al".to_string()),
+                    Value::Integer(10),
+                    Value::Integer(5),
+                    Value::Integer(15),
+                ],
+                vec![
+                    Value::Text("Bea".to_string()),
+                    Value::Integer(2),
+                    Value::Integer(1),
+                    Value::Integer(8),
+                ],
+                vec![
+                    Value::Text("Dee".to_string()),
+                    Value::Integer(2),
+                    Value::Integer(0),
+                    Value::Null,
+                ],
+            ]
+        );
+        let pairs = pair_rows(
+            &outer,
+            &inner,
+            |left, right| sql_eq(&left[0], &right[0]),
+            |left, right| vec![left[1].clone(), right[1].clone()],
+        );
+        assert_eq!(pairs.len(), 34);
+        let by_flag = project_groups(&aggregate_equijoin(
+            &outer,
+            &inner,
+            0,
+            0,
+            None,
+            false,
+            1,
+            |row, _| vec![row[2].clone()],
+        ));
+        assert_eq!(by_flag[0][0], Value::Boolean(true));
+        assert_eq!(by_flag[0][1], Value::Integer(22));
+        assert_eq!(by_flag[0][2], Value::Integer(10));
+        assert_eq!(by_flag[0][3], Value::Integer(30));
+        let positive = project_groups(&aggregate_equijoin(
+            &outer,
+            &inner,
+            0,
+            0,
+            Some(&|_, inner| matches!(inner[1], Value::Integer(amount) if amount > 0)),
+            false,
+            1,
+            |row, _| vec![row[1].clone()],
+        ));
+        let multiple = project_groups(&aggregate_equijoin(
+            &outer,
+            &inner,
+            0,
+            0,
+            None,
+            false,
+            1,
+            |row, _| vec![row[1].clone(), row[2].clone()],
+        ));
+        let mut ordered = aggregate_equijoin(&outer, &inner, 0, 0, None, false, 1, |row, _| {
+            vec![row[1].clone()]
+        });
+        ordered.retain(|group| group.count >= 2);
+        order_groups(&mut ordered, 0);
+        let ordered = project_groups(&ordered)
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let first = expected.first().cloned().into_iter().collect::<Vec<_>>();
+        let load = |database: &mut Database| {
+            load_tables(
+                database,
+                "CREATE TABLE users (id INT, name TEXT, flag BOOLEAN);",
+                "CREATE TABLE orders (user_id INT, amount INT, flag BOOLEAN);",
+                "users",
+                "orders",
+                &outer,
+                &inner,
+            );
+        };
+        assert_cases(
+            &load,
+            &[
+                (grouped.as_str(), expected.clone()),
+                (
+                    "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id;",
+                    pairs,
+                ),
+                (
+                    "SELECT u.flag, COUNT(*), COUNT(o.amount), SUM(o.amount)
+                     FROM users u JOIN orders o ON u.id = o.user_id
+                     GROUP BY u.flag;",
+                    by_flag,
+                ),
+                (
+                    "SELECT u.name, COUNT(*), COUNT(o.amount), SUM(o.amount)
+                     FROM users u JOIN orders o ON u.id = o.user_id AND o.amount > 0
+                     GROUP BY u.name;",
+                    positive.clone(),
+                ),
+                (
+                    "SELECT u.name, COUNT(*), COUNT(o.amount), SUM(o.amount)
+                     FROM users u JOIN orders o ON u.id = o.user_id
+                     WHERE o.amount > 0
+                     GROUP BY u.name;",
+                    positive,
+                ),
+                (
+                    "SELECT u.name, u.flag, COUNT(*), COUNT(o.amount), SUM(o.amount)
+                     FROM users u JOIN orders o ON u.id = o.user_id
+                     GROUP BY u.name, u.flag;",
+                    multiple,
+                ),
+                (
+                    "SELECT u.name, COUNT(*), COUNT(o.amount), SUM(o.amount)
+                     FROM users u JOIN orders o ON u.id = o.user_id
+                     GROUP BY u.name
+                     HAVING COUNT(*) >= 2
+                     ORDER BY SUM(o.amount) DESC NULLS LAST, u.name ASC
+                     LIMIT 2;",
+                    ordered,
+                ),
+                (
+                    "SELECT u.name, COUNT(*), COUNT(o.amount), SUM(o.amount)
+                     FROM users u JOIN orders o ON u.id = o.user_id
+                     GROUP BY u.name
+                     LIMIT 1;",
+                    first,
+                ),
+            ],
+            Some("CREATE INDEX idx_orders_user ON orders(user_id);"),
+        );
+
+        let (wide_outer, wide_inner) = inner_build_shop();
+        let expected = project_groups(&aggregate_equijoin(
+            &wide_outer,
+            &wide_inner,
+            0,
+            0,
+            None,
+            false,
+            1,
+            |row, _| vec![row[1].clone()],
+        ));
+        assert_eq!(
+            expected,
+            vec![
+                vec![
+                    Value::Text("n0".to_string()),
+                    Value::Integer(2),
+                    Value::Integer(1),
+                    Value::Integer(5),
+                ],
+                vec![
+                    Value::Text("n0b".to_string()),
+                    Value::Integer(2),
+                    Value::Integer(1),
+                    Value::Integer(5),
+                ],
+                vec![
+                    Value::Text("n1".to_string()),
+                    Value::Integer(1),
+                    Value::Integer(1),
+                    Value::Integer(8),
+                ],
+            ]
+        );
+        let load = |database: &mut Database| {
+            load_tables(
+                database,
+                "CREATE TABLE users (id INT, name TEXT, flag BOOLEAN);",
+                "CREATE TABLE orders (user_id INT, amount INT, flag BOOLEAN);",
+                "users",
+                "orders",
+                &wide_outer,
+                &wide_inner,
+            );
+        };
+        assert_cases(
+            &load,
+            &[(
+                "SELECT u.name, COUNT(*), COUNT(o.amount), SUM(o.amount)
+                 FROM users u JOIN orders o ON u.id = o.user_id
+                 GROUP BY u.name;",
+                expected,
+            )],
+            Some("CREATE INDEX idx_orders_user ON orders(user_id);"),
+        );
+    }
+
+    #[test]
+    fn text_and_boolean_join_aggregates_match_a_reference() {
+        let outer = vec![
+            vec![Value::Text("Ada".to_string()), Value::Integer(1)],
+            vec![Value::Text("Ada".to_string()), Value::Integer(2)],
+            vec![Value::Null, Value::Integer(3)],
+            vec![Value::Text("Bea".to_string()), Value::Integer(4)],
+            vec![Value::Text(String::new()), Value::Integer(5)],
+        ];
+        let inner = vec![
+            vec![Value::Text("Ada".to_string()), Value::Integer(10)],
+            vec![Value::Text("Ada".to_string()), Value::Null],
+            vec![Value::Null, Value::Integer(7)],
+            vec![Value::Text(String::new()), Value::Integer(8)],
+            vec![Value::Text("Cy".to_string()), Value::Integer(9)],
+        ];
+        let expected = project_groups(&aggregate_equijoin(
+            &outer,
+            &inner,
+            0,
+            0,
+            None,
+            false,
+            1,
+            |row, _| vec![row[0].clone()],
+        ));
+        assert_eq!(
+            expected,
+            vec![
+                vec![
+                    Value::Text("Ada".to_string()),
+                    Value::Integer(4),
+                    Value::Integer(2),
+                    Value::Integer(20),
+                ],
+                vec![
+                    Value::Text(String::new()),
+                    Value::Integer(1),
+                    Value::Integer(1),
+                    Value::Integer(8),
+                ],
+            ]
+        );
+        let load = |database: &mut Database| {
+            load_tables(
+                database,
+                "CREATE TABLE users (name TEXT, score INT);",
+                "CREATE TABLE codes (label TEXT, amount INT);",
+                "users",
+                "codes",
+                &outer,
+                &inner,
+            );
+        };
+        assert_cases(
+            &load,
+            &[(
+                "SELECT u.name, COUNT(*), COUNT(c.amount), SUM(c.amount)
+                 FROM users u JOIN codes c ON u.name = c.label
+                 GROUP BY u.name;",
+                expected,
+            )],
+            None,
+        );
+
+        let outer = vec![
+            vec![Value::Boolean(true), Value::Text("a".to_string())],
+            vec![Value::Boolean(true), Value::Text("b".to_string())],
+            vec![Value::Boolean(false), Value::Text("c".to_string())],
+            vec![Value::Null, Value::Text("d".to_string())],
+            vec![Value::Boolean(false), Value::Text("e".to_string())],
+        ];
+        let inner = vec![
+            vec![Value::Boolean(true), Value::Integer(5)],
+            vec![Value::Boolean(true), Value::Null],
+            vec![Value::Boolean(false), Value::Integer(7)],
+            vec![Value::Null, Value::Integer(9)],
+        ];
+        let expected = project_groups(&aggregate_equijoin(
+            &outer,
+            &inner,
+            0,
+            0,
+            None,
+            false,
+            1,
+            |row, _| vec![row[1].clone()],
+        ));
+        assert_eq!(
+            expected,
+            vec![
+                row4("a", 2, 1, Some(5)),
+                row4("b", 2, 1, Some(5)),
+                row4("c", 1, 1, Some(7)),
+                row4("e", 1, 1, Some(7)),
+            ]
+        );
+        let load = |database: &mut Database| {
+            load_tables(
+                database,
+                "CREATE TABLE users (flag BOOLEAN, name TEXT);",
+                "CREATE TABLE bits (flag BOOLEAN, amount INT);",
+                "users",
+                "bits",
+                &outer,
+                &inner,
+            );
+        };
+        assert_cases(
+            &load,
+            &[(
+                "SELECT u.name, COUNT(*), COUNT(b.amount), SUM(b.amount)
+                 FROM users u JOIN bits b ON u.flag = b.flag
+                 GROUP BY u.name;",
+                expected,
+            )],
+            None,
+        );
+    }
+
+    #[test]
+    fn self_join_aggregates_match_across_algorithms() {
+        let rows = vec![
+            vec![Value::Integer(1), Value::Text("Ada".to_string())],
+            vec![Value::Integer(1), Value::Text("Bea".to_string())],
+            vec![Value::Null, Value::Text("Cy".to_string())],
+            vec![Value::Integer(2), Value::Text("Dee".to_string())],
+            vec![Value::Integer(1), Value::Text("Ann".to_string())],
+        ];
+        let expected = project_groups(&aggregate_equijoin(
+            &rows,
+            &rows,
+            0,
+            0,
+            None,
+            true,
+            0,
+            |row, _| vec![row[1].clone()],
+        ));
+        assert_eq!(
+            expected,
+            vec![
+                row4("Ada", 3, 3, Some(3)),
+                row4("Bea", 3, 3, Some(3)),
+                row4("Dee", 1, 1, Some(2)),
+                row4("Ann", 3, 3, Some(3)),
+            ]
+        );
+        let load = |database: &mut Database| {
+            database
+                .execute("CREATE TABLE staff (team INT, name TEXT);")
+                .unwrap();
+            insert_rows(database, "staff", &rows);
+        };
+        assert_cases(
+            &load,
+            &[(
+                "SELECT e.name, COUNT(*), COUNT(e.team), SUM(e.team)
+                 FROM staff e JOIN staff b ON e.team = b.team
+                 GROUP BY e.name;",
+                expected,
+            )],
+            Some("CREATE INDEX idx_staff_team ON staff(team);"),
+        );
+    }
+
+    #[test]
+    fn empty_join_aggregates_match_across_algorithms() {
+        let scalar = vec![vec![Value::Integer(0), Value::Integer(0), Value::Null]];
+        let grouped = "SELECT u.name, COUNT(*), COUNT(o.amount), SUM(o.amount)
+            FROM users u JOIN orders o ON u.id = o.user_id
+            GROUP BY u.name;";
+        let scalar_sql = "SELECT COUNT(*), COUNT(o.amount), SUM(o.amount)
+            FROM users u JOIN orders o ON u.id = o.user_id;";
+        let kept = "SELECT COUNT(*), COUNT(o.amount), SUM(o.amount)
+            FROM users u JOIN orders o ON u.id = o.user_id
+            HAVING COUNT(*) = 0;";
+        let dropped = "SELECT COUNT(*), COUNT(o.amount), SUM(o.amount)
+            FROM users u JOIN orders o ON u.id = o.user_id
+            HAVING COUNT(*) >= 1;";
+        let load_empty = |database: &mut Database| {
+            database
+                .execute("CREATE TABLE users (id INT, name TEXT);")
+                .unwrap();
+            database
+                .execute("CREATE TABLE orders (user_id INT, amount INT);")
+                .unwrap();
+        };
+        assert_cases(
+            &load_empty,
+            &[
+                (scalar_sql, scalar.clone()),
+                (kept, scalar),
+                (dropped, Vec::new()),
+                (grouped, Vec::new()),
+            ],
+            Some("CREATE INDEX idx_orders_user ON orders(user_id);"),
+        );
+        let load_users = |database: &mut Database| {
+            database
+                .execute("CREATE TABLE users (id INT, name TEXT);")
+                .unwrap();
+            database
+                .execute("CREATE TABLE orders (user_id INT, amount INT);")
+                .unwrap();
+            database
+                .execute("INSERT INTO users VALUES (1, 'Ada');")
+                .unwrap();
+        };
+        assert_cases(
+            &load_users,
+            &[(
+                scalar_sql,
+                vec![vec![Value::Integer(0), Value::Integer(0), Value::Null]],
+            )],
+            Some("CREATE INDEX idx_orders_user ON orders(user_id);"),
+        );
+    }
+
+    #[test]
+    fn recorded_seeds_match_across_join_algorithms() {
+        for seed in REVIEW_SEEDS {
+            let (outer, inner) = generate_review_shop(seed);
+            let grouped = project_groups(&aggregate_equijoin(
+                &outer,
+                &inner,
+                0,
+                0,
+                None,
+                false,
+                1,
+                |row, _| vec![row[1].clone()],
+            ));
+            let pair_count = pair_rows(
+                &outer,
+                &inner,
+                |left, right| sql_eq(&left[0], &right[0]),
+                |_, _| Vec::new(),
+            )
+            .len() as i64;
+            let summed: i64 = grouped
+                .iter()
+                .map(|row| match row[1] {
+                    Value::Integer(count) => count,
+                    _ => panic!("count"),
+                })
+                .sum();
+            assert_eq!(summed, pair_count, "seed {seed:#x}");
+            let paid = project_groups(&aggregate_equijoin(
+                &outer,
+                &inner,
+                0,
+                0,
+                Some(&|_, inner| matches!(inner[2], Value::Boolean(true))),
+                false,
+                1,
+                |row, _| vec![row[1].clone()],
+            ));
+            let mut having = aggregate_equijoin(&outer, &inner, 0, 0, None, false, 1, |row, _| {
+                vec![row[1].clone()]
+            });
+            having.retain(|group| group.count >= 2 && matches!(group.sum, Some(sum) if sum > 0));
+            let having = project_groups(&having);
+            let both = project_groups(&aggregate_equijoin(
+                &outer,
+                &inner,
+                0,
+                0,
+                None,
+                false,
+                1,
+                |row, _| vec![row[1].clone(), row[2].clone()],
+            ));
+            let load = |database: &mut Database| {
+                load_tables(
+                    database,
+                    "CREATE TABLE users (id INT, name TEXT, flag BOOLEAN);",
+                    "CREATE TABLE orders (user_id INT, amount INT, flag BOOLEAN);",
+                    "users",
+                    "orders",
+                    &outer,
+                    &inner,
+                );
+            };
+            assert_cases(
+                &load,
+                &[
+                    (
+                        "SELECT u.name, COUNT(*), COUNT(o.amount), SUM(o.amount)
+                         FROM users u JOIN orders o ON u.id = o.user_id
+                         GROUP BY u.name;",
+                        grouped,
+                    ),
+                    (
+                        "SELECT u.name, COUNT(*), COUNT(o.amount), SUM(o.amount)
+                         FROM users u JOIN orders o ON u.id = o.user_id
+                         WHERE o.flag = TRUE
+                         GROUP BY u.name;",
+                        paid,
+                    ),
+                    (
+                        "SELECT u.name, COUNT(*), COUNT(o.amount), SUM(o.amount)
+                         FROM users u JOIN orders o ON u.id = o.user_id
+                         GROUP BY u.name
+                         HAVING COUNT(*) >= 2 AND SUM(o.amount) > 0;",
+                        having,
+                    ),
+                    (
+                        "SELECT u.name, u.flag, COUNT(*), COUNT(o.amount), SUM(o.amount)
+                         FROM users u JOIN orders o ON u.id = o.user_id
+                         GROUP BY u.name, u.flag;",
+                        both,
+                    ),
+                ],
+                Some("CREATE INDEX idx_orders_user ON orders(user_id);"),
+            );
+        }
+    }
+
+    #[test]
+    fn late_overflow_agrees_across_join_algorithms() {
+        let load = |database: &mut Database| {
+            database
+                .execute("CREATE TABLE users (id INT, name TEXT);")
+                .unwrap();
+            database
+                .execute("CREATE TABLE orders (user_id INT, amount INT);")
+                .unwrap();
+            database
+                .execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Bea');")
+                .unwrap();
+            database
+                .execute(
+                    "INSERT INTO orders VALUES (1, 10), (1, 5), (2, 9223372036854775807), (2, 1);",
+                )
+                .unwrap();
+        };
+        let queries = [
+            "SELECT u.name, SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name;",
+            "SELECT u.name, SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name HAVING u.name = 'Ada';",
+            "SELECT u.name, SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name HAVING SUM(o.amount) < 0;",
+            "SELECT u.name, SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name LIMIT 1;",
+            "SELECT u.name, SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name LIMIT 0;",
+        ];
+        let mut memory = Database::new();
+        load(&mut memory);
+        for sql in queries {
+            assert_overflow(&mut memory, sql, "");
+            let nested = {
+                let _force = ForceNestedJoin::new();
+                memory.execute(sql).unwrap_err().to_string()
+            };
+            assert_eq!(nested, "SUM overflows INTEGER", "{sql}");
+            let stored = {
+                let _guard = MaterializeAggregate::new();
+                memory.execute(sql).unwrap_err().to_string()
+            };
+            assert_eq!(stored, "SUM overflows INTEGER", "{sql}");
+        }
+        assert_eq!(
+            query(&mut memory, "SELECT COUNT(*) FROM users;").rows,
+            vec![vec![Value::Integer(2)]]
+        );
+        let dir = crate::test_dir::TestDir::new("review-overflow");
+        let path = dir.join("db");
+        {
+            let mut database = Database::open(&path).unwrap();
+            load(&mut database);
+        }
+        Database::migrate(&path).unwrap();
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE INDEX idx_orders_user ON orders(user_id);")
+            .unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+        for sql in queries {
+            let indexed = {
+                let _force = ForceIndexJoin::new();
+                database.execute(sql).unwrap_err().to_string()
+            };
+            assert_eq!(indexed, "SUM overflows INTEGER", "{sql}");
+        }
+        let explained = {
+            let _force = ForceIndexJoin::new();
+            query(
+                &mut database,
+                "EXPLAIN SELECT u.name, SUM(o.amount)
+                 FROM users u JOIN orders o ON u.id = o.user_id
+                 GROUP BY u.name HAVING u.name = 'Ada' LIMIT 1;",
+            )
+        };
+        assert_eq!(
+            explained.rows[0][4],
+            Value::Text("IndexNestedLoopJoin".to_string())
+        );
+        drop(database);
+        let mut wal = path.clone().into_os_string();
+        wal.push(".wal");
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+    }
+
+    #[test]
+    fn explain_reports_the_algorithm_execution_uses() {
+        let (outer, inner) = outer_build_shop();
+        let mut database = Database::new();
+        load_tables(
+            &mut database,
+            "CREATE TABLE users (id INT, name TEXT, flag BOOLEAN);",
+            "CREATE TABLE orders (user_id INT, amount INT, flag BOOLEAN);",
+            "users",
+            "orders",
+            &outer,
+            &inner,
+        );
+        let sql = "SELECT u.name, COUNT(*), SUM(o.amount)
+            FROM users u JOIN orders o ON u.id = o.user_id AND o.amount > 0
+            GROUP BY u.name
+            HAVING SUM(o.amount) > 0 AND SUM(o.amount) > 0
+            ORDER BY COUNT(*);";
+        let hashed = query(&mut database, sql).rows;
+        let explained = query(&mut database, &format!("EXPLAIN {sql}"));
+        assert_eq!(
+            explained.rows[0][2],
+            Value::Text("COUNT(*), SUM(o.amount)".to_string())
+        );
+        assert_eq!(explained.rows[0][4], Value::Text("HashJoin".to_string()));
+        assert_eq!(explained.rows[0][7], Value::Text("u (users)".to_string()));
+        assert_eq!(
+            explained.rows[0][9],
+            Value::Text("u.id = o.user_id".to_string())
+        );
+        assert_eq!(
+            explained.rows[0][10],
+            Value::Text("u.id = o.user_id AND o.amount > 0".to_string())
+        );
+        let nested_plan = {
+            let _force = ForceNestedJoin::new();
+            let explained = query(&mut database, &format!("EXPLAIN {sql}"));
+            let rows = query(&mut database, sql).rows;
+            assert_eq!(rows, hashed);
+            explained
+        };
+        assert_eq!(
+            nested_plan.rows[0][4],
+            Value::Text("NestedLoopJoin".to_string())
+        );
+        let plain = "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id;";
+        assert_eq!(
+            query(&mut database, &format!("EXPLAIN {plain}")).rows[0][0],
+            Value::Text("HashJoin".to_string())
+        );
+        {
+            let _force = ForceNestedJoin::new();
+            assert_eq!(
+                query(&mut database, &format!("EXPLAIN {plain}")).rows[0][0],
+                Value::Text("NestedLoopJoin".to_string())
+            );
+        }
+
+        let dir = crate::test_dir::TestDir::new("review-explain");
+        let path = dir.join("db");
+        {
+            let mut stored = Database::open(&path).unwrap();
+            load_tables(
+                &mut stored,
+                "CREATE TABLE users (id INT, name TEXT, flag BOOLEAN);",
+                "CREATE TABLE orders (user_id INT, amount INT, flag BOOLEAN);",
+                "users",
+                "orders",
+                &outer,
+                &inner,
+            );
+        }
+        Database::migrate(&path).unwrap();
+        let mut stored = Database::open(&path).unwrap();
+        stored
+            .execute("CREATE INDEX idx_orders_user ON orders(user_id);")
+            .unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+        let unforced = query(&mut stored, &format!("EXPLAIN {sql}"));
+        assert_eq!(unforced.rows[0][4], Value::Text("HashJoin".to_string()));
+        let indexed = {
+            let _force = ForceIndexJoin::new();
+            let explained = query(&mut stored, &format!("EXPLAIN {sql}"));
+            let rows = query(&mut stored, sql).rows;
+            assert_eq!(rows, hashed);
+            explained
+        };
+        assert_eq!(
+            indexed.rows[0][4],
+            Value::Text("IndexNestedLoopJoin".to_string())
+        );
+        assert_eq!(
+            indexed.rows[0][8],
+            Value::Text("idx_orders_user".to_string())
+        );
+        let ambiguous =
+            "SELECT flag, COUNT(*) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY flag;";
+        let select_error = stored.execute(ambiguous).unwrap_err().to_string();
+        let explain_error = stored
+            .execute(&format!("EXPLAIN {ambiguous}"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(select_error, "column 'flag' is ambiguous");
+        assert_eq!(explain_error, select_error);
+        drop(stored);
+        let mut wal = path.clone().into_os_string();
+        wal.push(".wal");
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+    }
+
+    fn assert_overflow(database: &mut Database, sql: &str, label: &str) {
+        assert_eq!(
+            database.execute(sql).unwrap_err().to_string(),
+            "SUM overflows INTEGER",
+            "{label}{sql}"
+        );
+    }
+
+    fn assert_cases(
+        load: &dyn Fn(&mut Database),
+        cases: &[(&str, Vec<Vec<Value>>)],
+        index_sql: Option<&str>,
+    ) {
+        let mut memory = Database::new();
+        load(&mut memory);
+        for (sql, expected) in cases {
+            assert_eq!(query(&mut memory, sql).rows, *expected, "hash {sql}");
+            let nested = {
+                let _force = ForceNestedJoin::new();
+                query(&mut memory, sql).rows
+            };
+            assert_eq!(nested, *expected, "nested {sql}");
+            let stored = {
+                let _guard = MaterializeAggregate::new();
+                query(&mut memory, sql).rows
+            };
+            assert_eq!(stored, *expected, "materialized {sql}");
+            let nested_stored = {
+                let _force = ForceNestedJoin::new();
+                let _guard = MaterializeAggregate::new();
+                query(&mut memory, sql).rows
+            };
+            assert_eq!(nested_stored, *expected, "nested materialized {sql}");
+            let collided = {
+                let _force = ForceHashCollision::new();
+                query(&mut memory, sql).rows
+            };
+            assert_eq!(collided, *expected, "collided {sql}");
+        }
+        let Some(index_sql) = index_sql else {
+            return;
+        };
+        let dir = crate::test_dir::TestDir::new("review-algorithms");
+        let path = dir.join("db");
+        {
+            let mut database = Database::open(&path).unwrap();
+            load(&mut database);
+        }
+        Database::migrate(&path).unwrap();
+        let mut database = Database::open(&path).unwrap();
+        database.execute(index_sql).unwrap();
+        let _force = ForceIndexJoin::new();
+        for (sql, expected) in cases {
+            assert_eq!(query(&mut database, sql).rows, *expected, "index {sql}");
+        }
+    }
+
+    fn aggregate_sql(
+        projection: &str,
+        outer: &str,
+        inner: &str,
+        on: &str,
+        selection: &str,
+        groups: &str,
+        tail: &str,
+    ) -> String {
+        format!(
+            "SELECT {projection} FROM {outer} JOIN {inner} ON {on}{selection} GROUP BY {groups}{tail};"
+        )
+    }
+
+    fn row4(name: &str, count: i64, counted: i64, sum: Option<i64>) -> Vec<Value> {
+        vec![
+            Value::Text(name.to_string()),
+            Value::Integer(count),
+            Value::Integer(counted),
+            sum.map(Value::Integer).unwrap_or(Value::Null),
+        ]
+    }
+
+    struct RefGroup {
+        key: Vec<Value>,
+        count: i64,
+        counted: i64,
+        sum: Option<i64>,
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn aggregate_equijoin(
+        outer: &[Vec<Value>],
+        inner: &[Vec<Value>],
+        outer_key: usize,
+        inner_key: usize,
+        extra: Option<&dyn Fn(&[Value], &[Value]) -> bool>,
+        sum_outer: bool,
+        sum_at: usize,
+        group_key: impl Fn(&[Value], &[Value]) -> Vec<Value>,
+    ) -> Vec<RefGroup> {
+        let mut groups: Vec<RefGroup> = Vec::new();
+        for outer_row in outer {
+            for inner_row in inner {
+                if !sql_eq(&outer_row[outer_key], &inner_row[inner_key]) {
+                    continue;
+                }
+                if extra.is_some_and(|extra| !extra(outer_row, inner_row)) {
+                    continue;
+                }
+                let key = group_key(outer_row, inner_row);
+                let summed = if sum_outer { outer_row } else { inner_row };
+                let amount = match summed.get(sum_at) {
+                    Some(Value::Null) => None,
+                    Some(Value::Integer(amount)) => Some(*amount),
+                    Some(other) => panic!("amount is {other:?}"),
+                    None => panic!("amount column is outside the row"),
+                };
+                if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
+                    group.count += 1;
+                    if let Some(amount) = amount {
+                        group.counted += 1;
+                        group.sum = Some(group.sum.unwrap_or(0).checked_add(amount).unwrap());
+                    }
+                } else {
+                    groups.push(RefGroup {
+                        key,
+                        count: 1,
+                        counted: i64::from(amount.is_some()),
+                        sum: amount,
+                    });
+                }
+            }
+        }
+        groups
+    }
+
+    fn project_groups(groups: &[RefGroup]) -> Vec<Vec<Value>> {
+        groups
+            .iter()
+            .map(|group| {
+                let mut row = group.key.clone();
+                row.push(Value::Integer(group.count));
+                row.push(Value::Integer(group.counted));
+                row.push(group.sum.map(Value::Integer).unwrap_or(Value::Null));
+                row
+            })
+            .collect()
+    }
+
+    fn order_groups(groups: &mut [RefGroup], name_at: usize) {
+        groups.sort_by(|left, right| {
+            cmp_sum_desc_nulls_last(left.sum, right.sum)
+                .then_with(|| cmp_asc_nulls_last(&left.key[name_at], &right.key[name_at]))
+        });
+    }
+
+    fn cmp_sum_desc_nulls_last(left: Option<i64>, right: Option<i64>) -> Ordering {
+        match (left, right) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(left), Some(right)) => right.cmp(&left),
+        }
+    }
+
+    fn cmp_asc_nulls_last(left: &Value, right: &Value) -> Ordering {
+        match (left, right) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Greater,
+            (_, Value::Null) => Ordering::Less,
+            (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
+            (Value::Text(left), Value::Text(right)) => left.cmp(right),
+            (Value::Boolean(left), Value::Boolean(right)) => left.cmp(right),
+            _ => Ordering::Equal,
+        }
+    }
+
+    fn pair_rows(
+        outer: &[Vec<Value>],
+        inner: &[Vec<Value>],
+        keep: impl Fn(&[Value], &[Value]) -> bool,
+        project: impl Fn(&[Value], &[Value]) -> Vec<Value>,
+    ) -> Vec<Vec<Value>> {
+        let mut rows = Vec::new();
+        for outer_row in outer {
+            for inner_row in inner {
+                if keep(outer_row, inner_row) {
+                    rows.push(project(outer_row, inner_row));
+                }
+            }
+        }
+        rows
+    }
+
+    fn sql_eq(left: &Value, right: &Value) -> bool {
+        match (left, right) {
+            (Value::Integer(left), Value::Integer(right)) => left == right,
+            (Value::Text(left), Value::Text(right)) => left == right,
+            (Value::Boolean(left), Value::Boolean(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    fn outer_build_shop() -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
+        let outer = vec![
+            shop_user(Some(1), "Ada", Some(true)),
+            shop_user(Some(1), "Ada", Some(false)),
+            shop_user(Some(1), "Al", Some(true)),
+            shop_user(Some(2), "Bea", None),
+            shop_user(Some(3), "Dee", Some(true)),
+            shop_user(None, "Cy", Some(false)),
+        ];
+        let mut inner = Vec::new();
+        for amount in 1..=5 {
+            inner.push(shop_order(Some(1), Some(amount), Some(true)));
+            inner.push(shop_order(Some(1), None, Some(false)));
+        }
+        inner.push(shop_order(Some(2), None, Some(true)));
+        inner.push(shop_order(Some(2), Some(8), Some(true)));
+        inner.push(shop_order(Some(3), None, Some(true)));
+        inner.push(shop_order(Some(3), None, Some(false)));
+        inner.push(shop_order(None, Some(5), Some(true)));
+        inner.push(shop_order(Some(9), Some(4), Some(true)));
+        (outer, inner)
+    }
+
+    fn inner_build_shop() -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
+        let mut outer = Vec::new();
+        outer.push(shop_user(Some(0), "n0", Some(true)));
+        outer.push(shop_user(Some(0), "n0b", Some(false)));
+        for id in 1..7 {
+            outer.push(shop_user(Some(id), &format!("n{id}"), Some(id % 2 == 0)));
+        }
+        outer.push(shop_user(None, "tail", None));
+        let inner = vec![
+            shop_order(Some(0), Some(5), Some(true)),
+            shop_order(Some(0), None, Some(false)),
+            shop_order(Some(1), Some(8), Some(true)),
+        ];
+        (outer, inner)
+    }
+
+    fn shop_user(id: Option<i64>, name: &str, flag: Option<bool>) -> Vec<Value> {
+        vec![opt_int(id), Value::Text(name.to_string()), opt_bool(flag)]
+    }
+
+    fn shop_order(user_id: Option<i64>, amount: Option<i64>, flag: Option<bool>) -> Vec<Value> {
+        vec![opt_int(user_id), opt_int(amount), opt_bool(flag)]
+    }
+
+    fn copied_int(value: &Value) -> Option<i64> {
+        match value {
+            Value::Integer(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn opt_int(value: Option<i64>) -> Value {
+        value.map(Value::Integer).unwrap_or(Value::Null)
+    }
+
+    fn opt_bool(value: Option<bool>) -> Value {
+        value.map(Value::Boolean).unwrap_or(Value::Null)
+    }
+
+    fn load_tables(
+        database: &mut Database,
+        outer_sql: &str,
+        inner_sql: &str,
+        outer_name: &str,
+        inner_name: &str,
+        outer: &[Vec<Value>],
+        inner: &[Vec<Value>],
+    ) {
+        database.execute(outer_sql).unwrap();
+        if outer_name != inner_name {
+            database.execute(inner_sql).unwrap();
+        }
+        insert_rows(database, outer_name, outer);
+        if outer_name != inner_name {
+            insert_rows(database, inner_name, inner);
+        }
+    }
+
+    fn insert_rows(database: &mut Database, table: &str, rows: &[Vec<Value>]) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut sql = format!("INSERT INTO {table} VALUES ");
+        for (index, row) in rows.iter().enumerate() {
+            if index > 0 {
+                sql.push(',');
+            }
+            sql.push('(');
+            for (column, value) in row.iter().enumerate() {
+                if column > 0 {
+                    sql.push(',');
+                }
+                sql.push_str(&sql_literal(value));
+            }
+            sql.push(')');
+        }
+        database.execute(&sql).unwrap();
+    }
+
+    fn sql_literal(value: &Value) -> String {
+        match value {
+            Value::Null => "NULL".to_string(),
+            Value::Integer(value) => value.to_string(),
+            Value::Boolean(true) => "TRUE".to_string(),
+            Value::Boolean(false) => "FALSE".to_string(),
+            Value::Text(text) => {
+                let mut out = String::from("'");
+                for ch in text.chars() {
+                    if ch == '\'' {
+                        out.push('\'');
+                    }
+                    out.push(ch);
+                }
+                out.push('\'');
+                out
+            }
+        }
+    }
+
+    fn generate_review_shop(seed: u64) -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
+        let mut state = seed;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        let users = 4 + (next() % 5) as usize;
+        let mut outer: Vec<Vec<Value>> = Vec::with_capacity(users);
+        for index in 0..users {
+            let mut id = if next() % 5 == 0 {
+                None
+            } else {
+                Some(i64::try_from(index).unwrap())
+            };
+            if index > 0 && next() % 4 == 0 {
+                id = copied_int(&outer[0][0]);
+            }
+            let flag = match next() % 3 {
+                0 => None,
+                1 => Some(false),
+                _ => Some(true),
+            };
+            outer.push(shop_user(id, &format!("n{index}"), flag));
+        }
+        let orders = 6 + (next() % 10) as usize;
+        let mut inner = Vec::with_capacity(orders);
+        for index in 0..orders {
+            let user_id = match next() % 5 {
+                0 => None,
+                1 => Some(50 + i64::try_from(index).unwrap()),
+                _ => copied_int(&outer[(next() as usize) % outer.len()][0]),
+            };
+            let amount = if next() % 3 == 0 {
+                None
+            } else {
+                Some(i64::try_from(next() % 20).unwrap())
+            };
+            let flag = match next() % 3 {
+                0 => None,
+                1 => Some(false),
+                _ => Some(true),
+            };
+            inner.push(shop_order(user_id, amount, flag));
+        }
+        (outer, inner)
+    }
+
+    #[test]
+    #[ignore = "release profile of join aggregation"]
+    fn profile_join_aggregation() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let memory = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!("join_aggregate cpu={cpu} mem_bytes={memory} rustc={rustc}");
+        for users in [200_i64, 1_000, 4_000] {
+            profile_join_shape(users, "bucket", false, false);
+            profile_join_shape(users, "id", false, false);
+            profile_join_shape(users, "bucket", true, false);
+        }
+        for users in [1_000_i64, 4_000] {
+            profile_join_shape(users, "bucket", false, true);
+            profile_join_shape(users, "id", false, true);
+        }
+        let dir = crate::test_dir::TestDir::new("join-agg-profile");
+        let path = dir.join("db");
+        for users in [200_i64, 1_000, 4_000] {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}.wal", path.display()));
+            let mut database = Database::open(&path).unwrap();
+            load_join_profile(&mut database, users);
+            drop(database);
+            Database::migrate(&path).unwrap();
+            let mut database = Database::open(&path).unwrap();
+            database
+                .execute("CREATE INDEX idx_orders_user ON orders(user_id);")
+                .unwrap();
+            profile_join_query(&mut database, users, "index", "bucket", false, false);
+            profile_join_query(&mut database, users, "index", "id", false, false);
+            profile_join_query(&mut database, users, "index", "bucket", true, false);
+        }
+    }
+
+    fn profile_join_shape(users: i64, key: &str, having: bool, materialize: bool) {
+        let mut nested = Database::new();
+        load_join_profile(&mut nested, users);
+        profile_join_query(&mut nested, users, "nested", key, having, materialize);
+        let mut hashed = Database::new();
+        load_join_profile(&mut hashed, users);
+        profile_join_query(&mut hashed, users, "hash", key, having, materialize);
+    }
+
+    fn profile_join_query(
+        database: &mut Database,
+        users: i64,
+        algorithm: &str,
+        key: &str,
+        having: bool,
+        materialize: bool,
+    ) {
+        let threshold = users.saturating_mul(4) / 10;
+        let having_sql = if having {
+            format!(" HAVING COUNT(*) >= {threshold}")
+        } else {
+            String::new()
+        };
+        let sql = format!(
+            "SELECT u.{key}, COUNT(*), SUM(o.amount)
+             FROM users u JOIN orders o ON u.id = o.user_id
+             GROUP BY u.{key}{having_sql};"
+        );
+        let _nested = (algorithm == "nested").then(ForceNestedJoin::new);
+        let _index = (algorithm == "index").then(ForceIndexJoin::new);
+        let _stored = materialize.then(MaterializeAggregate::new);
+        let mode = if materialize {
+            "materialized"
+        } else {
+            "stream"
+        };
+        let mut samples = Vec::with_capacity(6);
+        let mut groups = 0usize;
+        let mut checksum = 0i64;
+        for _ in 0..6 {
+            let started = std::time::Instant::now();
+            let result = query(database, &sql);
+            samples.push(started.elapsed().as_micros());
+            checksum = 0;
+            for row in &result.rows {
+                let Value::Integer(count) = row[1] else {
+                    panic!("expected a count");
+                };
+                checksum = checksum.wrapping_add(count);
+            }
+            groups = result.rows.len();
+            std::hint::black_box(&result.rows);
+        }
+        let orders = users.saturating_mul(4);
+        let matches = usize::try_from(orders).unwrap_or(usize::MAX);
+        let cold = samples[0];
+        let mut warm = samples[1..].to_vec();
+        warm.sort_unstable();
+        let warm = warm[warm.len() / 2];
+        let returned = groups;
+        let accumulated = if key == "bucket" { 10 } else { returned };
+        let bytes = join_group_bytes(accumulated, 1, 2);
+        let pair_bytes = matches.saturating_mul(24 + 5 * 24);
+        println!(
+            "join_aggregate algo={algorithm} mode={mode} users={users} orders={orders} matches={matches} key={key} returned={returned} groups={accumulated} having={having} bytes={bytes} pair_bytes={pair_bytes} checksum={checksum} cold_us={cold} warm_us={warm}"
+        );
+    }
+
+    fn load_join_profile(database: &mut Database, users: i64) {
+        database
+            .execute("CREATE TABLE users (id INT, name TEXT, bucket INT);")
+            .unwrap();
+        database
+            .execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        let mut start = 0_i64;
+        while start < users {
+            let end = (start + 499).min(users - 1);
+            let mut sql = String::from("INSERT INTO users VALUES ");
+            for id in start..=end {
+                if id != start {
+                    sql.push(',');
+                }
+                sql.push_str(&format!("({id}, 'u{id}', {})", id % 10));
+            }
+            database.execute(&sql).unwrap();
+            start = end + 1;
+        }
+        let orders = users.saturating_mul(4);
+        let mut start = 0_i64;
+        while start < orders {
+            let end = (start + 499).min(orders - 1);
+            let mut sql = String::from("INSERT INTO orders VALUES ");
+            for id in start..=end {
+                if id != start {
+                    sql.push(',');
+                }
+                let user = if id % 3 == 0 { 0 } else { id % users };
+                if id % 2 == 0 {
+                    sql.push_str(&format!("({user}, NULL)"));
+                } else {
+                    sql.push_str(&format!("({user}, {id})"));
+                }
+            }
+            database.execute(&sql).unwrap();
+            start = end + 1;
+        }
+    }
+
+    fn join_group_bytes(groups: usize, key_cells: usize, aggs: usize) -> usize {
+        let value = std::mem::size_of::<Value>();
+        let vector = std::mem::size_of::<Vec<Value>>();
+        let accumulator = 16usize;
+        let keys = groups.saturating_mul(vector.saturating_add(key_cells.saturating_mul(value)));
+        let acc = groups.saturating_mul(vector.saturating_add(aggs.saturating_mul(accumulator)));
+        let map_entry = std::mem::size_of::<u64>()
+            + std::mem::size_of::<Vec<usize>>()
+            + std::mem::size_of::<usize>();
+        keys.saturating_add(acc)
+            .saturating_add(groups.saturating_mul(map_entry))
     }
 }

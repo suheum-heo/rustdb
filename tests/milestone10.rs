@@ -294,16 +294,18 @@ fn invalid_aggregates_are_rejected_before_reading_rows() {
     assert_eq!(
         failure(
             &mut database,
-            "SELECT COUNT(*) FROM employees HAVING COUNT(*) > 1;"
+            "SELECT COUNT(*) FROM employees HAVING AVG(salary) > 1;"
         ),
-        "HAVING is not supported"
+        "function calls are not supported"
     );
     assert_eq!(
         failure(
             &mut database,
-            "SELECT COUNT(*) FROM employees e JOIN employees b ON e.team = b.team;"
+            "SELECT COUNT(*) FROM employees e
+             JOIN employees b ON e.team = b.team
+             JOIN employees c ON e.team = c.team;"
         ),
-        "aggregates over JOIN are not supported"
+        "multiple JOINs are not supported"
     );
     assert_eq!(
         failure(
@@ -426,6 +428,7 @@ fn explain_names_the_aggregate_and_leaves_ordinary_selects_alone() {
             "index".to_string(),
             "bounds".to_string(),
             "filter".to_string(),
+            "having".to_string(),
         ]
     );
     assert_eq!(explained.rows[0][0], text("HashAggregate"));
@@ -433,6 +436,7 @@ fn explain_names_the_aggregate_and_leaves_ordinary_selects_alone() {
     assert_eq!(explained.rows[0][2], text("COUNT(*), SUM(salary)"));
     assert_eq!(explained.rows[0][3], text("SeqScan"));
     assert_eq!(explained.rows[0][6], text("active = TRUE"));
+    assert_eq!(explained.rows[0][7], Value::Null);
     let scalar = query(&mut database, "EXPLAIN SELECT COUNT(*) FROM employees;");
     assert_eq!(scalar.rows[0][0], text("Aggregate"));
     assert_eq!(scalar.rows[0][1], Value::Null);
