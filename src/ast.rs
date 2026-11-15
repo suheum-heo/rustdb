@@ -176,15 +176,28 @@ pub(crate) enum Projection {
 }
 
 /// One item in an explicit select list.
+///
+/// `alias` is the name written with `AS` or as an implicit alias. `None` means
+/// the output name is the schema column name or the rendered aggregate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SelectItem {
     /// A column of an input table.
-    Column(SelectColumn),
-    /// `COUNT` or `SUM`.
-    Aggregate(AggregateCall),
+    Column {
+        /// The bound column. The alias does not replace it.
+        column: SelectColumn,
+        /// Explicit output name.
+        alias: Option<String>,
+    },
+    /// `COUNT`, `SUM`, `AVG`, `MIN`, or `MAX`.
+    Aggregate {
+        /// The call that owns the accumulator.
+        call: AggregateCall,
+        /// Explicit output name.
+        alias: Option<String>,
+    },
 }
 
-/// `COUNT` or `SUM` in the select list or in `ORDER BY`.
+/// `COUNT`, `SUM`, `AVG`, `MIN`, or `MAX` in the select list, `HAVING`, or `ORDER BY`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AggregateCall {
     /// Which function.
@@ -200,6 +213,12 @@ pub(crate) enum AggregateFunction {
     Count,
     /// `SUM` of an integer column.
     Sum,
+    /// `AVG` of an integer column. The result is a query-only ratio.
+    Avg,
+    /// `MIN` of an integer, text, or boolean column.
+    Min,
+    /// `MAX` of an integer, text, or boolean column.
+    Max,
 }
 
 /// The argument of `COUNT` or `SUM`.
@@ -217,6 +236,9 @@ impl AggregateCall {
         let name = match self.function {
             AggregateFunction::Count => "COUNT",
             AggregateFunction::Sum => "SUM",
+            AggregateFunction::Avg => "AVG",
+            AggregateFunction::Min => "MIN",
+            AggregateFunction::Max => "MAX",
         };
         match &self.argument {
             AggregateArg::Star => format!("{name}(*)"),
@@ -270,8 +292,8 @@ pub(crate) enum Expr {
     IsNull(Box<Expr>),
     /// `IS NOT NULL`.
     IsNotNull(Box<Expr>),
-    /// `COUNT` or `SUM`. Produced for `HAVING`. A select-list aggregate stays
-    /// a [`SelectItem`].
+    /// An aggregate produced for `HAVING` or `ORDER BY`. A select-list aggregate
+    /// stays a [`SelectItem`].
     Aggregate(AggregateCall),
 }
 
@@ -316,6 +338,7 @@ fn write_expr(expr: &Expr, parent: u8, out: &mut String) {
         Expr::Literal(Value::Boolean(true)) => out.push_str("TRUE"),
         Expr::Literal(Value::Boolean(false)) => out.push_str("FALSE"),
         Expr::Literal(Value::Text(text)) => push_sql_text(out, text),
+        Expr::Literal(value @ Value::Ratio { .. }) => out.push_str(&value.to_string()),
         Expr::Column { name, qualifier } => {
             if let Some(qualifier) = qualifier {
                 out.push_str(qualifier);

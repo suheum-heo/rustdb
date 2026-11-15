@@ -353,7 +353,7 @@ fn nested_aggregates_are_rejected() {
         "nested aggregates are not supported"
     );
     assert_eq!(
-        failure(&mut database, "SELECT AVG(amount) FROM orders;"),
+        failure(&mut database, "SELECT percentile(amount) FROM orders;"),
         "function calls are not supported"
     );
 }

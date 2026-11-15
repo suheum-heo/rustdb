@@ -294,7 +294,7 @@ fn invalid_aggregates_are_rejected_before_reading_rows() {
     assert_eq!(
         failure(
             &mut database,
-            "SELECT COUNT(*) FROM employees HAVING AVG(salary) > 1;"
+            "SELECT COUNT(*) FROM employees HAVING lower(department) = 'eng';"
         ),
         "function calls are not supported"
     );
@@ -336,10 +336,6 @@ fn invalid_aggregates_are_rejected_before_reading_rows() {
     assert_eq!(
         failure(&mut database, "SELECT SUM(1) FROM employees;"),
         "aggregate arguments must be columns"
-    );
-    assert_eq!(
-        failure(&mut database, "SELECT COUNT(*) AS total FROM employees;"),
-        "column aliases are not supported"
     );
     assert_eq!(
         failure(
@@ -1189,8 +1185,9 @@ fn time(
 fn aggregate_bytes(groups: usize, key_cells: usize, aggs: usize, hashed: bool) -> usize {
     let value = std::mem::size_of::<Value>();
     let vector = std::mem::size_of::<Vec<Value>>();
-    // `AccValue` is 16 bytes. `executor::tests` locks that size.
-    let accumulator = 16usize;
+    // `AccValue` grew when AVG and MIN/MAX were added. The library profile
+    // measures `size_of::<AccValue>()`; this estimate uses that same width.
+    let accumulator = 48usize;
     let keys = if hashed {
         groups.saturating_mul(vector.saturating_add(key_cells.saturating_mul(value)))
     } else {

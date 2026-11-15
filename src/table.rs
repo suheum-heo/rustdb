@@ -125,6 +125,7 @@ impl Table {
                     self.name
                 )));
             };
+            value.ensure_persistent()?;
             if let Some(actual) = value.data_type()
                 && actual != column.data_type()
             {

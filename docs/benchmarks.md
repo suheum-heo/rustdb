@@ -418,6 +418,50 @@ Rows whose `Returned` column is 1 are the `HAVING` samples. The threshold keeps 
 
 At 4,000 users the streaming hash join takes 1,575 µs for 10 groups and 2,028 µs for 4,000 groups. The nested loop takes 362,340 µs and 364,137 µs. Both of those paths stream, so that gap is the join algorithm. The index probe takes 4,269 µs and 4,867 µs, also streaming. Storing the joined rows before grouping adds 642 µs on the 10-group hash path (2,217 µs) and 691 µs on the 4,000-group hash path (2,719 µs). The nested-loop materialized times are 373,546 µs and 374,993 µs. The stored pairs would be 2,304,000 bytes. The grouping state is 1,440 bytes for 10 groups and 576,000 bytes for 4,000 groups. `HAVING` warm times are 1,583 µs for the hash join and 370,212 µs for the nested loop. The filter drops nine groups after they have been accumulated, so the 10-group estimate still applies. The outer-build hash path also keeps 256,000 bytes of match positions at this size. That buffer is separate from `bytes` and from `pair_bytes`.
 
+## Milestone 12 AVG, MIN, MAX
+
+One release run on an in-memory database, 15 November 2026. The comparison fast path is the `i128` product. These queries do not overflow it.
+
+```text
+cargo test --release --offline --lib profile_milestone12 -- --ignored --nocapture
+```
+
+`milestone12 cpu=Apple M5 mem_bytes=17179869184 rustc=rustc 1.100.0 (0ef1bc386 2026-11-09) acc_bytes=48 value_bytes=32`
+
+`staff` has `id`, `name`, `bucket = id % 10`, `salary = id`, and `active`. `users` has the same ids and buckets. `orders` has four rows per user; even order ids store `NULL` and odd ids store the order id. The timer starts after the inserts. Each shape runs six times. Cold is the first sample. Warm is the median of the other five. A scalar `bytes` value is one accumulator vector. A grouped `bytes` value is the key vector, the accumulator vector, and one hash-map entry per accumulated group, including groups that `HAVING` later drops. Neither figure is process RSS.
+
+`SUM(salary)` of `0 .. rows-1` is `(rows-1)*rows/2`. The printed checksums match that integer: 499,500, 49,995,000, and 4,999,950,000. `AVG` of the same column is `(rows-1)/2`. The checksum adds the reduced numerator to the denominator, which is 1,001, 10,001, and 100,001. `sum_avg` adds those two checksums.
+
+| Shape | Rows | Returned | Groups | Aggs | Bytes | Checksum | Cold | Warm |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `SUM` | 1,000 | 1 | 1 | 1 | 72 | 499,500 | 240 µs | 40 µs |
+| `AVG` | 1,000 | 1 | 1 | 1 | 72 | 1,001 | 41 µs | 39 µs |
+| `SUM` and `AVG` | 1,000 | 1 | 1 | 2 | 120 | 500,501 | 48 µs | 46 µs |
+| 10 groups, four aggregates | 1,000 | 10 | 10 | 4 | 3,120 | 15,076 | 183 µs | 94 µs |
+| one group per row | 1,000 | 1,000 | 1,000 | 1 | 168,000 | 1,000,000 | 257 µs | 225 µs |
+| `HAVING AVG > rows/2` | 1,000 | 4 | 10 | 1 | 1,680 | 2,044 | 102 µs | 71 µs |
+| hash join, 10 groups | 1,000 | 10 | 10 | 3 | 2,640 | 30,050 | 674 µs | 546 µs |
+| `SUM` | 10,000 | 1 | 1 | 1 | 72 | 49,995,000 | 267 µs | 228 µs |
+| `AVG` | 10,000 | 1 | 1 | 1 | 72 | 10,001 | 252 µs | 221 µs |
+| `SUM` and `AVG` | 10,000 | 1 | 1 | 2 | 120 | 50,005,001 | 277 µs | 259 µs |
+| 10 groups, four aggregates | 10,000 | 10 | 10 | 4 | 3,120 | 150,084 | 529 µs | 513 µs |
+| one group per row | 10,000 | 10,000 | 10,000 | 1 | 1,680,000 | 100,000,000 | 1,771 µs | 1,548 µs |
+| `HAVING AVG > rows/2` | 10,000 | 4 | 10 | 1 | 1,680 | 20,044 | 469 µs | 461 µs |
+| hash join, 10 groups | 10,000 | 10 | 10 | 3 | 2,640 | 300,050 | 4,156 µs | 4,087 µs |
+| `SUM` | 100,000 | 1 | 1 | 1 | 72 | 4,999,950,000 | 3,396 µs | 2,513 µs |
+| `AVG` | 100,000 | 1 | 1 | 1 | 72 | 100,001 | 2,351 µs | 2,506 µs |
+| `SUM` and `AVG` | 100,000 | 1 | 1 | 2 | 120 | 5,000,050,001 | 2,655 µs | 2,725 µs |
+| 10 groups, four aggregates | 100,000 | 10 | 10 | 4 | 3,120 | 1,500,092 | 5,432 µs | 5,060 µs |
+| one group per row | 100,000 | 100,000 | 100,000 | 1 | 16,800,000 | 10,000,000,000 | 18,391 µs | 16,969 µs |
+| `HAVING AVG > rows/2` | 100,000 | 4 | 10 | 1 | 1,680 | 200,044 | 4,549 µs | 4,494 µs |
+| hash join, 10 groups | 100,000 | 10 | 10 | 3 | 2,640 | 3,000,050 | 48,172 µs | 46,507 µs |
+
+At 100,000 rows the scalar `SUM` warm time is 2,513 µs and the scalar `AVG` warm time is 2,506 µs. Running both in one statement is 2,725 µs. The `i128` sum does not show up as its own cost beside the scan on this run. These averages fit in the `i128` cross product, so the 256-bit comparison path is not on this timer. The 1,000-row `SUM` cold sample is 240 µs because it is the first query after the load; its warm time is 40 µs, next to `AVG` at 39 µs. Ten groups with `AVG`, `MIN`, `MAX`, and `MIN` of text take 5,060 µs warm at 100,000 rows. One group per row takes 16,969 µs and the estimate is 16,800,000 bytes. `HAVING` returns 4 of the 10 groups and the byte estimate still counts all 10.
+
+The join builds 4 rows in `orders` per user and keeps 10 groups. Warm time is 546 µs, 4,087 µs, and 46,507 µs at 1,000, 10,000, and 100,000 users. Milestone 11's streaming hash of `COUNT` and `SUM` at 4,000 users and 16,000 matches was 1,575 µs warm. That statement, the row counts, and the aggregates are different, so the two tables are not a before-and-after for `AVG`.
+
+`AccValue` is 48 bytes and `Value` is 32 bytes. Milestone 10's published byte column assumed a 16-byte accumulator. A new run of that profile would print a larger `bytes` number for the same groups. The Milestone 10 table was not remeasured.
+
 ## Limitations
 
 - One machine and one load per size in each session. The five scan, update, and insert samples are repeats on that same file, so they share cache and allocator state.
@@ -435,3 +479,4 @@ At 4,000 users the streaming hash join takes 1,575 µs for 10 groups and 2,028 �
 - The Milestone 9 rows are one release run on a file database, retaken after key groups replaced the bare fingerprint. Nested-loop samples are forced through the nested-loop executor. Hash samples run before the index exists. Index samples force the index path after `CREATE INDEX`. The warm time is the median of five repeats. The cold time is the first sample. `hash_bytes` counts positions, key-group headers, and map entries. It is not process RSS. The planner hashes unless the inner table is more than 64 times the outer table.
 - The Milestone 10 table is a second release run on an in-memory database. The warm time is the median of five repeats. The cold time is the first sample. `bytes` counts the key vector, the accumulator vector, and one hash-map entry per group. It is not process RSS. A scalar aggregate has no hash map. The input table and the returned rows are not included. The earlier warm column is the first run of the same operator. The 100,000-group sample moved by 1,476 µs between those runs.
 - The Milestone 11 table is the pre-merge review run. Nested-loop and hash samples are in memory. Index samples are on a file after `CREATE INDEX`, with the probe forced because the inner table is only four times the outer table. The warm time is the median of five repeats. The cold time is the first sample. `bytes` is the grouping state before `HAVING`. `pair_bytes` is the joined rows the streaming path does not store. The hash path still stores 16 bytes of match positions per pair when it builds the outer table. None of those figures are process RSS.
+- The Milestone 12 table is one release run on an in-memory database. The warm time is the median of five repeats. The cold time is the first sample. Scalar `bytes` is the accumulator vector. Grouped `bytes` also counts key cells and one hash-map entry per accumulated group. `HAVING` still charges the groups it drops. The join is the in-memory hash join. None of those figures are process RSS. The Milestone 10 byte formula in code now uses the 48-byte accumulator; the published Milestone 10 table still shows the earlier 16-byte estimate.
