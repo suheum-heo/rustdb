@@ -11,12 +11,15 @@ mod page;
 mod pager;
 mod profile;
 mod record;
+#[cfg(test)]
+mod reliability;
 mod store;
 mod wal;
 
 pub use page::{MAX_RECORD_LEN, PAGE_SIZE};
-pub(crate) use record::ensure_record_fits;
+pub(crate) use page::{Page, cell, live_slots, page_id_of, verify};
+pub(crate) use record::{decode_catalog, decode_index, decode_record, ensure_record_fits};
 pub(crate) use store::{IndexImage, Store, TableImage};
 #[cfg(test)]
 pub(crate) use wal::Inject;
-pub(crate) use wal::StepError;
+pub(crate) use wal::{LogClass, StepError, classify_log};

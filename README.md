@@ -62,9 +62,9 @@ Each successful `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `INS
 
 The process holds an advisory `flock` on `PATH.lock` and on the database file for as long as it has the database open. The lock file stays after unlock. A second open of the same path fails, including a second open in this process. Renaming the database file does not release the inode lock held by the process that already has it open. `flock` is advisory: a process that does not take it is not stopped. A forked child inherits the lock until it closes that descriptor or starts a new program. The descriptor is close-on-exec.
 
-A crash before the commit record is durable leaves the previous database, and an incomplete log that belongs to the file is discarded on open. A crash after the commit record is durable and before the log is cleared is repaired on the next open by writing the logged pages again. That replay is safe to repeat. A version 1 file is not migrated on open. `rustdb --migrate PATH` rewrites version 1 as version 2, or version 2 as version 3, and keeps row ids and table ids. A new database stays version 2 until that command is run. `CREATE INDEX` on version 2 fails and names the command.
+A crash before the commit record is durable leaves the previous database, and an incomplete log that belongs to the file is discarded on open. A crash after the commit record is durable and before the log is cleared is repaired on the next open by writing the logged pages again. That replay is safe to repeat. If `sync_all` of the commit record returns an error, the statement is not rolled back: the trailer may already be on disk, and the next open can make that statement visible. The caller has to treat that error as an uncertain outcome. The tests inject that error. They do not cut power. A version 1 file is not migrated on open. `rustdb --migrate PATH` rewrites version 1 as version 2, or version 2 as version 3, and keeps row ids and table ids. A new database stays version 2 until that command is run. `CREATE INDEX` on version 2 fails and names the command.
 
-This is not a power-loss proof. The tests stop the commit at chosen steps, including a sync that returns an error after the commit record has been written. They do not cut power. RustDB assumes a local filesystem that honors `File::sync_all` and `flock`. The byte layout, the log, and the remaining filesystem assumptions are in [docs/storage-format.md](docs/storage-format.md).
+This is not a power-loss proof. The tests stop the commit at chosen steps, including a sync that returns an error after the commit record has been written. They do not cut power. RustDB assumes a local filesystem that honors `File::sync_all` and `flock`. The byte layout is in [docs/storage-format.md](docs/storage-format.md). The commit boundaries and what recovery keeps are in [docs/reliability.md](docs/reliability.md).
 
 A row must fit in one heap cell, at most 4068 bytes. Larger rows are rejected in both modes. There are no overflow pages. A table can still occupy many pages: each row is one cell, and cells are linked in insertion order.
 
@@ -80,10 +80,13 @@ Requires a stable Rust toolchain (this project was built with Rust 1.100).
 cargo run
 cargo run -- --database ./rustdb.db
 cargo run -- --migrate ./rustdb-v1.db
-cargo test
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --all-targets --locked
+cargo test --locked
 ```
+
+GitHub Actions runs those four checks on pull requests and pushes to `main`, and when the workflow is started by hand. It uses the stable toolchain and `Cargo.lock`. Ignored release profiles are not part of that job. The workflow file is in the tree; a green run on GitHub is separate from a local `cargo test`. How to run property tests, fuzz targets, and recovery checks is in [docs/reliability.md](docs/reliability.md).
 
 With no arguments the REPL uses an empty in-memory database, and exiting drops every table. `--database PATH` creates a version 2 file when it does not exist and reloads it on the next run. `--migrate PATH` rewrites a version 1 file as version 2, or a version 2 file as version 3, and then exits. It does not start the REPL. A version 3 file is left unchanged and the command fails. The REPL prompts with `rustdb> `. End each statement with `;`. A statement can span lines. `exit` and `quit` close the session. SQL errors are printed and the session continues.
 
@@ -302,4 +305,4 @@ rustdb> exit
 
 ## Next milestone
 
-Milestone 15 should add `SELECT DISTINCT` for a non-aggregate `INNER JOIN` of two tables. `DISTINCT` with `GROUP BY`, `HAVING`, or an aggregate stays rejected. `MIN(DISTINCT)` and `MAX(DISTINCT)` stay rejected until they are defined as the ordinary extremes. Outer joins, window functions, arithmetic, subqueries, and more than two tables stay out of scope.
+Milestone 16 should add `SELECT DISTINCT` for a non-aggregate `INNER JOIN` of two tables. `DISTINCT` with `GROUP BY`, `HAVING`, or an aggregate stays rejected. `MIN(DISTINCT)` and `MAX(DISTINCT)` stay rejected until they are defined as the ordinary extremes. Outer joins, window functions, arithmetic, subqueries, and more than two tables stay out of scope.
