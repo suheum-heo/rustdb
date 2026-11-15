@@ -9,8 +9,9 @@
 //! table when `ON` has a matching equality and the inner table is empty-probed
 //! or more than 64 times the outer table. Every other equality of two scalar
 //! columns builds an in-memory hash table on the smaller input.
-//! Other joins walk both tables in insertion order. Other filters scan the
-//! in-memory table.
+//! Other joins walk both tables in insertion order. A single-table `SELECT`
+//! can `GROUP BY` columns and compute `COUNT` and `SUM`. Other filters scan
+//! the in-memory table.
 //!
 //! # Example
 //!

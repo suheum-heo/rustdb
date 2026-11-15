@@ -67,10 +67,13 @@ pub(crate) enum Statement {
         from: QueryFrom,
         /// Output columns.
         projection: Projection,
-        /// Optional filter. Absent means every joined row. Applied after `ON`.
+        /// Optional filter. Absent means every joined row. Applied after `ON`
+        /// and before grouping.
         selection: Option<Expr>,
-        /// Sort keys. Empty means nested-loop order, which is insertion order
-        /// for a single table.
+        /// Grouping columns. Empty means no `GROUP BY`.
+        group_by: Vec<SelectColumn>,
+        /// Sort keys. Empty means insertion order, or first-seen group order
+        /// for an aggregate query.
         order_by: Vec<OrderKey>,
         /// Maximum rows after filtering and sorting.
         limit: Option<u64>,
@@ -133,12 +136,21 @@ pub(crate) struct Assignment {
 /// every non-null value, so `ASC` is nulls last and `DESC` is nulls first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OrderKey {
-    /// Source-table column, which does not have to appear in the select list.
-    pub(crate) column: SelectColumn,
+    /// A source column, or an aggregate in an aggregate query.
+    pub(crate) target: OrderTarget,
     /// `true` for `ASC` and for an omitted direction.
     pub(crate) ascending: bool,
     /// Explicit `NULLS FIRST` (`Some(true)`) or `NULLS LAST` (`Some(false)`).
     pub(crate) nulls_first: Option<bool>,
+}
+
+/// What an `ORDER BY` key names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OrderTarget {
+    /// A column of an input table.
+    Column(SelectColumn),
+    /// `COUNT` or `SUM`.
+    Aggregate(AggregateCall),
 }
 
 /// The select list.
@@ -151,8 +163,58 @@ pub(crate) enum Projection {
         /// Table name or alias that owns the columns.
         qualifier: String,
     },
-    /// Explicit columns, in output order.
-    Columns(Vec<SelectColumn>),
+    /// Explicit columns and aggregates, in output order.
+    Columns(Vec<SelectItem>),
+}
+
+/// One item in an explicit select list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SelectItem {
+    /// A column of an input table.
+    Column(SelectColumn),
+    /// `COUNT` or `SUM`.
+    Aggregate(AggregateCall),
+}
+
+/// `COUNT` or `SUM` in the select list or in `ORDER BY`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AggregateCall {
+    /// Which function.
+    pub(crate) function: AggregateFunction,
+    /// `*` or one column.
+    pub(crate) argument: AggregateArg,
+}
+
+/// Aggregate functions this engine evaluates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AggregateFunction {
+    /// `COUNT`.
+    Count,
+    /// `SUM` of an integer column.
+    Sum,
+}
+
+/// The argument of `COUNT` or `SUM`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AggregateArg {
+    /// `COUNT(*)`.
+    Star,
+    /// A column. `COUNT` ignores NULL. `SUM` requires an integer column.
+    Column(SelectColumn),
+}
+
+impl AggregateCall {
+    /// SQL text used as the output name and in `EXPLAIN`.
+    pub(crate) fn render(&self) -> String {
+        let name = match self.function {
+            AggregateFunction::Count => "COUNT",
+            AggregateFunction::Sum => "SUM",
+        };
+        match &self.argument {
+            AggregateArg::Star => format!("{name}(*)"),
+            AggregateArg::Column(column) => format!("{name}({})", column.render()),
+        }
+    }
 }
 
 /// A column reference in a select list.
@@ -162,6 +224,15 @@ pub(crate) struct SelectColumn {
     pub(crate) name: String,
     /// Normalized table qualifier, when the user wrote `table.column`.
     pub(crate) qualifier: Option<String>,
+}
+
+impl SelectColumn {
+    pub(crate) fn render(&self) -> String {
+        match &self.qualifier {
+            Some(qualifier) => format!("{qualifier}.{}", self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 /// A scalar expression that can appear in `WHERE` or `VALUES`.

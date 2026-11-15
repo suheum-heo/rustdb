@@ -314,6 +314,47 @@ Speedup is the nested warm time divided by the other warm time.
 
 Hash is faster than the nested loop at every point. It is also faster than the index except when the inner table is much larger than the outer table: 100× is 572 µs against 524 µs, and 400× is 2,289 µs against 2,054 µs. At 20× the hash scan is still faster, 1,177 µs against 1,850 µs. The planner therefore hashes a same-type equality unless the outer table is empty or the inner table has more than 64 times as many rows. There is no cost model and no histogram. The index column is the cost of forcing that path; it is not the path chosen for the equal-size rows.
 
+## Milestone 10 single-table aggregation
+
+Measured on 14 November 2026. The database is in memory, so the times are the query and not `fsync`. Each size builds `samples(id INT, bucket INT, amount INT, flag BOOLEAN)` with one `INSERT` per row. `bucket` is `id % 10`. `amount` is `NULL` when `id` is even and `id` otherwise. `flag` is `FALSE` when `id % 3 = 0` and `TRUE` otherwise. Insert time is not included.
+
+Each query runs six times. Cold is the first sample. Warm is the median of the next five. The harness adds every returned integer into a checksum, counts the rows, and passes both to `std::hint::black_box`. `returned` matched `groups` on every sample.
+
+`bytes` is an estimate of the grouping state, not process RSS. A hash group stores a key vector (`size_of::<Vec<Value>>() + key_cells * size_of::<Value>()`), an accumulator vector (`size_of::<Vec<Value>>() + 16` bytes per aggregate), and one map entry (`size_of::<u64>() + size_of::<Vec<usize>>() + size_of::<usize>()`). On this machine one integer key and one aggregate cost 128 bytes. `AccValue` is 16 bytes: one `i64` and a tag that also represents `Sum(None)`. A scalar aggregate has no key vector and no map entry. Its 40 bytes are one accumulator vector. The estimate does not include allocator slack, empty hash slots, the input table, or the rows returned to the caller. An earlier draft of this section omitted the accumulator vector header, so its grouped sizes were 24 bytes per group smaller.
+
+```bash
+cargo test --release --offline --test milestone10 profile_aggregation -- --ignored --nocapture
+```
+
+| Item | Value |
+| --- | --- |
+| Machine | Apple M5, 16 GiB RAM (`hw.memsize` 17,179,869,184), `arm64` |
+| Compiler | `rustc 1.100.0 (0ef1bc386 2026-11-09)` |
+| Build | `cargo test --release --offline --test milestone10 profile_aggregation -- --ignored --nocapture` |
+| Algorithm | Filter, then one hash table of groups, then sort and limit. No spill. |
+
+| Shape | Rows | Groups | Bytes | Cold | Warm | Earlier warm |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `COUNT(*)` | 1,000 | 1 | 40 | 280 µs | 8 µs | 8 µs |
+| few keys | 1,000 | 10 | 1,280 | 46 µs | 40 µs | 37 µs |
+| many keys | 1,000 | 1,000 | 128,000 | 294 µs | 254 µs | 203 µs |
+| `SUM` with NULLs | 1,000 | 1 | 40 | 14 µs | 9 µs | 8 µs |
+| filtered | 1,000 | 10 | 1,280 | 61 µs | 45 µs | 42 µs |
+| `COUNT(*)` | 10,000 | 1 | 40 | 30 µs | 26 µs | 26 µs |
+| few keys | 10,000 | 10 | 1,280 | 215 µs | 210 µs | 209 µs |
+| many keys | 10,000 | 10,000 | 1,280,000 | 1,791 µs | 1,525 µs | 1,438 µs |
+| `SUM` with NULLs | 10,000 | 1 | 40 | 42 µs | 33 µs | 30 µs |
+| filtered | 10,000 | 10 | 1,280 | 251 µs | 241 µs | 234 µs |
+| `COUNT(*)` | 100,000 | 1 | 40 | 246 µs | 204 µs | 189 µs |
+| few keys | 100,000 | 10 | 1,280 | 2,015 µs | 1,930 µs | 1,919 µs |
+| many keys | 100,000 | 100,000 | 12,800,000 | 16,699 µs | 14,591 µs | 16,067 µs |
+| `SUM` with NULLs | 100,000 | 1 | 40 | 304 µs | 267 µs | 242 µs |
+| filtered | 100,000 | 10 | 1,280 | 2,313 µs | 2,256 µs | 2,320 µs |
+
+Few keys is `SELECT bucket, COUNT(*) FROM samples GROUP BY bucket`. Many keys is `SELECT id, SUM(amount) FROM samples GROUP BY id`. Filtered is `SELECT bucket, SUM(amount) FROM samples WHERE flag = TRUE GROUP BY bucket`. Even `amount` values are NULL, so the scalar `SUM` adds half of the rows. The earlier warm column is the first release run, taken before this review. The operator is the same. The review build reads one test-only thread-local before hashing a group, so a collision test can put every tuple in one bucket.
+
+From 10,000 to 100,000 rows every shape grows by about 8× to 10×. `COUNT(*)` goes from 26 µs to 204 µs. The 10-group queries go from 210 µs and 241 µs to 1,930 µs and 2,256 µs. The 100,000-group query goes from 1,525 µs to 14,591 µs. Its grouping state grows with the input, from 1,280,000 bytes to 12,800,000 bytes. Against the earlier run, the 100,000-row scalar shapes differ by 15 µs and 25 µs, the 10-group shapes differ by 11 µs and 64 µs, and the 100,000-group shape is 1,476 µs faster. That spread is two runs of the same operator. The 1,000-row samples are too small for a slope.
+
 ## Limitations
 
 - One machine and one load per size in each session. The five scan, update, and insert samples are repeats on that same file, so they share cache and allocator state.
@@ -329,3 +370,4 @@ Hash is faster than the nested loop at every point. It is also faster than the i
 - The Milestone 7 rows are two release runs on one in-memory database, taken immediately before and after the scan stopped copying both inputs. The warm time is the median of five repeats. The cold time is the first sample. The copied-byte column counts the row vectors that the scan clones. It is not process RSS. The join does not read an index, so the pair count is `N × M` for every shape. The 4,000-row times differ by a few percent between the runs; that spread is larger than the cost of the removed copy.
 - The Milestone 8 rows are one release run on a file database, retaken after the sibling-link check. The nested-loop samples run before the index exists. The index samples run after `CREATE INDEX`, with the tree in the pager cache after the cold sample. The warm time is the median of five repeats. The cold time is the first sample. Both paths are checked against the same checksum. On this run the index is faster at every measured point. An earlier run on the same machine measured the 100-row identity join slower on the index path (125 µs against 99 µs).
 - The Milestone 9 rows are one release run on a file database, retaken after key groups replaced the bare fingerprint. Nested-loop samples are forced through the nested-loop executor. Hash samples run before the index exists. Index samples force the index path after `CREATE INDEX`. The warm time is the median of five repeats. The cold time is the first sample. `hash_bytes` counts positions, key-group headers, and map entries. It is not process RSS. The planner hashes unless the inner table is more than 64 times the outer table.
+- The Milestone 10 table is a second release run on an in-memory database. The warm time is the median of five repeats. The cold time is the first sample. `bytes` counts the key vector, the accumulator vector, and one hash-map entry per group. It is not process RSS. A scalar aggregate has no hash map. The input table and the returned rows are not included. The earlier warm column is the first run of the same operator. The 100,000-group sample moved by 1,476 µs between those runs.
