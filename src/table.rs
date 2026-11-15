@@ -262,6 +262,11 @@ impl Table {
         self.positions.remove(&row_id);
     }
 
+    #[cfg(test)]
+    pub(crate) fn move_position_for_test(&mut self, row_id: u64, position: usize) {
+        self.positions.insert(row_id, position);
+    }
+
     pub(crate) fn image(&self) -> TableImage {
         TableImage {
             name: self.name.clone(),

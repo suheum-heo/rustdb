@@ -322,6 +322,14 @@ impl Database {
     }
 
     #[cfg(test)]
+    pub(crate) fn zero_leftmost_leaf_right(&mut self, name: &str) -> Result<(), DbError> {
+        self.store
+            .as_mut()
+            .ok_or_else(|| DbError::Internal("index scan requires a database file".to_string()))?
+            .zero_leftmost_leaf_right(name)
+    }
+
+    #[cfg(test)]
     pub(crate) fn clear_page_cache(&mut self) {
         if let Some(store) = self.store.as_mut() {
             store.clear_page_cache();
@@ -342,19 +350,15 @@ mod tests {
     use crate::storage::Inject;
     use crate::value::Value;
 
+    fn scratch(label: &str) -> (crate::test_dir::TestDir, std::path::PathBuf) {
+        let dir = crate::test_dir::TestDir::new(label);
+        let path = dir.join("db");
+        (dir, path)
+    }
+
     #[test]
     fn a_failed_checkpoint_blocks_every_statement_until_reopen() {
-        let dir = std::env::temp_dir().join(format!(
-            "rustdb-fence-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("db");
+        let (dir, path) = scratch("fence");
         let mut database = Database::open(&path).unwrap();
         database
             .execute("CREATE TABLE users (id INT, name TEXT);")
@@ -389,17 +393,7 @@ mod tests {
 
     #[test]
     fn an_ambiguous_commit_sync_is_not_reported_as_a_rollback() {
-        let dir = std::env::temp_dir().join(format!(
-            "rustdb-ambiguous-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("db");
+        let (dir, path) = scratch("ambiguous");
         let mut database = Database::open(&path).unwrap();
         database
             .execute("CREATE TABLE users (id INT, name TEXT);")
@@ -433,18 +427,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn aged_index(label: &str) -> (std::path::PathBuf, Database) {
-        let dir = std::env::temp_dir().join(format!(
-            "rustdb-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("db");
+    fn aged_index(label: &str) -> (crate::test_dir::TestDir, Database) {
+        let (dir, path) = scratch(label);
         let mut database = Database::open(&path).unwrap();
         database
             .execute("CREATE TABLE users (id INT, age INT, name TEXT);")
@@ -559,6 +543,151 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn joined_index(label: &str) -> (crate::test_dir::TestDir, Database) {
+        let (dir, path) = scratch(&format!("join-{label}"));
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        database
+            .execute("CREATE TABLE orders (id INT, user_id INT, total INT);")
+            .unwrap();
+        database
+            .execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Bea');")
+            .unwrap();
+        database
+            .execute("INSERT INTO orders VALUES (10, 1, 10), (11, 1, 30), (12, 2, 5);")
+            .unwrap();
+        drop(database);
+        Database::migrate(&path).unwrap();
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE INDEX idx_orders_user ON orders(user_id);")
+            .unwrap();
+        let results = database
+            .execute(
+                "SELECT users.name, orders.total
+                 FROM users JOIN orders ON users.id = orders.user_id;",
+            )
+            .unwrap();
+        let StatementResult::Query(query) = &results[0] else {
+            panic!("expected a query");
+        };
+        assert_eq!(
+            query.rows,
+            vec![
+                vec![Value::Text("Ada".to_string()), Value::Integer(10)],
+                vec![Value::Text("Ada".to_string()), Value::Integer(30)],
+                vec![Value::Text("Bea".to_string()), Value::Integer(5)],
+            ]
+        );
+        (dir, database)
+    }
+
+    #[test]
+    fn a_join_probe_rejects_a_missing_row_id() {
+        let (dir, mut database) = joined_index("missing-row");
+        database
+            .table_mut("orders")
+            .unwrap()
+            .forget_position_for_test(1);
+        let error = database
+            .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_join_probe_rejects_a_stale_row_position() {
+        let (dir, mut database) = joined_index("stale-position");
+        database
+            .table_mut("orders")
+            .unwrap()
+            .move_position_for_test(1, 2);
+        let error = database
+            .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_join_probe_rejects_an_indexed_value_that_disagrees_with_the_heap() {
+        let (dir, mut database) = joined_index("bad-key");
+        database
+            .table_mut("orders")
+            .unwrap()
+            .overwrite_cell_for_test(0, 1, Value::Integer(99));
+        let error = database
+            .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_join_probe_rejects_a_duplicated_index_row_id() {
+        let (dir, mut database) = joined_index("duplicate-row");
+        database
+            .patch_root_leaf_entry("idx_orders_user", 2, Some(1), Some(1))
+            .unwrap();
+        let error = database
+            .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
+            .unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_join_probe_rejects_a_corrupt_index_page() {
+        let (dir, mut database) = joined_index("bad-page");
+        database.corrupt_index_root_type("idx_orders_user").unwrap();
+        let error = database
+            .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
+            .unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_join_probe_rejects_an_unsorted_leaf_instead_of_skipping_a_match() {
+        let (dir, mut database) = joined_index("unsorted-join");
+        database
+            .patch_root_leaf_entry("idx_orders_user", 0, Some(30), None)
+            .unwrap();
+        let error = database
+            .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
+            .unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_join_probe_rejects_a_broken_sibling_instead_of_a_short_result() {
+        let (dir, mut database) = joined_index("broken-sibling");
+        for id in 13..=310 {
+            database
+                .execute(&format!("INSERT INTO orders VALUES ({id}, 1, 1);"))
+                .unwrap();
+        }
+        let results = database
+            .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
+            .unwrap();
+        let StatementResult::Query(query) = &results[0] else {
+            panic!("expected a query");
+        };
+        assert_eq!(query.rows.len(), 301);
+        database
+            .zero_leftmost_leaf_right("idx_orders_user")
+            .unwrap();
+        let error = database
+            .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
+            .unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "release profile of index maintenance"]
     fn profile_index_maintenance() {
@@ -591,15 +720,7 @@ mod tests {
     }
 
     fn index_profile(size: usize, with_index: bool) -> IndexProfile {
-        let dir = std::env::temp_dir().join(format!(
-            "rustdb-index-profile-{}-{}-{}",
-            std::process::id(),
-            size,
-            with_index as u8
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("db");
+        let (dir, path) = scratch(&format!("index-profile-{size}-{}", with_index as u8));
         let mut database = Database::open(&path).unwrap();
         database
             .execute("CREATE TABLE bench (id INT, age INT, email TEXT, note TEXT, active BOOLEAN);")
@@ -772,18 +893,8 @@ mod tests {
         (started.elapsed().as_micros(), rows, sum)
     }
 
-    fn load_select_database(rows: i64, indexed: bool) -> (std::path::PathBuf, Database) {
-        let dir = std::env::temp_dir().join(format!(
-            "rustdb-select-{indexed}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("db");
+    fn load_select_database(rows: i64, indexed: bool) -> (crate::test_dir::TestDir, Database) {
+        let (dir, path) = scratch(&format!("select-{indexed}"));
         let mut database = Database::open(&path).unwrap();
         database
             .execute("CREATE TABLE bench (id INT, age INT, note TEXT);")

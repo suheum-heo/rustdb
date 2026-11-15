@@ -202,6 +202,20 @@ impl Store {
     }
 
     #[cfg(test)]
+    pub(crate) fn zero_leftmost_leaf_right(&mut self, name: &str) -> Result<(), DbError> {
+        let root = self.index_root(name)?;
+        let leaf_id = {
+            let mut nodes = PagerNodes {
+                pager: &mut self.pager,
+            };
+            btree::leftmost_leaf_id(&mut nodes, root)?
+        };
+        let page = self.pager.cached_page_mut(leaf_id)?;
+        crate::storage::page::set_next_page(page, 0);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn clear_page_cache(&mut self) {
         self.pager.clear_cache_for_test();
     }
@@ -1113,26 +1127,12 @@ mod tests {
     use super::*;
     use crate::value::DataType;
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static NEXT: AtomicU64 = AtomicU64::new(0);
 
     struct TempPath(std::path::PathBuf);
 
     impl TempPath {
         fn new() -> Self {
-            let n = NEXT.fetch_add(1, Ordering::Relaxed);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir = std::env::temp_dir().join(format!(
-                "rustdb-store-{}-{}-{n}",
-                std::process::id(),
-                nanos
-            ));
-            fs::create_dir_all(&dir).unwrap();
+            let dir = crate::test_dir::unique_dir("store");
             Self(dir.join("test.db"))
         }
 
@@ -2363,6 +2363,43 @@ mod tests {
         page.as_mut_slice()
             .copy_from_slice(&bytes[start..start + PAGE_SIZE]);
         page.as_mut_slice()[28 + 8..28 + 16].copy_from_slice(&99u64.to_le_bytes());
+        page::seal(&mut page);
+        bytes[start..start + PAGE_SIZE].copy_from_slice(page.as_slice());
+        fs::write(file.path(), &bytes).unwrap();
+        let error = Store::open(file.path()).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+    }
+
+    #[test]
+    fn reopen_rejects_an_index_that_omits_a_heap_key() {
+        let (file, _, _) = migrated_users(vec![(1, sample(4, "Ada")), (2, sample(5, "Bea"))], 3);
+        {
+            let (mut store, _) = Store::open(file.path()).unwrap();
+            store
+                .publish_indexes(
+                    &[image(
+                        "users",
+                        vec![(1, sample(4, "Ada")), (2, sample(5, "Bea"))],
+                        3,
+                    )],
+                    &[IndexImage {
+                        name: "idx_users_id".to_string(),
+                        table: "users".to_string(),
+                        column: "id".to_string(),
+                    }],
+                )
+                .unwrap();
+        }
+        let mut bytes = fs::read(file.path()).unwrap();
+        let leaf = bytes
+            .chunks(PAGE_SIZE)
+            .position(|page| u16::from_le_bytes([page[0], page[1]]) == page::TYPE_INDEX_LEAF)
+            .unwrap();
+        let start = leaf * PAGE_SIZE;
+        let mut page = Page::new();
+        page.as_mut_slice()
+            .copy_from_slice(&bytes[start..start + PAGE_SIZE]);
+        page.as_mut_slice()[28..36].copy_from_slice(&99_i64.to_le_bytes());
         page::seal(&mut page);
         bytes[start..start + PAGE_SIZE].copy_from_slice(page.as_slice());
         fs::write(file.path(), &bytes).unwrap();

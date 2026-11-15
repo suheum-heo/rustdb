@@ -6,7 +6,8 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use rustdb::{Database, StatementResult};
 
@@ -158,13 +159,17 @@ fn print_samples(label: &str, samples: &[u128]) {
 }
 
 fn temp_db() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("rustdb-bench-{}-{nanos}", std::process::id()));
-    fs::create_dir_all(&dir).expect("temp dir");
-    dir.join("bench.db")
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rustdb-bench-{pid}-{n}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => return dir.join("bench.db"),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("failed to create {}: {error}", dir.display()),
+        }
+    }
 }
 
 fn command_output(program: &str, args: &[&str]) -> String {

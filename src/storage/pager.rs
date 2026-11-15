@@ -673,20 +673,12 @@ fn ambiguous(error: DbError) -> StepError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDir(PathBuf);
 
     impl TempDir {
         fn new() -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir =
-                std::env::temp_dir().join(format!("rustdb-pager-{}-{nanos}", std::process::id()));
-            fs::create_dir_all(&dir).unwrap();
-            Self(dir)
+            Self(crate::test_dir::unique_dir("pager"))
         }
     }
 

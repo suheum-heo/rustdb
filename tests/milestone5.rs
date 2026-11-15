@@ -2,17 +2,11 @@
 
 use rustdb::Database;
 
-fn temporary() -> (std::path::PathBuf, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!(
-        "rustdb-m5-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+#[path = "support/temp_dir.rs"]
+mod temp_dir;
+
+fn temporary() -> (temp_dir::KeepDir, std::path::PathBuf) {
+    let dir = temp_dir::KeepDir::new("m5");
     let path = dir.join("db");
     (dir, path)
 }

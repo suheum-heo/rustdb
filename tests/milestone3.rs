@@ -2,21 +2,14 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustdb::{Database, MAX_RECORD_LEN, PAGE_SIZE, StatementResult, Value};
 
+#[path = "support/temp_dir.rs"]
+mod temp_dir;
+
 fn temp_dir() -> PathBuf {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("rustdb-m3-{}-{}-{n}", std::process::id(), nanos));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    temp_dir::unique_dir("m3")
 }
 
 struct TempDb {

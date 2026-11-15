@@ -113,30 +113,18 @@ impl Drop for DbLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_database() -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "rustdb-lock-life-{}-{}-{n}",
-            std::process::id(),
-            nanos
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir.join("db")
+    fn temp_database() -> (crate::test_dir::TestDir, PathBuf) {
+        let dir = crate::test_dir::TestDir::new("lock-life");
+        let path = dir.join("db");
+        (dir, path)
     }
 
     #[test]
     fn dropping_the_only_guard_lets_the_same_process_acquire_again() {
-        let path = temp_database();
+        let (_dir, path) = temp_database();
         for _ in 0..100 {
             let held = acquire(&path).unwrap();
             let error = match acquire(&path) {
@@ -148,12 +136,11 @@ mod tests {
             let held = acquire(&path).unwrap();
             drop(held);
         }
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn contended_acquires_keep_one_live_owner() {
-        let path = temp_database();
+        let (_dir, path) = temp_database();
         let start = Arc::new(Barrier::new(8));
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -184,6 +171,5 @@ mod tests {
         let held = acquire(&path).unwrap();
         drop(held);
         assert!(path_for(&path).is_file());
-        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

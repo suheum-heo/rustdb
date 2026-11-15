@@ -1,22 +1,12 @@
 //! Two-table `INNER JOIN`: binding, nested-loop order, and `EXPLAIN`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use rustdb::{Database, StatementResult, Value};
 
-fn temporary(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "rustdb-m7-{label}-{}-{}-{n}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+#[path = "support/temp_dir.rs"]
+mod temp_dir;
+
+fn temporary(label: &str) -> (temp_dir::KeepDir, std::path::PathBuf) {
+    let dir = temp_dir::KeepDir::new(label);
     let path = dir.join("db");
     (dir, path)
 }
@@ -516,7 +506,7 @@ fn mixed_column_types_compare_only_when_the_types_agree() {
 }
 
 #[test]
-fn restart_keeps_the_join_and_an_index_does_not_change_it() {
+fn restart_keeps_the_join_rows_and_uses_the_inner_index() {
     let (_dir, path) = temporary("join");
     let mut database = Database::open(&path).unwrap();
     seed(&mut database);
@@ -544,7 +534,8 @@ fn restart_keeps_the_join_and_an_index_does_not_change_it() {
             JOIN orders
             ON users.id = orders.user_id;",
     );
-    assert_eq!(explained.rows[0][0], text("NestedLoopJoin"));
+    assert_eq!(explained.rows[0][0], text("IndexNestedLoopJoin"));
+    assert_eq!(explained.rows[0][3], text("idx_orders_user"));
     let single = query(
         &mut database,
         "EXPLAIN SELECT name FROM users WHERE id = 1;",
