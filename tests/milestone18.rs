@@ -508,16 +508,8 @@ fn unsupported_outer_forms_stay_rejected() {
             "LEFT JOIN is not supported with DISTINCT",
         ),
         (
-            "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name;",
-            "LEFT JOIN is not supported with GROUP BY",
-        ),
-        (
-            "SELECT COUNT(*) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
-            "LEFT JOIN is not supported with aggregate functions",
-        ),
-        (
-            "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id HAVING u.name = 'Ada';",
-            "LEFT JOIN is not supported with HAVING",
+            "SELECT COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+            "LEFT JOIN is not supported with DISTINCT aggregates",
         ),
     ];
     for (sql, message) in cases {
@@ -525,9 +517,9 @@ fn unsupported_outer_forms_stay_rejected() {
     }
     let error = failure(
         &mut database,
-        "EXPLAIN SELECT COUNT(*) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+        "EXPLAIN SELECT COUNT(DISTINCT o.user_id) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
     );
-    assert_eq!(error, "LEFT JOIN is not supported with aggregate functions");
+    assert_eq!(error, "LEFT JOIN is not supported with DISTINCT aggregates");
 }
 
 #[test]

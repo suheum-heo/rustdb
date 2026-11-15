@@ -581,12 +581,15 @@ fn select_distinct(select: &Select) -> Result<bool, DbError> {
     }
 }
 
-/// `LEFT JOIN` is a non-aggregate query. `DISTINCT`, `GROUP BY`, `HAVING`,
-/// and aggregates stay rejected so a left join cannot be planned as an inner join.
+/// `SELECT DISTINCT` and `DISTINCT` aggregates stay off a `LEFT JOIN`.
+///
+/// Plain `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, and `HAVING` are
+/// accepted. The arguments are the same expressions an `INNER JOIN` aggregate
+/// already accepts.
 fn reject_left_join(
     distinct: bool,
     projection: &Projection,
-    group_by: &[SelectColumn],
+    _group_by: &[SelectColumn],
     having: Option<&Expr>,
     order_by: &[OrderKey],
 ) -> Result<(), DbError> {
@@ -595,29 +598,9 @@ fn reject_left_join(
             "LEFT JOIN is not supported with DISTINCT",
         ));
     }
-    if !group_by.is_empty() {
+    if crate::ast::has_distinct_aggregate(projection, having, order_by) {
         return Err(DbError::unsupported(
-            "LEFT JOIN is not supported with GROUP BY",
-        ));
-    }
-    if having.is_some() {
-        return Err(DbError::unsupported(
-            "LEFT JOIN is not supported with HAVING",
-        ));
-    }
-    let aggregate = match projection {
-        Projection::All | Projection::QualifiedAll { .. } | Projection::QualifiedStars { .. } => {
-            false
-        }
-        Projection::Columns(items) => items
-            .iter()
-            .any(|item| matches!(item, SelectItem::Aggregate { .. })),
-    } || order_by
-        .iter()
-        .any(|key| matches!(key.target, OrderTarget::Aggregate(_)));
-    if aggregate {
-        return Err(DbError::unsupported(
-            "LEFT JOIN is not supported with aggregate functions",
+            "LEFT JOIN is not supported with DISTINCT aggregates",
         ));
     }
     Ok(())
@@ -1672,6 +1655,19 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "LEFT JOIN is not supported with DISTINCT"
+        );
+        parse("SELECT COUNT(*) FROM users u LEFT JOIN orders o ON u.id = o.user_id;").unwrap();
+        parse(
+            "SELECT u.name, COUNT(o.user_id) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name;",
+        )
+        .unwrap();
+        let error = parse(
+            "SELECT SUM(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "LEFT JOIN is not supported with DISTINCT aggregates"
         );
         let error = parse("SELECT * FROM users RIGHT JOIN orders ON users.id = orders.user_id;")
             .unwrap_err();

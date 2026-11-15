@@ -10,17 +10,18 @@
 //! or more than 64 times the outer table. Every other equality of two scalar
 //! columns builds an in-memory hash table on the smaller input.
 //! Other joins walk both tables in insertion order. A `SELECT` can `GROUP BY`
-//! columns of one table or of one `INNER JOIN` and compute `COUNT`, `SUM`,
-//! `AVG`, `MIN`, and `MAX`. `AVG` is an exact ratio and is not stored.
+//! columns of one table, one `INNER JOIN`, or one `LEFT JOIN` and compute
+//! `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`. `AVG` is an exact ratio and is not stored.
 //! `HAVING` keeps a group only when it is TRUE. A select-list alias is an
 //! output name, an `ORDER BY` name, and an unqualified `HAVING` name.
 //! `COUNT`, `SUM`, and `AVG` accept `DISTINCT` on one column. `SELECT DISTINCT`
 //! keeps the first copy of each projected row from one non-aggregate table or
-//! from one non-aggregate `INNER JOIN`. A non-aggregate `LEFT JOIN` of two
-//! tables keeps every left row. A same-type column equality hashes the right
-//! table. Any other `ON` uses a nested loop. A left row with no TRUE `ON`
-//! match is returned once, with NULL for each right column. `WHERE` runs after
-//! that extension.
+//! from one non-aggregate `INNER JOIN`. A `LEFT JOIN` of two tables keeps
+//! every left row. A same-type column equality hashes the right table. Any
+//! other `ON` uses a nested loop. A left row with no TRUE `ON` match is
+//! returned once, with NULL for each right column. `WHERE` runs after that
+//! extension. `COUNT(*)` counts a null-extended row. `SELECT DISTINCT` and
+//! `DISTINCT` aggregates stay off that join.
 //! Other filters scan the in-memory table.
 //!
 //! # Example
