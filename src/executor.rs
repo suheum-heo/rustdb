@@ -13,6 +13,14 @@
 //! unless the query overrides that with `NULLS FIRST` or `NULLS LAST`.
 //! `UPDATE` and `DELETE` still read every row of one table.
 //!
+//! A single-table `SELECT` may group rows. `WHERE` runs first. `COUNT(*)`
+//! counts every remaining row, `COUNT(column)` skips NULL, and `SUM` adds
+//! non-NULL integers with checked arithmetic. An empty input with no
+//! `GROUP BY` returns one row. `GROUP BY` keeps NULL keys in one group and
+//! emits groups in first-seen order. A group hash mixes a type tag with each
+//! key, and a shared fingerprint still compares the stored cells, so unequal
+//! tuples stay apart. `ORDER BY` and `LIMIT` run after that.
+//!
 //! An `INNER JOIN` walks the outer table in insertion order. For each outer
 //! row it reads inner candidates, then keeps a pair only when `ON` is TRUE.
 //! `WHERE` then runs on that pair. An indexed integer equality uses the index
@@ -36,7 +44,10 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use crate::ast::{Assignment, Expr, OrderKey, Projection, QueryFrom, Statement, TableRef};
+use crate::ast::{
+    AggregateArg, AggregateCall, AggregateFunction, Assignment, Expr, OrderKey, OrderTarget,
+    Projection, QueryFrom, SelectColumn, SelectItem, Statement, TableRef,
+};
 use crate::database::{Database, DurableChange};
 use crate::error::DbError;
 use crate::expr::{self, BoundExpr, Scope};
@@ -103,6 +114,7 @@ struct PreparedSelect {
 struct SelectTail<'a> {
     projection: &'a Projection,
     selection: Option<&'a Expr>,
+    group_by: &'a [SelectColumn],
     order_by: &'a [OrderKey],
     limit: Option<u64>,
 }
@@ -210,9 +222,17 @@ impl Database {
                 from,
                 projection,
                 selection,
+                group_by,
                 order_by,
                 limit,
-            } => self.query(&from, &projection, selection.as_ref(), &order_by, limit),
+            } => self.query(
+                &from,
+                &projection,
+                selection.as_ref(),
+                &group_by,
+                &order_by,
+                limit,
+            ),
             Statement::Explain(inner) => self.explain(inner.as_ref()),
         }
     }
@@ -222,30 +242,28 @@ impl Database {
         from: &QueryFrom,
         projection: &Projection,
         selection: Option<&Expr>,
+        group_by: &[SelectColumn],
         order_by: &[OrderKey],
         limit: Option<u64>,
     ) -> Result<StatementResult, DbError> {
+        let tail = SelectTail {
+            projection,
+            selection,
+            group_by,
+            order_by,
+            limit,
+        };
+        if is_aggregate_query(projection, group_by, order_by) {
+            let QueryFrom::Table(source) = from else {
+                return Err(DbError::unsupported(
+                    "aggregates over JOIN are not supported",
+                ));
+            };
+            return self.aggregate_table(source, tail);
+        }
         match from {
-            QueryFrom::Table(source) => self.query_table(
-                source,
-                SelectTail {
-                    projection,
-                    selection,
-                    order_by,
-                    limit,
-                },
-            ),
-            QueryFrom::Join { outer, inner, on } => self.query_join(
-                outer,
-                inner,
-                on,
-                SelectTail {
-                    projection,
-                    selection,
-                    order_by,
-                    limit,
-                },
-            ),
+            QueryFrom::Table(source) => self.query_table(source, tail),
+            QueryFrom::Join { outer, inner, on } => self.query_join(outer, inner, on, tail),
         }
     }
 
@@ -303,6 +321,185 @@ impl Database {
             columns: prepared.output_names,
             rows: projected,
         }))
+    }
+
+    fn aggregate_table(
+        &mut self,
+        source: &TableRef,
+        tail: SelectTail<'_>,
+    ) -> Result<StatementResult, DbError> {
+        let mut plan = self.prepare_aggregate(
+            source,
+            tail.projection,
+            tail.selection,
+            tail.group_by,
+            tail.order_by,
+        )?;
+        plan.path = self.settle_path(plan.path)?;
+        let positions = match &plan.path {
+            AccessPath::SeqScan => None,
+            AccessPath::IndexScan { .. } => Some(self.index_positions(&source.name, &plan.path)?),
+        };
+        let table = self.table(&source.name)?;
+        let grouped = collect_groups(table.rows(), positions.as_deref(), &plan)?;
+        finish_rows(
+            grouped,
+            &plan.sort_keys,
+            tail.limit,
+            &plan.outputs,
+            plan.output_names,
+        )
+    }
+
+    fn explain_aggregate(
+        &mut self,
+        source: &TableRef,
+        projection: &Projection,
+        selection: Option<&Expr>,
+        group_by: &[SelectColumn],
+        order_by: &[OrderKey],
+    ) -> Result<StatementResult, DbError> {
+        let mut plan = self.prepare_aggregate(source, projection, selection, group_by, order_by)?;
+        plan.path = self.settle_path(plan.path)?;
+        let (scan, index, bounds) = plan::describe(&plan.path);
+        let groups = if plan.group_labels.is_empty() {
+            Value::Null
+        } else {
+            Value::Text(plan.group_labels.join(", "))
+        };
+        let aggregates = if plan.aggregate_labels.is_empty() {
+            Value::Null
+        } else {
+            Value::Text(plan.aggregate_labels.join(", "))
+        };
+        let filter = selection
+            .map(|expr| Value::Text(expr.render()))
+            .unwrap_or(Value::Null);
+        Ok(StatementResult::Query(QueryResult {
+            columns: vec![
+                "access".to_string(),
+                "groups".to_string(),
+                "aggregates".to_string(),
+                "scan".to_string(),
+                "index".to_string(),
+                "bounds".to_string(),
+                "filter".to_string(),
+            ],
+            rows: vec![vec![
+                Value::Text(plan.access.clone()),
+                groups,
+                aggregates,
+                scan,
+                index,
+                bounds,
+                filter,
+            ]],
+        }))
+    }
+
+    fn prepare_aggregate(
+        &self,
+        source: &TableRef,
+        projection: &Projection,
+        selection: Option<&Expr>,
+        group_by: &[SelectColumn],
+        order_by: &[OrderKey],
+    ) -> Result<AggPlan, DbError> {
+        let indexes = self.index_images().to_vec();
+        let table = self.table(&source.name)?;
+        let scope = Scope::from_table(table, &source.alias);
+        let filter = bind_optional_where(selection, &scope)?;
+        let mut group_ordinals = Vec::with_capacity(group_by.len());
+        let mut group_labels = Vec::with_capacity(group_by.len());
+        for column in group_by {
+            group_ordinals.push(scope.resolve(column)?);
+            group_labels.push(column.render());
+        }
+        let Projection::Columns(items) = projection else {
+            return Err(DbError::unsupported(
+                "SELECT * is not supported with GROUP BY or aggregates",
+            ));
+        };
+        let mut aggs = Vec::new();
+        let mut outputs = Vec::with_capacity(items.len());
+        let mut output_names = Vec::with_capacity(items.len());
+        let mut aggregate_labels = Vec::new();
+        for item in items {
+            match item {
+                SelectItem::Column(column) => {
+                    let ordinal = scope.resolve(column)?;
+                    let Some(slot) = group_ordinals.iter().position(|group| *group == ordinal)
+                    else {
+                        return Err(DbError::invalid(format!(
+                            "column '{}' must appear in GROUP BY",
+                            column.name
+                        )));
+                    };
+                    let Some(name) = scope.name_at(ordinal) else {
+                        return Err(DbError::Internal(
+                            "group column is outside the table".to_string(),
+                        ));
+                    };
+                    output_names.push(name.to_string());
+                    outputs.push(slot);
+                }
+                SelectItem::Aggregate(call) => {
+                    let slot = bind_aggregate(call, &scope, &mut aggs)?;
+                    aggregate_labels.push(call.render());
+                    output_names.push(call.render());
+                    outputs.push(group_ordinals.len() + slot);
+                }
+            }
+        }
+        let group_width = group_ordinals.len();
+        let mut sort_keys = Vec::with_capacity(order_by.len());
+        for key in order_by {
+            let index = match &key.target {
+                OrderTarget::Column(column) => {
+                    let ordinal = scope.resolve(column)?;
+                    let Some(slot) = group_ordinals.iter().position(|group| *group == ordinal)
+                    else {
+                        return Err(DbError::invalid(format!(
+                            "column '{}' must appear in GROUP BY",
+                            column.name
+                        )));
+                    };
+                    slot
+                }
+                OrderTarget::Aggregate(call) => {
+                    let slot = bind_aggregate(call, &scope, &mut aggs)?;
+                    let label = call.render();
+                    if !aggregate_labels.contains(&label) {
+                        aggregate_labels.push(label);
+                    }
+                    group_width + slot
+                }
+            };
+            sort_keys.push(SortKey {
+                index,
+                ascending: key.ascending,
+                nulls_first: key.nulls_first.unwrap_or(!key.ascending),
+            });
+        }
+        let choices = index_choices(table, &indexes)?;
+        let path = plan::choose(&source.alias, selection, &choices);
+        let access = if group_ordinals.is_empty() {
+            "Aggregate"
+        } else {
+            "HashAggregate"
+        };
+        Ok(AggPlan {
+            group_ordinals,
+            group_labels,
+            aggs,
+            outputs,
+            output_names,
+            aggregate_labels,
+            sort_keys,
+            filter,
+            path,
+            access: access.to_string(),
+        })
     }
 
     fn query_join(
@@ -381,12 +578,27 @@ impl Database {
             from,
             projection,
             selection,
+            group_by,
             order_by,
             ..
         } = statement
         else {
             return Err(DbError::unsupported("EXPLAIN is only supported for SELECT"));
         };
+        if is_aggregate_query(projection, group_by, order_by) {
+            let QueryFrom::Table(source) = from else {
+                return Err(DbError::unsupported(
+                    "aggregates over JOIN are not supported",
+                ));
+            };
+            return self.explain_aggregate(
+                source,
+                projection,
+                selection.as_ref(),
+                group_by,
+                order_by,
+            );
+        }
         match from {
             QueryFrom::Table(source) => {
                 let mut prepared =
@@ -906,6 +1118,306 @@ fn corrupt_index(name: &str) -> DbError {
     ))
 }
 
+struct AggPlan {
+    group_ordinals: Vec<usize>,
+    group_labels: Vec<String>,
+    aggs: Vec<AggFn>,
+    /// Indexes into a row laid out as group keys, then aggregate values.
+    outputs: Vec<usize>,
+    output_names: Vec<String>,
+    aggregate_labels: Vec<String>,
+    sort_keys: Vec<SortKey>,
+    filter: Option<BoundExpr>,
+    path: AccessPath,
+    access: String,
+}
+
+enum AggFn {
+    CountStar,
+    CountColumn(usize),
+    Sum(usize),
+}
+
+enum AccValue {
+    Count(i64),
+    Sum(Option<i64>),
+}
+
+struct AggGroup {
+    key: Vec<Value>,
+    acc: Vec<AccValue>,
+}
+
+fn is_aggregate_query(
+    projection: &Projection,
+    group_by: &[SelectColumn],
+    order_by: &[OrderKey],
+) -> bool {
+    if !group_by.is_empty() {
+        return true;
+    }
+    if order_by
+        .iter()
+        .any(|key| matches!(key.target, OrderTarget::Aggregate(_)))
+    {
+        return true;
+    }
+    match projection {
+        Projection::All | Projection::QualifiedAll { .. } => false,
+        Projection::Columns(items) => items
+            .iter()
+            .any(|item| matches!(item, SelectItem::Aggregate(_))),
+    }
+}
+
+fn bind_aggregate(
+    call: &AggregateCall,
+    scope: &Scope,
+    aggs: &mut Vec<AggFn>,
+) -> Result<usize, DbError> {
+    let function = match call.function {
+        AggregateFunction::Count => match &call.argument {
+            AggregateArg::Star => AggFn::CountStar,
+            AggregateArg::Column(column) => AggFn::CountColumn(scope.resolve(column)?),
+        },
+        AggregateFunction::Sum => {
+            let AggregateArg::Column(column) = &call.argument else {
+                return Err(DbError::unsupported("SUM requires an INTEGER column"));
+            };
+            let ordinal = scope.resolve(column)?;
+            let Some(data_type) = scope.type_at(ordinal) else {
+                return Err(DbError::Internal(
+                    "aggregate column is outside the table".to_string(),
+                ));
+            };
+            if data_type != DataType::Integer {
+                return Err(DbError::TypeError(format!(
+                    "SUM requires INTEGER, not {data_type}"
+                )));
+            }
+            AggFn::Sum(ordinal)
+        }
+    };
+    if let Some(slot) = aggs
+        .iter()
+        .position(|existing| agg_same(existing, &function))
+    {
+        return Ok(slot);
+    }
+    aggs.push(function);
+    Ok(aggs.len() - 1)
+}
+
+fn agg_same(left: &AggFn, right: &AggFn) -> bool {
+    match (left, right) {
+        (AggFn::CountStar, AggFn::CountStar) => true,
+        (AggFn::CountColumn(left), AggFn::CountColumn(right)) => left == right,
+        (AggFn::Sum(left), AggFn::Sum(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn collect_groups(
+    rows: &[Vec<Value>],
+    positions: Option<&[usize]>,
+    plan: &AggPlan,
+) -> Result<Vec<Vec<Value>>, DbError> {
+    if plan.group_ordinals.is_empty() {
+        let mut acc = fresh_acc(&plan.aggs);
+        let mut visit = |row: &[Value]| update_acc(&mut acc, row, &plan.aggs);
+        visit_filtered(rows, positions, plan.filter.as_ref(), &mut visit)?;
+        return Ok(vec![materialize_group(&[], &acc)]);
+    }
+    let mut groups: Vec<AggGroup> = Vec::new();
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut visit = |row: &[Value]| absorb_row(row, plan, &mut groups, &mut buckets);
+    visit_filtered(rows, positions, plan.filter.as_ref(), &mut visit)?;
+    Ok(groups
+        .into_iter()
+        .map(|group| materialize_group(&group.key, &group.acc))
+        .collect())
+}
+
+fn visit_filtered(
+    rows: &[Vec<Value>],
+    positions: Option<&[usize]>,
+    filter: Option<&BoundExpr>,
+    visit: &mut impl FnMut(&[Value]) -> Result<(), DbError>,
+) -> Result<(), DbError> {
+    if let Some(positions) = positions {
+        for &position in positions {
+            let Some(row) = rows.get(position) else {
+                return Err(DbError::Internal(format!(
+                    "index position {position} is outside the table"
+                )));
+            };
+            if expr::row_matches(filter, row)? {
+                visit(row)?;
+            }
+        }
+        return Ok(());
+    }
+    for row in rows {
+        if expr::row_matches(filter, row)? {
+            visit(row)?;
+        }
+    }
+    Ok(())
+}
+
+fn absorb_row(
+    row: &[Value],
+    plan: &AggPlan,
+    groups: &mut Vec<AggGroup>,
+    buckets: &mut HashMap<u64, Vec<usize>>,
+) -> Result<(), DbError> {
+    let hash = hash_group(row, &plan.group_ordinals)?;
+    let found = buckets.get(&hash).and_then(|slots| {
+        slots
+            .iter()
+            .copied()
+            .find(|&slot| group_equals(&groups[slot].key, row, &plan.group_ordinals))
+    });
+    if let Some(slot) = found {
+        return update_acc(&mut groups[slot].acc, row, &plan.aggs);
+    }
+    let mut key = Vec::with_capacity(plan.group_ordinals.len());
+    for &ordinal in &plan.group_ordinals {
+        let Some(value) = row.get(ordinal) else {
+            return Err(DbError::Internal(
+                "group column is outside the row".to_string(),
+            ));
+        };
+        key.push(value.clone());
+    }
+    let mut acc = fresh_acc(&plan.aggs);
+    update_acc(&mut acc, row, &plan.aggs)?;
+    let slot = groups.len();
+    groups.push(AggGroup { key, acc });
+    buckets.entry(hash).or_default().push(slot);
+    Ok(())
+}
+
+fn fresh_acc(aggs: &[AggFn]) -> Vec<AccValue> {
+    aggs.iter()
+        .map(|agg| match agg {
+            AggFn::CountStar | AggFn::CountColumn(_) => AccValue::Count(0),
+            AggFn::Sum(_) => AccValue::Sum(None),
+        })
+        .collect()
+}
+
+fn update_acc(acc: &mut [AccValue], row: &[Value], aggs: &[AggFn]) -> Result<(), DbError> {
+    for (slot, agg) in aggs.iter().enumerate() {
+        match agg {
+            AggFn::CountStar => add_count(&mut acc[slot], "COUNT")?,
+            AggFn::CountColumn(ordinal) => {
+                if !cell(row, *ordinal)?.is_null() {
+                    add_count(&mut acc[slot], "COUNT")?;
+                }
+            }
+            AggFn::Sum(ordinal) => {
+                let value = match cell(row, *ordinal)? {
+                    Value::Null => continue,
+                    Value::Integer(value) => *value,
+                    _ => {
+                        return Err(DbError::Internal(
+                            "SUM received a non-integer value".to_string(),
+                        ));
+                    }
+                };
+                let AccValue::Sum(total) = &mut acc[slot] else {
+                    return Err(DbError::Internal(
+                        "SUM accumulator has the wrong shape".to_string(),
+                    ));
+                };
+                let base = total.unwrap_or(0);
+                *total = Some(
+                    base.checked_add(value)
+                        .ok_or_else(|| DbError::invalid("SUM overflows INTEGER"))?,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_count(slot: &mut AccValue, name: &str) -> Result<(), DbError> {
+    let AccValue::Count(count) = slot else {
+        return Err(DbError::Internal(
+            "COUNT accumulator has the wrong shape".to_string(),
+        ));
+    };
+    *count = count
+        .checked_add(1)
+        .ok_or_else(|| DbError::invalid(format!("{name} overflows INTEGER")))?;
+    Ok(())
+}
+
+fn cell(row: &[Value], ordinal: usize) -> Result<&Value, DbError> {
+    row.get(ordinal)
+        .ok_or_else(|| DbError::Internal("aggregate column is outside the row".to_string()))
+}
+
+fn materialize_group(key: &[Value], acc: &[AccValue]) -> Vec<Value> {
+    let mut row = Vec::with_capacity(key.len() + acc.len());
+    row.extend_from_slice(key);
+    for value in acc {
+        row.push(match value {
+            AccValue::Count(count) => Value::Integer(*count),
+            AccValue::Sum(total) => total.map(Value::Integer).unwrap_or(Value::Null),
+        });
+    }
+    row
+}
+
+fn hash_group(row: &[Value], ordinals: &[usize]) -> Result<u64, DbError> {
+    #[cfg(test)]
+    if let Some(forced) = FORCED_HASH.with(std::cell::Cell::get) {
+        for &ordinal in ordinals {
+            let _ = cell(row, ordinal)?;
+        }
+        return Ok(forced);
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for &ordinal in ordinals {
+        match cell(row, ordinal)? {
+            Value::Null => 0u8.hash(&mut hasher),
+            Value::Integer(value) => {
+                1u8.hash(&mut hasher);
+                value.hash(&mut hasher);
+            }
+            Value::Text(value) => {
+                2u8.hash(&mut hasher);
+                value.hash(&mut hasher);
+            }
+            Value::Boolean(value) => {
+                3u8.hash(&mut hasher);
+                value.hash(&mut hasher);
+            }
+        }
+    }
+    Ok(hasher.finish())
+}
+
+fn group_equals(key: &[Value], row: &[Value], ordinals: &[usize]) -> bool {
+    if key.len() != ordinals.len() {
+        return false;
+    }
+    key.iter().zip(ordinals).all(|(stored, &ordinal)| {
+        let Some(value) = row.get(ordinal) else {
+            return false;
+        };
+        match (stored, value) {
+            (Value::Null, Value::Null) => true,
+            (Value::Integer(left), Value::Integer(right)) => left == right,
+            (Value::Text(left), Value::Text(right)) => left == right,
+            (Value::Boolean(left), Value::Boolean(right)) => left == right,
+            _ => false,
+        }
+    })
+}
+
 fn bind_optional_where(
     selection: Option<&Expr>,
     scope: &Scope,
@@ -919,9 +1431,15 @@ fn output_columns(scope: &Scope, projection: &Projection) -> Result<Vec<usize>, 
     match projection {
         Projection::All => Ok((0..scope.len()).collect()),
         Projection::QualifiedAll { qualifier } => scope.columns_of(qualifier),
-        Projection::Columns(columns) => {
-            columns.iter().map(|column| scope.resolve(column)).collect()
-        }
+        Projection::Columns(columns) => columns
+            .iter()
+            .map(|item| match item {
+                SelectItem::Column(column) => scope.resolve(column),
+                SelectItem::Aggregate(_) => Err(DbError::Internal(
+                    "aggregate select item in a non-aggregate query".to_string(),
+                )),
+            })
+            .collect(),
     }
 }
 
@@ -1028,7 +1546,12 @@ fn assign_row(row: &[Value], assignments: &[BoundAssignment]) -> Result<Vec<Valu
 fn bind_order(scope: &Scope, keys: &[OrderKey]) -> Result<Vec<SortKey>, DbError> {
     let mut bound = Vec::with_capacity(keys.len());
     for key in keys {
-        let index = scope.resolve(&key.column)?;
+        let OrderTarget::Column(column) = &key.target else {
+            return Err(DbError::unsupported(
+                "ORDER BY aggregate requires GROUP BY or an aggregate select list",
+            ));
+        };
+        let index = scope.resolve(column)?;
         bound.push(SortKey {
             index,
             ascending: key.ascending,
@@ -2035,5 +2558,152 @@ mod tests {
             return "unknown".to_string();
         }
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn count_overflow_is_an_error_and_the_accumulator_is_one_slot() {
+        let mut slot = AccValue::Count(i64::MAX);
+        let error = add_count(&mut slot, "COUNT").unwrap_err();
+        assert_eq!(error.to_string(), "COUNT overflows INTEGER");
+        let AccValue::Count(count) = slot else {
+            panic!("COUNT overflow changed the accumulator");
+        };
+        assert_eq!(count, i64::MAX);
+        // Count and Sum share one 16-byte slot: the `i64` and a tag that also
+        // distinguishes `Sum(None)`.
+        assert_eq!(std::mem::size_of::<AccValue>(), 16);
+    }
+
+    #[test]
+    fn a_forced_group_hash_collision_does_not_merge_unequal_groups() {
+        let distinct = [
+            vec![
+                Value::Integer(0),
+                Value::Text("0".to_string()),
+                Value::Boolean(false),
+            ],
+            vec![
+                Value::Integer(-1),
+                Value::Text("0".to_string()),
+                Value::Boolean(false),
+            ],
+            vec![Value::Integer(i64::MIN), Value::Null, Value::Boolean(true)],
+            vec![
+                Value::Null,
+                Value::Text("0".to_string()),
+                Value::Boolean(false),
+            ],
+            vec![
+                Value::Integer(0),
+                Value::Text("0".to_string()),
+                Value::Boolean(true),
+            ],
+            vec![Value::Null, Value::Null, Value::Null],
+        ];
+        assert_ne!(
+            hash_group(&distinct[0], &[0, 1, 2]).unwrap(),
+            hash_group(&distinct[1], &[0, 1, 2]).unwrap()
+        );
+        {
+            let _force = ForceHashCollision::new();
+            let forced = hash_group(&distinct[0], &[0, 1, 2]).unwrap();
+            for row in &distinct {
+                assert_eq!(hash_group(row, &[0, 1, 2]).unwrap(), forced);
+            }
+            assert!(hash_group(&distinct[0], &[9]).is_err());
+        }
+        assert_ne!(
+            hash_group(&distinct[0], &[0, 1, 2]).unwrap(),
+            hash_group(&distinct[1], &[0, 1, 2]).unwrap()
+        );
+
+        let mut db = Database::new();
+        db.execute("CREATE TABLE items (n INT, label TEXT, flag BOOLEAN);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO items VALUES
+                (0, '0', FALSE),
+                (-1, '0', FALSE),
+                (-9223372036854775808, NULL, TRUE),
+                (NULL, '0', FALSE),
+                (0, '0', TRUE),
+                (NULL, NULL, NULL),
+                (0, '0', FALSE),
+                (1, 'a', FALSE),
+                (NULL, NULL, NULL);",
+        )
+        .unwrap();
+        let grouped = "SELECT n, label, flag, COUNT(*), COUNT(n), SUM(n)
+             FROM items GROUP BY n, label, flag;";
+        let distinct_rows = "SELECT n, label, flag FROM items GROUP BY n, label, flag;";
+        let normal = query(&mut db, grouped);
+        let normal_keys = query(&mut db, distinct_rows);
+        let forced = {
+            let _force = ForceHashCollision::new();
+            let grouped = query(&mut db, grouped);
+            let keys = query(&mut db, distinct_rows);
+            assert_eq!(keys.rows, normal_keys.rows);
+            grouped
+        };
+        assert_eq!(forced.rows, normal.rows);
+        assert_eq!(normal.rows.len(), 7);
+        assert_eq!(
+            normal.rows[0],
+            vec![
+                Value::Integer(0),
+                Value::Text("0".to_string()),
+                Value::Boolean(false),
+                Value::Integer(2),
+                Value::Integer(2),
+                Value::Integer(0),
+            ]
+        );
+        assert!(
+            normal
+                .rows
+                .iter()
+                .any(|row| row[0] == Value::Null && row[3] == Value::Integer(2))
+        );
+        assert!(
+            normal
+                .rows
+                .iter()
+                .any(|row| row[0] == Value::Integer(i64::MIN))
+        );
+    }
+
+    #[test]
+    fn identical_aggregates_share_one_accumulator() {
+        let table = Table::new(
+            "items".to_string(),
+            vec![crate::schema::Column::new("n", DataType::Integer)],
+        )
+        .unwrap();
+        let scope = Scope::from_table(&table, "items");
+        let sum = AggregateCall {
+            function: AggregateFunction::Sum,
+            argument: AggregateArg::Column(SelectColumn {
+                name: "n".to_string(),
+                qualifier: None,
+            }),
+        };
+        let qualified = AggregateCall {
+            function: AggregateFunction::Sum,
+            argument: AggregateArg::Column(SelectColumn {
+                name: "n".to_string(),
+                qualifier: Some("items".to_string()),
+            }),
+        };
+        let mut aggs = Vec::new();
+        let first = bind_aggregate(&sum, &scope, &mut aggs).unwrap();
+        let second = bind_aggregate(&sum, &scope, &mut aggs).unwrap();
+        let third = bind_aggregate(&qualified, &scope, &mut aggs).unwrap();
+        assert_eq!((first, second, third, aggs.len()), (0, 0, 0, 1));
+        let count = AggregateCall {
+            function: AggregateFunction::Count,
+            argument: AggregateArg::Star,
+        };
+        assert_eq!(bind_aggregate(&count, &scope, &mut aggs).unwrap(), 1);
+        assert_eq!(aggs.len(), 2);
     }
 }

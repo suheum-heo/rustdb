@@ -8,9 +8,10 @@
 
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CreateTable, CreateTableOptions, DataType as SqlDataType,
-    Delete as SqlDelete, DescribeAlias, Expr as SqlExpr, FromTable, GroupByExpr,
-    HiveDistributionStyle, Ident, JoinConstraint, JoinOperator, LimitClause, ObjectName,
-    ObjectType, OrderBy, OrderByKind, OrderBySort, Query, Select, SelectFlavor, SelectItem,
+    Delete as SqlDelete, DescribeAlias, Expr as SqlExpr, FromTable, Function as SqlFunction,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, HiveDistributionStyle, Ident,
+    JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectType, OrderBy, OrderByKind,
+    OrderBySort, Query, Select, SelectFlavor, SelectItem as SqlSelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, Statement as SqlStatement, TableFactor,
     UnaryOperator, Update as SqlUpdate, Value as SqlValue,
 };
@@ -18,7 +19,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::ast::{
-    Assignment, BinOp, Expr, OrderKey, Projection, QueryFrom, SelectColumn, Statement, TableRef,
+    AggregateArg, AggregateCall, AggregateFunction, Assignment, BinOp, Expr, OrderKey, OrderTarget,
+    Projection, QueryFrom, SelectColumn, SelectItem, Statement, TableRef,
 };
 use crate::error::DbError;
 use crate::schema::Column;
@@ -537,14 +539,36 @@ fn convert_select(
     reject_select_clauses(&select)?;
     let table = convert_from(&select)?;
     let projection = convert_projection(&select.projection)?;
-    let selection = select.selection.as_ref().map(convert_expr).transpose()?;
+    let selection = select
+        .selection
+        .as_ref()
+        .map(|expr| convert_expr_in(expr, Some("WHERE")))
+        .transpose()?;
+    let group_by = convert_group_by(&select.group_by)?;
+    if matches!(table, QueryFrom::Join { .. })
+        && (!group_by.is_empty() || projection_has_aggregate(&projection))
+    {
+        return Err(DbError::unsupported(
+            "aggregates over JOIN are not supported",
+        ));
+    }
     Ok(Statement::Select {
         from: table,
         projection,
         selection,
+        group_by,
         order_by,
         limit,
     })
+}
+
+fn projection_has_aggregate(projection: &Projection) -> bool {
+    match projection {
+        Projection::All | Projection::QualifiedAll { .. } => false,
+        Projection::Columns(items) => items
+            .iter()
+            .any(|item| matches!(item, SelectItem::Aggregate(_))),
+    }
 }
 
 fn reject_select_clauses(select: &Select) -> Result<(), DbError> {
@@ -556,10 +580,6 @@ fn reject_select_clauses(select: &Select) -> Result<(), DbError> {
     }
     if !matches!(select.flavor, SelectFlavor::Standard) {
         return Err(DbError::unsupported("this SELECT syntax is not supported"));
-    }
-    match &select.group_by {
-        GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty() => {}
-        _ => return Err(DbError::unsupported("GROUP BY is not supported")),
     }
     if select.having.is_some() {
         return Err(DbError::unsupported("HAVING is not supported"));
@@ -635,7 +655,7 @@ fn inner_join_condition(operator: &JoinOperator) -> Result<Expr, DbError> {
         _ => return Err(DbError::unsupported("this JOIN is not supported")),
     };
     match constraint {
-        JoinConstraint::On(expr) => convert_expr(expr),
+        JoinConstraint::On(expr) => convert_expr_in(expr, Some("ON")),
         JoinConstraint::Using(_) | JoinConstraint::UsingAlias(_, _) => {
             Err(DbError::unsupported("USING is not supported"))
         }
@@ -701,15 +721,15 @@ fn table_name(factor: &TableFactor) -> Result<String, DbError> {
     Ok(table_ref(factor)?.name)
 }
 
-fn convert_projection(items: &[SelectItem]) -> Result<Projection, DbError> {
+fn convert_projection(items: &[SqlSelectItem]) -> Result<Projection, DbError> {
     if items.is_empty() {
         return Err(DbError::invalid("SELECT requires a column list"));
     }
-    if let [SelectItem::Wildcard(options)] = items {
+    if let [SqlSelectItem::Wildcard(options)] = items {
         reject_wildcard_options(options)?;
         return Ok(Projection::All);
     }
-    if let [SelectItem::QualifiedWildcard(kind, options)] = items {
+    if let [SqlSelectItem::QualifiedWildcard(kind, options)] = items {
         reject_wildcard_options(options)?;
         return Ok(Projection::QualifiedAll {
             qualifier: wildcard_qualifier(kind)?,
@@ -719,13 +739,13 @@ fn convert_projection(items: &[SelectItem]) -> Result<Projection, DbError> {
     let mut columns = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            SelectItem::UnnamedExpr(expr) => columns.push(select_column(expr)?),
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+            SqlSelectItem::UnnamedExpr(expr) => columns.push(select_item(expr)?),
+            SqlSelectItem::Wildcard(_) | SqlSelectItem::QualifiedWildcard(_, _) => {
                 return Err(DbError::unsupported(
                     "mixing * with other select items is not supported",
                 ));
             }
-            SelectItem::ExprWithAlias { .. } | SelectItem::ExprWithAliases { .. } => {
+            SqlSelectItem::ExprWithAlias { .. } | SqlSelectItem::ExprWithAliases { .. } => {
                 return Err(DbError::unsupported("column aliases are not supported"));
             }
         }
@@ -767,36 +787,206 @@ fn wildcard_qualifier(kind: &SelectItemQualifiedWildcardKind) -> Result<String, 
     Ok(qualifier)
 }
 
-fn select_column(expr: &SqlExpr) -> Result<SelectColumn, DbError> {
+fn select_item(expr: &SqlExpr) -> Result<SelectItem, DbError> {
+    if let Some(call) = aggregate_call(expr)? {
+        return Ok(SelectItem::Aggregate(call));
+    }
     match convert_expr(expr)? {
-        Expr::Column { name, qualifier } => Ok(SelectColumn { name, qualifier }),
+        Expr::Column { name, qualifier } => {
+            Ok(SelectItem::Column(SelectColumn { name, qualifier }))
+        }
         _ => Err(DbError::unsupported("SELECT expressions are not supported")),
     }
 }
 
+fn convert_group_by(group_by: &GroupByExpr) -> Result<Vec<SelectColumn>, DbError> {
+    match group_by {
+        GroupByExpr::All(_) => Err(DbError::unsupported("GROUP BY ALL is not supported")),
+        GroupByExpr::Expressions(exprs, modifiers) => {
+            if !modifiers.is_empty() {
+                return Err(DbError::unsupported(
+                    "GROUP BY ROLLUP and CUBE are not supported",
+                ));
+            }
+            exprs
+                .iter()
+                .map(|expr| match convert_expr(expr)? {
+                    Expr::Column { name, qualifier } => Ok(SelectColumn { name, qualifier }),
+                    _ => Err(DbError::unsupported(
+                        "GROUP BY expressions are not supported",
+                    )),
+                })
+                .collect()
+        }
+    }
+}
+
+fn aggregate_call(expr: &SqlExpr) -> Result<Option<AggregateCall>, DbError> {
+    let expr = peel_nested(expr);
+    let SqlExpr::Function(function) = expr else {
+        return Ok(None);
+    };
+    let name = function_name(&function.name)?;
+    let kind = match name.as_str() {
+        "count" => AggregateFunction::Count,
+        "sum" => AggregateFunction::Sum,
+        _ => return Err(DbError::unsupported("function calls are not supported")),
+    };
+    reject_aggregate_options(function)?;
+    let argument = aggregate_argument(kind, function)?;
+    Ok(Some(AggregateCall {
+        function: kind,
+        argument,
+    }))
+}
+
+fn reject_aggregate_options(function: &SqlFunction) -> Result<(), DbError> {
+    if function.uses_odbc_syntax {
+        return Err(DbError::unsupported(
+            "ODBC function calls are not supported",
+        ));
+    }
+    if !matches!(function.parameters, FunctionArguments::None) {
+        return Err(DbError::unsupported(
+            "function parameters are not supported",
+        ));
+    }
+    if function.over.is_some() {
+        return Err(DbError::unsupported("window functions are not supported"));
+    }
+    if function.filter.is_some() {
+        return Err(DbError::unsupported("aggregate FILTER is not supported"));
+    }
+    if function.null_treatment.is_some() {
+        return Err(DbError::unsupported(
+            "aggregate NULL treatment is not supported",
+        ));
+    }
+    if !function.within_group.is_empty() {
+        return Err(DbError::unsupported("WITHIN GROUP is not supported"));
+    }
+    Ok(())
+}
+
+fn aggregate_argument(
+    kind: AggregateFunction,
+    function: &SqlFunction,
+) -> Result<AggregateArg, DbError> {
+    let FunctionArguments::List(list) = &function.args else {
+        return Err(DbError::unsupported("COUNT requires an argument"));
+    };
+    if list.duplicate_treatment.is_some() {
+        return Err(DbError::unsupported(
+            "DISTINCT aggregates are not supported",
+        ));
+    }
+    if !list.clauses.is_empty() {
+        return Err(DbError::unsupported(
+            "this aggregate clause is not supported",
+        ));
+    }
+    if list.args.len() != 1 {
+        return Err(DbError::unsupported(
+            "aggregate functions take one argument",
+        ));
+    }
+    let FunctionArg::Unnamed(argument) = &list.args[0] else {
+        return Err(DbError::unsupported(
+            "named function arguments are not supported",
+        ));
+    };
+    match argument {
+        FunctionArgExpr::Wildcard => {
+            if kind == AggregateFunction::Sum {
+                return Err(DbError::unsupported("SUM requires an INTEGER column"));
+            }
+            Ok(AggregateArg::Star)
+        }
+        FunctionArgExpr::QualifiedWildcard(_) | FunctionArgExpr::WildcardWithOptions(_) => {
+            Err(DbError::unsupported("aggregate arguments must be columns"))
+        }
+        FunctionArgExpr::Expr(expr) => {
+            if contains_function(expr) {
+                return Err(DbError::unsupported("nested aggregates are not supported"));
+            }
+            match convert_expr(expr)? {
+                Expr::Column { name, qualifier } => {
+                    Ok(AggregateArg::Column(SelectColumn { name, qualifier }))
+                }
+                _ => Err(DbError::unsupported("aggregate arguments must be columns")),
+            }
+        }
+    }
+}
+
+fn contains_function(expr: &SqlExpr) -> bool {
+    match peel_nested(expr) {
+        SqlExpr::Function(_) => true,
+        SqlExpr::UnaryOp { expr, .. } => contains_function(expr),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            contains_function(left) || contains_function(right)
+        }
+        SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => contains_function(inner),
+        _ => false,
+    }
+}
+
+fn peel_nested(expr: &SqlExpr) -> &SqlExpr {
+    let mut expr = expr;
+    while let SqlExpr::Nested(inner) = expr {
+        expr = inner;
+    }
+    expr
+}
+
+fn function_name(name: &ObjectName) -> Result<String, DbError> {
+    if name.0.len() != 1 {
+        return Err(DbError::unsupported(
+            "qualified function names are not supported",
+        ));
+    }
+    let Some(ident) = name.0[0].as_ident() else {
+        return Err(DbError::unsupported("function calls are not supported"));
+    };
+    Ok(normalize_ident(ident))
+}
+
 fn convert_expr(expr: &SqlExpr) -> Result<Expr, DbError> {
+    convert_expr_in(expr, None)
+}
+
+fn convert_expr_in(expr: &SqlExpr, clause: Option<&str>) -> Result<Expr, DbError> {
     match expr {
-        SqlExpr::Nested(inner) => convert_expr(inner),
+        SqlExpr::Nested(inner) => convert_expr_in(inner, clause),
         SqlExpr::Identifier(ident) => Ok(Expr::Column {
             name: normalize_ident(ident),
             qualifier: None,
         }),
         SqlExpr::CompoundIdentifier(parts) => convert_compound(parts),
         SqlExpr::Value(value) => convert_literal(&value.value),
-        SqlExpr::UnaryOp { op, expr } => convert_unary(*op, expr),
+        SqlExpr::UnaryOp { op, expr } => convert_unary(*op, expr, clause),
         SqlExpr::BinaryOp { left, op, right } => Ok(Expr::Binary {
-            left: Box::new(convert_expr(left)?),
+            left: Box::new(convert_expr_in(left, clause)?),
             op: convert_operator(op)?,
-            right: Box::new(convert_expr(right)?),
+            right: Box::new(convert_expr_in(right, clause)?),
         }),
-        SqlExpr::IsNull(inner) => Ok(Expr::IsNull(Box::new(convert_expr(inner)?))),
-        SqlExpr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(convert_expr(inner)?))),
+        SqlExpr::IsNull(inner) => Ok(Expr::IsNull(Box::new(convert_expr_in(inner, clause)?))),
+        SqlExpr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(convert_expr_in(inner, clause)?))),
         SqlExpr::Between { .. } => Err(DbError::unsupported("BETWEEN is not supported")),
         SqlExpr::Like { .. } | SqlExpr::ILike { .. } => {
             Err(DbError::unsupported("LIKE is not supported"))
         }
         SqlExpr::In { .. } => Err(DbError::unsupported("IN is not supported")),
-        SqlExpr::Function(_) => Err(DbError::unsupported("function calls are not supported")),
+        SqlExpr::Function(function) => {
+            let name = function_name(&function.name).unwrap_or_default();
+            if matches!(name.as_str(), "count" | "sum") {
+                let place = clause.unwrap_or("this expression");
+                return Err(DbError::unsupported(format!(
+                    "aggregates are not allowed in {place}"
+                )));
+            }
+            Err(DbError::unsupported("function calls are not supported"))
+        }
         SqlExpr::Subquery(_) => Err(DbError::unsupported("subqueries are not supported")),
         _ => Err(DbError::unsupported("this expression is not supported")),
     }
@@ -830,7 +1020,7 @@ fn convert_operator(op: &BinaryOperator) -> Result<BinOp, DbError> {
     }
 }
 
-fn convert_unary(op: UnaryOperator, expr: &SqlExpr) -> Result<Expr, DbError> {
+fn convert_unary(op: UnaryOperator, expr: &SqlExpr, clause: Option<&str>) -> Result<Expr, DbError> {
     match op {
         UnaryOperator::Plus | UnaryOperator::Minus => {
             if let SqlExpr::Value(value) = expr
@@ -843,7 +1033,7 @@ fn convert_unary(op: UnaryOperator, expr: &SqlExpr) -> Result<Expr, DbError> {
                 "unary operators are only supported on integer literals",
             ))
         }
-        UnaryOperator::Not => Ok(Expr::Not(Box::new(convert_expr(expr)?))),
+        UnaryOperator::Not => Ok(Expr::Not(Box::new(convert_expr_in(expr, clause)?))),
         _ => Err(DbError::unsupported("this unary operator is not supported")),
     }
 }
@@ -933,7 +1123,11 @@ fn convert_update(update: SqlUpdate) -> Result<Statement, DbError> {
             value: convert_expr(&assignment.value)?,
         });
     }
-    let selection = update.selection.as_ref().map(convert_expr).transpose()?;
+    let selection = update
+        .selection
+        .as_ref()
+        .map(|expr| convert_expr_in(expr, Some("WHERE")))
+        .transpose()?;
     Ok(Statement::Update {
         table,
         assignments,
@@ -971,7 +1165,11 @@ fn convert_delete(delete: SqlDelete) -> Result<Statement, DbError> {
         return Err(DbError::unsupported("JOIN is not supported"));
     }
     let table = table_name(&tables[0].relation)?;
-    let selection = delete.selection.as_ref().map(convert_expr).transpose()?;
+    let selection = delete
+        .selection
+        .as_ref()
+        .map(|expr| convert_expr_in(expr, Some("WHERE")))
+        .transpose()?;
     Ok(Statement::Delete { table, selection })
 }
 
@@ -997,12 +1195,18 @@ fn convert_order_key(key: &sqlparser::ast::OrderByExpr) -> Result<OrderKey, DbEr
     if matches!(key.options.sort, Some(OrderBySort::Using(_))) {
         return Err(DbError::unsupported("ORDER BY USING is not supported"));
     }
-    let column = match convert_expr(&key.expr)? {
-        Expr::Column { name, qualifier } => SelectColumn { name, qualifier },
-        _ => {
-            return Err(DbError::unsupported(
-                "ORDER BY expressions are not supported",
-            ));
+    let target = if let Some(call) = aggregate_call(&key.expr)? {
+        OrderTarget::Aggregate(call)
+    } else {
+        match convert_expr(&key.expr)? {
+            Expr::Column { name, qualifier } => {
+                OrderTarget::Column(SelectColumn { name, qualifier })
+            }
+            _ => {
+                return Err(DbError::unsupported(
+                    "ORDER BY expressions are not supported",
+                ));
+            }
         }
     };
     let ascending = match key.options.sort {
@@ -1013,7 +1217,7 @@ fn convert_order_key(key: &sqlparser::ast::OrderByExpr) -> Result<OrderKey, DbEr
         }
     };
     Ok(OrderKey {
-        column,
+        target,
         ascending,
         nulls_first: key.options.nulls_first,
     })
@@ -1144,10 +1348,10 @@ mod tests {
                 );
                 assert_eq!(
                     projection,
-                    &Projection::Columns(vec![SelectColumn {
+                    &Projection::Columns(vec![SelectItem::Column(SelectColumn {
                         name: "name".to_string(),
                         qualifier: None,
-                    }])
+                    })])
                 );
                 assert!(selection.is_some());
             }
@@ -1188,7 +1392,10 @@ mod tests {
                 order_by, limit, ..
             } => {
                 assert_eq!(order_by.len(), 2);
-                assert_eq!(order_by[0].column.name, "age");
+                let OrderTarget::Column(column) = &order_by[0].target else {
+                    panic!("expected a column");
+                };
+                assert_eq!(column.name, "age");
                 assert!(!order_by[0].ascending);
                 assert!(order_by[1].ascending);
                 assert_eq!(order_by[0].nulls_first, None);
@@ -1223,14 +1430,14 @@ mod tests {
                 assert_eq!(
                     projection,
                     &Projection::Columns(vec![
-                        SelectColumn {
+                        SelectItem::Column(SelectColumn {
                             name: "name".to_string(),
                             qualifier: Some("u".to_string()),
-                        },
-                        SelectColumn {
+                        }),
+                        SelectItem::Column(SelectColumn {
                             name: "total".to_string(),
                             qualifier: Some("o".to_string()),
-                        },
+                        }),
                     ])
                 );
             }
