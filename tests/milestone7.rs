@@ -677,8 +677,8 @@ fn unsupported_joins_are_rejected() {
     seed(&mut database);
     let cases = [
         (
-            "SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id;",
-            "LEFT JOIN is not supported",
+            "SELECT DISTINCT name FROM users LEFT JOIN orders ON users.id = orders.user_id;",
+            "LEFT JOIN is not supported with DISTINCT",
         ),
         (
             "SELECT * FROM users RIGHT JOIN orders ON users.id = orders.user_id;",
@@ -1071,9 +1071,9 @@ fn explain_binds_without_running_or_writing() {
     assert_eq!(ambiguous, "column 'id' is ambiguous");
     let unsupported = failure(
         &mut database,
-        "EXPLAIN SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id;",
+        "EXPLAIN SELECT * FROM users RIGHT JOIN orders ON users.id = orders.user_id;",
     );
-    assert_eq!(unsupported, "LEFT JOIN is not supported");
+    assert_eq!(unsupported, "RIGHT JOIN is not supported");
     assert_eq!(rows(&mut database, EQUAL).len(), 5);
     drop(database);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), before);

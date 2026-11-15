@@ -45,7 +45,14 @@
 //!
 //! An `INNER JOIN` walks the outer table in insertion order. For each outer
 //! row it reads inner candidates, then keeps a pair only when `ON` is TRUE.
-//! `WHERE` then runs on that pair. An indexed integer equality uses the index
+//! `WHERE` then runs on that pair. A `LEFT JOIN` uses only a nested loop.
+//! Every left row is visited in insertion order. Each right row that makes
+//! `ON` TRUE is emitted in insertion order. `WHERE` runs on that pair. A left
+//! row with no TRUE `ON` match is emitted once, with NULL for every right
+//! column, and `WHERE` then sees that extended row. A `WHERE` that removes
+//! the matches does not add the NULL row. `ON` FALSE and `ON` UNKNOWN do not
+//! match, including `NULL = NULL`. `LIMIT` does not stop that scan.
+//! An indexed integer equality on an `INNER JOIN` uses the index
 //! when the outer table is empty or the inner table has more than 64 times as
 //! many rows. Otherwise that equality builds a hash table. Each bucket keeps
 //! one group per distinct key, so a fingerprint collision does not mix keys.
@@ -67,8 +74,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::ast::{
-    AggregateArg, AggregateCall, AggregateFunction, Assignment, Expr, OrderKey, OrderTarget,
-    Projection, QueryFrom, SelectColumn, SelectItem, Statement, TableRef,
+    AggregateArg, AggregateCall, AggregateFunction, Assignment, Expr, JoinKind, OrderKey,
+    OrderTarget, Projection, QueryFrom, SelectColumn, SelectItem, Statement, TableRef,
 };
 use crate::database::{Database, DurableChange};
 use crate::error::DbError;
@@ -265,23 +272,55 @@ impl Database {
         tail: SelectTail<'_>,
     ) -> Result<StatementResult, DbError> {
         reject_runtime_distinct(from, tail)?;
+        reject_left_join(from, tail)?;
         if tail.distinct {
             return match from {
                 QueryFrom::Table(source) => self.query_table(source, tail),
-                QueryFrom::Join { outer, inner, on } => {
-                    self.query_distinct_join(outer, inner, on, tail)
-                }
+                QueryFrom::Join {
+                    kind: JoinKind::Inner,
+                    outer,
+                    inner,
+                    on,
+                } => self.query_distinct_join(outer, inner, on, tail),
+                QueryFrom::Join {
+                    kind: JoinKind::Left,
+                    ..
+                } => Err(DbError::unsupported(
+                    "LEFT JOIN is not supported with DISTINCT",
+                )),
             };
         }
         if is_aggregate_query(tail.projection, tail.group_by, tail.having, tail.order_by) {
             return match from {
                 QueryFrom::Table(source) => self.aggregate_table(source, tail),
-                QueryFrom::Join { outer, inner, on } => self.aggregate_join(outer, inner, on, tail),
+                QueryFrom::Join {
+                    kind: JoinKind::Inner,
+                    outer,
+                    inner,
+                    on,
+                } => self.aggregate_join(outer, inner, on, tail),
+                QueryFrom::Join {
+                    kind: JoinKind::Left,
+                    ..
+                } => Err(DbError::unsupported(
+                    "LEFT JOIN is not supported with aggregate functions",
+                )),
             };
         }
         match from {
             QueryFrom::Table(source) => self.query_table(source, tail),
-            QueryFrom::Join { outer, inner, on } => self.query_join(outer, inner, on, tail),
+            QueryFrom::Join {
+                kind: JoinKind::Inner,
+                outer,
+                inner,
+                on,
+            } => self.query_join(outer, inner, on, tail),
+            QueryFrom::Join {
+                kind: JoinKind::Left,
+                outer,
+                inner,
+                on,
+            } => self.query_left_join(outer, inner, on, tail),
         }
     }
 
@@ -460,6 +499,86 @@ impl Database {
                 })
             }
         }
+    }
+
+    /// Nested loop for `LEFT JOIN`. The planner's inner-join path is not used.
+    fn query_left_join(
+        &mut self,
+        outer: &TableRef,
+        inner: &TableRef,
+        on: &Expr,
+        tail: SelectTail<'_>,
+    ) -> Result<StatementResult, DbError> {
+        let prepared = self.prepare_join(
+            outer,
+            inner,
+            on,
+            tail.projection,
+            tail.selection,
+            tail.order_by,
+            false,
+        )?;
+        let inner_width = self.table(&inner.name)?.schema().columns().len();
+        self.with_copied_side(outer, inner, |outer_rows, inner_rows, _| {
+            scan_left_join(outer_rows, inner_rows, inner_width, prepared, tail.limit)
+        })
+    }
+
+    fn explain_left_join(
+        &self,
+        outer: &TableRef,
+        inner: &TableRef,
+        on: &Expr,
+        query: &crate::ast::SelectQuery,
+    ) -> Result<StatementResult, DbError> {
+        let prepared = self.prepare_join(
+            outer,
+            inner,
+            on,
+            &query.projection,
+            query.selection.as_ref(),
+            &query.order_by,
+            false,
+        )?;
+        let filter = query
+            .selection
+            .as_ref()
+            .map(|expr| Value::Text(expr.render()))
+            .unwrap_or(Value::Null);
+        let order = if query.order_by.is_empty() {
+            Value::Null
+        } else {
+            Value::Text(
+                query
+                    .order_by
+                    .iter()
+                    .map(render_order_key)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        };
+        Ok(StatementResult::Query(QueryResult {
+            columns: vec![
+                "access".to_string(),
+                "outer".to_string(),
+                "inner".to_string(),
+                "condition".to_string(),
+                "filter".to_string(),
+                "projection".to_string(),
+                "order_by".to_string(),
+                "limit".to_string(),
+            ],
+            rows: vec![vec![
+                Value::Text("LeftNestedLoopJoin".to_string()),
+                Value::Text(outer.explain_name()),
+                Value::Text(inner.explain_name()),
+                Value::Text(on.render()),
+                filter,
+                Value::Text(prepared.output_names.join(", ")),
+                order,
+                limit_cell(query.limit),
+            ]],
+        }))
     }
 
     fn query_distinct_join(
@@ -775,12 +894,22 @@ impl Database {
             distinct: query.distinct,
         };
         reject_runtime_distinct(&query.from, tail)?;
+        reject_left_join(&query.from, tail)?;
         if query.distinct {
             return match &query.from {
                 QueryFrom::Table(source) => self.explain_distinct(source, query),
-                QueryFrom::Join { outer, inner, on } => {
-                    self.explain_distinct_join(outer, inner, on, query)
-                }
+                QueryFrom::Join {
+                    kind: JoinKind::Inner,
+                    outer,
+                    inner,
+                    on,
+                } => self.explain_distinct_join(outer, inner, on, query),
+                QueryFrom::Join {
+                    kind: JoinKind::Left,
+                    ..
+                } => Err(DbError::unsupported(
+                    "LEFT JOIN is not supported with DISTINCT",
+                )),
             };
         }
         if is_aggregate_query(
@@ -791,9 +920,18 @@ impl Database {
         ) {
             return match &query.from {
                 QueryFrom::Table(source) => self.explain_aggregate(source, tail),
-                QueryFrom::Join { outer, inner, on } => {
-                    self.explain_aggregate_join(outer, inner, on, tail)
-                }
+                QueryFrom::Join {
+                    kind: JoinKind::Inner,
+                    outer,
+                    inner,
+                    on,
+                } => self.explain_aggregate_join(outer, inner, on, tail),
+                QueryFrom::Join {
+                    kind: JoinKind::Left,
+                    ..
+                } => Err(DbError::unsupported(
+                    "LEFT JOIN is not supported with aggregate functions",
+                )),
             };
         }
         match &query.from {
@@ -816,7 +954,18 @@ impl Database {
                     rows: vec![vec![access, index, bounds]],
                 }))
             }
-            QueryFrom::Join { outer, inner, on } => {
+            QueryFrom::Join {
+                kind: JoinKind::Left,
+                outer,
+                inner,
+                on,
+            } => self.explain_left_join(outer, inner, on, query),
+            QueryFrom::Join {
+                kind: JoinKind::Inner,
+                outer,
+                inner,
+                on,
+            } => {
                 let mut prepared = self.prepare_join(
                     outer,
                     inner,
@@ -1939,6 +2088,37 @@ fn text_list(labels: &[String]) -> Value {
     } else {
         Value::Text(labels.join(", "))
     }
+}
+
+fn reject_left_join(from: &QueryFrom, tail: SelectTail<'_>) -> Result<(), DbError> {
+    let QueryFrom::Join {
+        kind: JoinKind::Left,
+        ..
+    } = from
+    else {
+        return Ok(());
+    };
+    if tail.distinct {
+        return Err(DbError::unsupported(
+            "LEFT JOIN is not supported with DISTINCT",
+        ));
+    }
+    if !tail.group_by.is_empty() {
+        return Err(DbError::unsupported(
+            "LEFT JOIN is not supported with GROUP BY",
+        ));
+    }
+    if tail.having.is_some() {
+        return Err(DbError::unsupported(
+            "LEFT JOIN is not supported with HAVING",
+        ));
+    }
+    if is_aggregate_query(tail.projection, tail.group_by, tail.having, tail.order_by) {
+        return Err(DbError::unsupported(
+            "LEFT JOIN is not supported with aggregate functions",
+        ));
+    }
+    Ok(())
 }
 
 fn reject_runtime_distinct(_from: &QueryFrom, tail: SelectTail<'_>) -> Result<(), DbError> {
@@ -3851,6 +4031,85 @@ fn hash_key(key: KeyRef<'_>) -> u64 {
         }
     }
     hasher.finish()
+}
+
+fn scan_left_join(
+    outer_rows: &[Vec<Value>],
+    inner_rows: &[Vec<Value>],
+    inner_width: usize,
+    prepared: PreparedJoin,
+    limit: Option<u64>,
+) -> Result<StatementResult, DbError> {
+    let nulls = vec![Value::Null; inner_width];
+    let limit_n = limit.map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+    if prepared.sort_keys.is_empty() {
+        let mut projected = Vec::new();
+        let outputs = prepared.output_indexes.clone();
+        visit_left_pairs(
+            outer_rows,
+            inner_rows,
+            &nulls,
+            &prepared,
+            |outer_row, inner_row| {
+                if limit_n.is_some_and(|limit_n| projected.len() >= limit_n) {
+                    return Ok(());
+                }
+                projected.push(project_pair(outer_row, inner_row, &outputs)?);
+                Ok(())
+            },
+        )?;
+        return Ok(StatementResult::Query(QueryResult {
+            columns: prepared.output_names,
+            rows: projected,
+        }));
+    }
+    let mut joined = Vec::new();
+    visit_left_pairs(
+        outer_rows,
+        inner_rows,
+        &nulls,
+        &prepared,
+        |outer_row, inner_row| {
+            joined.push(concat_pair(outer_row, inner_row));
+            Ok(())
+        },
+    )?;
+    finish_rows(
+        joined,
+        &prepared.sort_keys,
+        limit,
+        &prepared.output_indexes,
+        prepared.output_names,
+    )
+}
+
+/// Emit every TRUE `ON` pair. A left row that never matches is emitted once
+/// against `nulls`. `WHERE` runs only on those constructed rows, so filtering
+/// a match does not invent a null-extended row. Evaluation continues after
+/// `LIMIT` so a later error is not hidden.
+fn visit_left_pairs(
+    outer_rows: &[Vec<Value>],
+    inner_rows: &[Vec<Value>],
+    nulls: &[Value],
+    prepared: &PreparedJoin,
+    mut visit: impl FnMut(&[Value], &[Value]) -> Result<(), DbError>,
+) -> Result<(), DbError> {
+    for outer_row in outer_rows {
+        let mut matched = false;
+        for inner_row in inner_rows {
+            if !expr::pair_matches(Some(&prepared.on), outer_row, inner_row)? {
+                continue;
+            }
+            matched = true;
+            if expr::pair_matches(prepared.filter.as_ref(), outer_row, inner_row)? {
+                visit(outer_row, inner_row)?;
+            }
+        }
+        if !matched && expr::pair_matches(prepared.filter.as_ref(), outer_row, nulls)? {
+            visit(outer_row, nulls)?;
+        }
+    }
+    Ok(())
 }
 
 fn scan_join(
@@ -8847,5 +9106,364 @@ mod tests {
             start = end + 1;
         }
         text_bytes
+    }
+
+    #[test]
+    fn a_left_join_limit_still_evaluates_the_later_pair() {
+        let scope = Scope::try_join(
+            "u",
+            vec![("id".to_string(), DataType::Integer)],
+            "o",
+            vec![("user_id".to_string(), DataType::Integer)],
+        )
+        .unwrap();
+        let on = Expr::Binary {
+            left: Box::new(Expr::Column {
+                name: "id".to_string(),
+                qualifier: Some("u".to_string()),
+            }),
+            op: crate::ast::BinOp::Eq,
+            right: Box::new(Expr::Column {
+                name: "user_id".to_string(),
+                qualifier: Some("o".to_string()),
+            }),
+        };
+        let prepared = PreparedJoin {
+            on: expr::bind_filter(&on, &scope, "ON").unwrap(),
+            filter: None,
+            sort_keys: Vec::new(),
+            output_indexes: vec![0, 1],
+            output_names: vec!["id".to_string(), "user_id".to_string()],
+            path: JoinAccess::NestedLoop,
+        };
+        let outer = vec![vec![Value::Integer(1)]];
+        let inner = vec![
+            vec![Value::Integer(1)],
+            vec![Value::Text("later".to_string())],
+        ];
+        let error = scan_left_join(&outer, &inner, 1, prepared, Some(1)).unwrap_err();
+        assert!(error.to_string().contains("different types"), "{error}");
+    }
+
+    /// `LIMIT` has already accepted a row from an earlier left input. A later
+    /// left row still evaluates `ON`, and that error replaces any partial output.
+    #[test]
+    fn a_later_left_row_still_reports_an_on_error_after_limit() {
+        let error = scan_typed_left(
+            vec![
+                vec![Value::Integer(1)],
+                vec![Value::Text("later".to_string())],
+            ],
+            vec![vec![Value::Integer(1)]],
+            OnShape::Equal,
+            None,
+            false,
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("different types"), "{error}");
+    }
+
+    /// The second right row makes `ON` TRUE and then fails in `WHERE`.
+    #[test]
+    fn a_later_pair_still_reports_a_where_error_after_limit() {
+        let error = scan_typed_left(
+            vec![vec![Value::Integer(1)]],
+            vec![
+                vec![Value::Integer(1)],
+                vec![Value::Text("later".to_string())],
+            ],
+            OnShape::True,
+            Some(false),
+            false,
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("different types"), "{error}");
+    }
+
+    /// `ON FALSE` rejects the stored right row, so `WHERE` runs on the null
+    /// extension and still sees the bad left value.
+    #[test]
+    fn a_null_extended_row_still_reports_a_where_error() {
+        let error = scan_typed_left(
+            vec![
+                vec![Value::Integer(1)],
+                vec![Value::Text("later".to_string())],
+            ],
+            vec![vec![Value::Integer(9)]],
+            OnShape::False,
+            Some(true),
+            false,
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("different types"), "{error}");
+    }
+
+    #[test]
+    fn order_by_and_limit_zero_still_report_the_later_error() {
+        let outer = vec![
+            vec![Value::Integer(1)],
+            vec![Value::Text("later".to_string())],
+        ];
+        let inner = vec![vec![Value::Integer(1)]];
+        let sorted = scan_typed_left(
+            outer.clone(),
+            inner.clone(),
+            OnShape::Equal,
+            None,
+            true,
+            Some(1),
+        );
+        assert!(sorted.unwrap_err().to_string().contains("different types"));
+        let limited = scan_typed_left(outer, inner, OnShape::Equal, None, false, Some(0));
+        assert!(limited.unwrap_err().to_string().contains("different types"));
+    }
+
+    /// How `ON` is built for a late-error scan.
+    enum OnShape {
+        /// `u.id = o.user_id`.
+        Equal,
+        /// Literal TRUE. Every right row matches.
+        True,
+        /// Literal FALSE. Every left row is null-extended.
+        False,
+    }
+
+    /// `where_outer` chooses `u.id > 0` or `o.user_id > 0`.
+    fn scan_typed_left(
+        outer: Vec<Vec<Value>>,
+        inner: Vec<Vec<Value>>,
+        on_shape: OnShape,
+        where_outer: Option<bool>,
+        sort: bool,
+        limit: Option<u64>,
+    ) -> Result<StatementResult, DbError> {
+        let scope = Scope::try_join(
+            "u",
+            vec![("id".to_string(), DataType::Integer)],
+            "o",
+            vec![("user_id".to_string(), DataType::Integer)],
+        )
+        .unwrap();
+        let on = match on_shape {
+            OnShape::True => Expr::Literal(Value::Boolean(true)),
+            OnShape::False => Expr::Literal(Value::Boolean(false)),
+            OnShape::Equal => Expr::Binary {
+                left: Box::new(Expr::Column {
+                    name: "id".to_string(),
+                    qualifier: Some("u".to_string()),
+                }),
+                op: crate::ast::BinOp::Eq,
+                right: Box::new(Expr::Column {
+                    name: "user_id".to_string(),
+                    qualifier: Some("o".to_string()),
+                }),
+            },
+        };
+        let filter = where_outer.map(|outer_side| {
+            let (name, qualifier) = if outer_side {
+                ("id", "u")
+            } else {
+                ("user_id", "o")
+            };
+            expr::bind_filter(
+                &Expr::Binary {
+                    left: Box::new(Expr::Column {
+                        name: name.to_string(),
+                        qualifier: Some(qualifier.to_string()),
+                    }),
+                    op: crate::ast::BinOp::Gt,
+                    right: Box::new(Expr::Literal(Value::Integer(0))),
+                },
+                &scope,
+                "WHERE",
+            )
+            .unwrap()
+        });
+        let prepared = PreparedJoin {
+            on: expr::bind_filter(&on, &scope, "ON").unwrap(),
+            filter,
+            sort_keys: if sort {
+                vec![SortKey {
+                    index: 0,
+                    ascending: true,
+                    nulls_first: false,
+                }]
+            } else {
+                Vec::new()
+            },
+            output_indexes: vec![0, 1],
+            output_names: vec!["id".to_string(), "user_id".to_string()],
+            path: JoinAccess::NestedLoop,
+        };
+        scan_left_join(&outer, &inner, 1, prepared, limit)
+    }
+
+    #[test]
+    #[ignore = "release profile of LEFT JOIN"]
+    fn profile_milestone18() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone18 cpu={cpu} mem_bytes={mem} rustc={rustc} value_bytes={} row_vec_bytes={}",
+            std::mem::size_of::<Value>(),
+            std::mem::size_of::<Vec<Value>>()
+        );
+        for rows in [100_i64, 1_000, 4_000] {
+            for shape in [
+                "matched",
+                "none",
+                "few",
+                "duplicates",
+                "where",
+                "order_limit",
+            ] {
+                profile_left_shape(rows, rows, shape);
+            }
+        }
+        for (users, orders) in [
+            (100_i64, 4_000),
+            (4_000, 100),
+            (1_000, 4_000),
+            (4_000, 1_000),
+        ] {
+            for shape in ["matched", "none", "duplicates", "where", "order_limit"] {
+                profile_left_shape(users, orders, shape);
+            }
+        }
+    }
+
+    fn profile_left_shape(users: i64, orders: i64, shape: &str) {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        database
+            .execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        load_left_users(&mut database, users);
+        load_left_orders(&mut database, orders, shape);
+        let sql = match shape {
+            "where" => format!(
+                "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount > {};",
+                orders / 2
+            ),
+            "order_limit" => "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id ORDER BY o.amount ASC LIMIT 5;".to_string(),
+            _ => "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;".to_string(),
+        };
+        let explained = query(&mut database, &format!("EXPLAIN {sql}"));
+        match &explained.rows[0][0] {
+            Value::Text(access) => assert_eq!(access, "LeftNestedLoopJoin"),
+            other => panic!("access {other:?}"),
+        }
+        let (matched, extended, returned) = left_counts(users, orders, shape);
+        let examined = users.saturating_mul(orders);
+        let mut samples = Vec::with_capacity(6);
+        let mut checksum = 0_i64;
+        for _ in 0..6 {
+            let started = std::time::Instant::now();
+            let result = query(&mut database, &sql);
+            samples.push(started.elapsed().as_micros());
+            assert_eq!(result.rows.len(), returned, "{shape} {users}x{orders}");
+            checksum = profile_checksum(&result);
+        }
+        let cold = samples[0];
+        let mut warm = samples[1..].to_vec();
+        warm.sort_unstable();
+        let warm = warm[warm.len() / 2];
+        let stored = if shape == "order_limit" {
+            matched + extended
+        } else {
+            returned
+        };
+        let width: usize = if shape == "order_limit" { 4 } else { 2 };
+        let bytes = stored.saturating_mul(
+            std::mem::size_of::<Vec<Value>>()
+                .saturating_add(width.saturating_mul(std::mem::size_of::<Value>())),
+        );
+        println!(
+            "milestone18 shape={shape} users={users} orders={orders} examined={examined} matched={matched} null_extended={extended} returned={returned} stored_rows={stored} bytes={bytes} checksum={checksum} cold_us={cold} warm_us={warm}"
+        );
+    }
+
+    /// Counts the same pairs the nested loop emits. This is not the executor.
+    fn left_counts(users: i64, orders: i64, shape: &str) -> (usize, usize, usize) {
+        let threshold = orders / 2;
+        let mut matched = 0_usize;
+        let mut extended = 0_usize;
+        let mut kept = 0_usize;
+        for user in 0..users {
+            let mut hit = false;
+            for order in 0..orders {
+                let user_id = match shape {
+                    "none" => -1,
+                    "few" => 0,
+                    "duplicates" => order % 10,
+                    _ => order,
+                };
+                if user_id != user {
+                    continue;
+                }
+                hit = true;
+                matched += 1;
+                if shape != "where" || order > threshold {
+                    kept += 1;
+                }
+            }
+            if !hit {
+                extended += 1;
+                if shape != "where" {
+                    kept += 1;
+                }
+            }
+        }
+        let returned = if shape == "order_limit" {
+            kept.min(5)
+        } else {
+            kept
+        };
+        (matched, extended, returned)
+    }
+
+    fn load_left_users(database: &mut Database, rows: i64) {
+        let mut start = 0_i64;
+        while start < rows {
+            let end = (start + 400).min(rows - 1);
+            let mut sql = String::from("INSERT INTO users VALUES ");
+            for id in start..=end {
+                if id != start {
+                    sql.push(',');
+                }
+                let label = (b'a' + u8::try_from(id % 8).unwrap_or(0)) as char;
+                sql.push_str(&format!("({id}, '{label}')"));
+            }
+            database.execute(&sql).unwrap();
+            start = end + 1;
+        }
+    }
+
+    fn load_left_orders(database: &mut Database, rows: i64, shape: &str) {
+        let mut start = 0_i64;
+        while start < rows {
+            let end = (start + 400).min(rows - 1);
+            let mut sql = String::from("INSERT INTO orders VALUES ");
+            for id in start..=end {
+                if id != start {
+                    sql.push(',');
+                }
+                let user_id = match shape {
+                    "none" => -1,
+                    "few" => 0,
+                    "duplicates" => id % 10,
+                    _ => id,
+                };
+                sql.push_str(&format!("({user_id}, {id})"));
+            }
+            database.execute(&sql).unwrap();
+            start = end + 1;
+        }
     }
 }
