@@ -697,3 +697,65 @@ At 4,000 by 4,000 the six shapes take about 101 ms warm and still examine all 16
 
 `where` on 100 by 4,000 returns 0 rows. Every user matched an order, those amounts are 0 through 99, and `amount > 2000` removes them. It does not add a null-extended row. `where` on 4,000 by 100 keeps 49 matches and drops the 3,900 null-extended rows. The 4,000 by 100 sort still holds all 4,000 joined rows, 608,000 bytes, and returns 5. The nested loop is the bottleneck. Neither a hash table nor an index is used.
 
+## Milestone 19 hash LEFT JOIN
+
+Release profile `profile_milestone19`, 15 Nov 2026. Apple M5, 17179869184 bytes of memory, `rustc 1.100.0 (0ef1bc386 2026-11-09)`. `Value` is 32 bytes and a row vector header is 24 bytes. The warm time is the median of the next five samples. The cold time is the first sample. A wrong row count or a checksum mismatch between the hash path and `LeftNestedLoopJoin` fails the run. Both paths produced the printed checksum.
+
+The hash path builds the right table. Before that, it checks that every `ON` cell is NULL or the column's declared type. A mismatched cell uses `LeftNestedLoopJoin` for that execution, so a type error is not skipped. Schema-valid rows stay on the hash path. `examined` counts exact-key hits, including hits that the residual `ON` later rejects. It is not `users * orders`, and it is not a claim that the join is linear. The nested column is the same statement forced through `LeftNestedLoopJoin`, so that examined count is `users * orders`. `LIMIT` does not stop either scan. `matched` counts `ON` results that are TRUE. `null-extended` counts left rows with no TRUE `ON` result, before `WHERE`. Speedup is nested warm divided by hash warm.
+
+`matched` gives every order `user_id = id`. `none` sets every `user_id` to -1. `few` points every order at user 0. `duplicates` uses `user_id = id % 10`. `residual` is the matched input with `ON u.id = o.user_id AND o.amount > orders / 2`. `where` puts that same threshold in `WHERE`. `order_limit` is the matched input with `ORDER BY amount ASC LIMIT 5`.
+
+Hash bytes are `8 * positions + 64 * groups` on this machine: one word per build position, one group header (`usize` plus `Vec<usize>`), and one map entry (`u64` plus `Vec` of groups) per distinct non-NULL key. Colliding fingerprints share a map entry, so the map term is then an upper bound. The figure excludes the hash map's bucket array, allocator slack, the copied input, and process RSS. Text keys are borrowed from the row and are not copied into the table. Copy bytes are the smaller input, or the right table when the two sides have the same number of rows. These two-column rows are 88 bytes each. The hash path stores no pair-position buffer. Match status is one boolean. The null-extended right row is one reused vector. `ORDER BY` still materializes the joined rows before sorting, the same way the nested path does. On `order_limit` that buffer is `(matched + null-extended) * 152` bytes: 15,200; 152,000; 608,000; and 1,520,000 for 100, 1,000, 4,000, and 10,000 fully matched left rows, and the same 608,000 and 1,520,000 when the larger left side is 4,000 or 10,000. That estimate is not RSS. Rust's `HashMap` still aborts the process if allocation fails.
+
+| Shape | Users | Orders | Hash examined | Nested examined | Matched | Null-extended | Returned | Hash bytes | Copy bytes | Hash cold | Hash warm | Nested cold | Nested warm | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| matched | 100 | 100 | 100 | 10,000 | 100 | 0 | 100 | 7,200 | 8,800 | 33 µs | 23 µs | 78 µs | 79 µs | 3.4× |
+| few | 100 | 100 | 100 | 10,000 | 100 | 99 | 199 | 864 | 8,800 | 19 µs | 19 µs | 73 µs | 72 µs | 3.8× |
+| none | 100 | 100 | 0 | 10,000 | 0 | 100 | 100 | 864 | 8,800 | 16 µs | 15 µs | 73 µs | 73 µs | 4.9× |
+| duplicates | 100 | 100 | 100 | 10,000 | 100 | 90 | 190 | 1,440 | 8,800 | 20 µs | 18 µs | 75 µs | 76 µs | 4.2× |
+| residual | 100 | 100 | 100 | 10,000 | 49 | 51 | 100 | 7,200 | 8,800 | 30 µs | 23 µs | 229 µs | 167 µs | 7.3× |
+| where | 100 | 100 | 100 | 10,000 | 100 | 0 | 49 | 7,200 | 8,800 | 24 µs | 21 µs | 76 µs | 76 µs | 3.6× |
+| order limit | 100 | 100 | 100 | 10,000 | 100 | 0 | 5 | 7,200 | 8,800 | 53 µs | 24 µs | 79 µs | 79 µs | 3.3× |
+| matched | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 1,000 | 72,000 | 88,000 | 137 µs | 127 µs | 6,458 µs | 6,435 µs | 50.7× |
+| few | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 999 | 1,999 | 8,064 | 88,000 | 110 µs | 103 µs | 6,139 µs | 6,130 µs | 59.5× |
+| none | 1,000 | 1,000 | 0 | 1,000,000 | 0 | 1,000 | 1,000 | 8,064 | 88,000 | 84 µs | 81 µs | 6,529 µs | 6,717 µs | 82.9× |
+| duplicates | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 990 | 1,990 | 8,640 | 88,000 | 119 µs | 112 µs | 6,873 µs | 6,424 µs | 57.4× |
+| residual | 1,000 | 1,000 | 1,000 | 1,000,000 | 499 | 501 | 1,000 | 72,000 | 88,000 | 141 µs | 138 µs | 14,480 µs | 14,184 µs | 102.8× |
+| where | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 499 | 72,000 | 88,000 | 130 µs | 127 µs | 7,077 µs | 6,777 µs | 53.4× |
+| order limit | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 5 | 72,000 | 88,000 | 167 µs | 150 µs | 6,492 µs | 6,466 µs | 43.1× |
+| matched | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 4,000 | 288,000 | 352,000 | 526 µs | 489 µs | 101,673 µs | 104,518 µs | 213.7× |
+| few | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 3,999 | 7,999 | 32,064 | 352,000 | 439 µs | 406 µs | 102,663 µs | 102,419 µs | 252.3× |
+| none | 4,000 | 4,000 | 0 | 16,000,000 | 0 | 4,000 | 4,000 | 32,064 | 352,000 | 319 µs | 301 µs | 105,941 µs | 103,993 µs | 345.5× |
+| duplicates | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 3,990 | 7,990 | 32,640 | 352,000 | 496 µs | 434 µs | 100,894 µs | 107,314 µs | 247.3× |
+| residual | 4,000 | 4,000 | 4,000 | 16,000,000 | 1,999 | 2,001 | 4,000 | 288,000 | 352,000 | 546 µs | 538 µs | 230,594 µs | 231,784 µs | 430.8× |
+| where | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 1,999 | 288,000 | 352,000 | 508 µs | 490 µs | 105,201 µs | 102,395 µs | 209.0× |
+| order limit | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 5 | 288,000 | 352,000 | 611 µs | 574 µs | 101,435 µs | 102,736 µs | 179.0× |
+| matched | 10,000 | 10,000 | 10,000 | 100,000,000 | 10,000 | 0 | 10,000 | 720,000 | 880,000 | 1,371 µs | 1,222 µs | 633,526 µs | 656,625 µs | 537.3× |
+| few | 10,000 | 10,000 | 10,000 | 100,000,000 | 10,000 | 9,999 | 19,999 | 80,064 | 880,000 | 1,033 µs | 955 µs | 651,224 µs | 637,961 µs | 668.0× |
+| none | 10,000 | 10,000 | 0 | 100,000,000 | 0 | 10,000 | 10,000 | 80,064 | 880,000 | 720 µs | 724 µs | 652,621 µs | 643,457 µs | 888.8× |
+| duplicates | 10,000 | 10,000 | 10,000 | 100,000,000 | 10,000 | 9,990 | 19,990 | 80,640 | 880,000 | 1,110 µs | 1,042 µs | 632,001 µs | 638,652 µs | 612.9× |
+| residual | 10,000 | 10,000 | 10,000 | 100,000,000 | 4,999 | 5,001 | 10,000 | 720,000 | 880,000 | 1,458 µs | 1,334 µs | 1,393,199 µs | 1,390,726 µs | 1,042.5× |
+| where | 10,000 | 10,000 | 10,000 | 100,000,000 | 10,000 | 0 | 4,999 | 720,000 | 880,000 | 1,286 µs | 1,206 µs | 654,363 µs | 637,130 µs | 528.3× |
+| order limit | 10,000 | 10,000 | 10,000 | 100,000,000 | 10,000 | 0 | 5 | 720,000 | 880,000 | 1,959 µs | 1,469 µs | 631,098 µs | 652,332 µs | 444.1× |
+| matched | 100 | 4,000 | 100 | 400,000 | 100 | 0 | 100 | 288,000 | 8,800 | 357 µs | 396 µs | 3,267 µs | 3,073 µs | 7.8× |
+| none | 100 | 4,000 | 0 | 400,000 | 0 | 100 | 100 | 32,064 | 8,800 | 148 µs | 110 µs | 2,640 µs | 2,575 µs | 23.4× |
+| duplicates | 100 | 4,000 | 4,000 | 400,000 | 4,000 | 90 | 4,090 | 32,640 | 8,800 | 256 µs | 228 µs | 2,741 µs | 2,709 µs | 11.9× |
+| where | 100 | 4,000 | 100 | 400,000 | 100 | 0 | 0 | 288,000 | 8,800 | 235 µs | 229 µs | 2,590 µs | 2,576 µs | 11.2× |
+| order limit | 100 | 4,000 | 100 | 400,000 | 100 | 0 | 5 | 288,000 | 8,800 | 245 µs | 233 µs | 2,550 µs | 2,576 µs | 11.1× |
+| matched | 4,000 | 100 | 100 | 400,000 | 100 | 3,900 | 4,000 | 7,200 | 8,800 | 188 µs | 203 µs | 2,613 µs | 2,714 µs | 13.4× |
+| none | 4,000 | 100 | 0 | 400,000 | 0 | 4,000 | 4,000 | 864 | 8,800 | 147 µs | 140 µs | 2,698 µs | 2,687 µs | 19.2× |
+| duplicates | 4,000 | 100 | 100 | 400,000 | 100 | 3,990 | 4,090 | 1,440 | 8,800 | 151 µs | 148 µs | 2,710 µs | 2,682 µs | 18.1× |
+| where | 4,000 | 100 | 100 | 400,000 | 100 | 3,900 | 49 | 7,200 | 8,800 | 136 µs | 143 µs | 2,699 µs | 2,622 µs | 18.3× |
+| order limit | 4,000 | 100 | 100 | 400,000 | 100 | 3,900 | 5 | 7,200 | 8,800 | 280 µs | 277 µs | 2,770 µs | 2,775 µs | 10.0× |
+| matched | 1,000 | 10,000 | 1,000 | 10,000,000 | 1,000 | 0 | 1,000 | 720,000 | 88,000 | 653 µs | 640 µs | 63,641 µs | 66,058 µs | 103.2× |
+| none | 1,000 | 10,000 | 0 | 10,000,000 | 0 | 1,000 | 1,000 | 80,064 | 88,000 | 284 µs | 243 µs | 65,704 µs | 66,530 µs | 273.8× |
+| duplicates | 1,000 | 10,000 | 10,000 | 10,000,000 | 10,000 | 990 | 10,990 | 80,640 | 88,000 | 673 µs | 593 µs | 65,520 µs | 66,994 µs | 113.0× |
+| where | 1,000 | 10,000 | 1,000 | 10,000,000 | 1,000 | 0 | 0 | 720,000 | 88,000 | 746 µs | 672 µs | 65,255 µs | 65,385 µs | 97.3× |
+| order limit | 1,000 | 10,000 | 1,000 | 10,000,000 | 1,000 | 0 | 5 | 720,000 | 88,000 | 772 µs | 671 µs | 63,525 µs | 66,091 µs | 98.5× |
+| matched | 10,000 | 1,000 | 1,000 | 10,000,000 | 1,000 | 9,000 | 10,000 | 72,000 | 88,000 | 446 µs | 438 µs | 63,204 µs | 66,560 µs | 152.0× |
+| none | 10,000 | 1,000 | 0 | 10,000,000 | 0 | 10,000 | 10,000 | 8,064 | 88,000 | 381 µs | 375 µs | 63,012 µs | 62,890 µs | 167.7× |
+| duplicates | 10,000 | 1,000 | 1,000 | 10,000,000 | 1,000 | 9,990 | 10,990 | 8,640 | 88,000 | 460 µs | 406 µs | 63,157 µs | 63,317 µs | 156.0× |
+| where | 10,000 | 1,000 | 1,000 | 10,000,000 | 1,000 | 9,000 | 499 | 72,000 | 88,000 | 357 µs | 345 µs | 63,726 µs | 64,405 µs | 186.7× |
+| order limit | 10,000 | 1,000 | 1,000 | 10,000,000 | 1,000 | 9,000 | 5 | 72,000 | 88,000 | 683 µs | 628 µs | 63,281 µs | 65,892 µs | 104.9× |
+
+At 10,000 by 10,000 the matched hash join is 1,222 µs warm and examines 10,000 key hits. The nested loop of the same statement is 656,625 µs warm and examines 100,000,000 pairs, 537.3× slower. The unmatched shape is 888.8× because the hash probe finds no key and still emits one null-extended row per left row. The residual shape is 1,042.5×: the hash still examines 10,000 candidates, and the nested loop evaluates the extra comparison on every pair. A duplicate key that matches every left row still walks that whole bucket, so this is not a linear worst case under a forced collision or extreme multiplicity. Hashing the larger right side is the cost of keeping left order without a pair buffer. On 100 by 4,000 matched, the hash table is 288,000 bytes for 4,000 right keys while the copied input is only the 100 left rows, 8,800 bytes, and the speedup is 7.8×. On 4,000 by 100 the same 400,000 nested pairs become a 7,200-byte hash of 100 right keys and the speedup is 13.4×. `where` on 100 by 4,000 and 1,000 by 10,000 returns 0 rows: every left row had an `ON` match, and `WHERE` removed those pairs without adding a null-extended row. Checksums for the square matched runs are 5,050; 500,500; 8,002,000; and 50,005,000. The 100 by 4,000 `where` checksum is 0. The 4,000 by 100 `where` checksum is 3,724.

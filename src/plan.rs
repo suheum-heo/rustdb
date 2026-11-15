@@ -11,6 +11,9 @@
 //! outer integer column and that indexed column. The original `ON` stays the
 //! residual predicate. Anything else is a nested loop.
 //!
+//! A two-table `LEFT JOIN` does not use an index. A same-type column equality
+//! hashes the right table. `OR`, a range, and `IS NULL` stay a nested loop.
+//!
 //! A range also stays a sequential scan when it covers every `i64`, or every
 //! key currently stored in the chosen index. That decision uses the predicate
 //! and, when needed, the index's minimum and maximum key. It does not assume
@@ -211,6 +214,66 @@ pub(crate) enum JoinAccess {
         /// Original `ON` text when it is not exactly `predicate`.
         residual: Option<String>,
     },
+}
+
+/// How a two-table `LEFT JOIN` will be executed.
+///
+/// An equality of `INTEGER`, `TEXT`, or `BOOLEAN` columns hashes the right
+/// table. `OR`, a range, `IS NULL`, or any comparison that is not a column
+/// equality on both sides stays a nested loop. Indexes are not consulted.
+/// `WHERE` is not part of this choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LeftAccess {
+    /// Compare every left row with every right row.
+    NestedLoop,
+    /// Probe a hash table built from the right table.
+    ///
+    /// The build is always the right input, so left rows can be emitted in
+    /// insertion order without a pair buffer. `predicate` is the equality used
+    /// as the hash key. `residual` is the original `ON` when it is wider.
+    Hash {
+        /// Schema position of the left join key.
+        outer_ordinal: usize,
+        /// Schema position of the right join key.
+        inner_ordinal: usize,
+        /// The equality that supplies the hash key.
+        predicate: String,
+        /// Original `ON` text when it is not exactly `predicate`.
+        residual: Option<String>,
+    },
+}
+
+/// Pick a left-join path from the shape of `ON`.
+///
+/// The first column-to-column equality in `AND` order wins. Reversed operands
+/// are the same equality. A later equality is not a second hash key.
+pub(crate) fn choose_left_join(
+    outer_alias: &str,
+    outer_columns: &[(String, DataType)],
+    inner_alias: &str,
+    inner_columns: &[(String, DataType)],
+    on: &Expr,
+) -> LeftAccess {
+    if contains_or(on) {
+        return LeftAccess::NestedLoop;
+    }
+    let mut atoms = Vec::new();
+    flatten_and(on, &mut atoms);
+    for atom in atoms {
+        let Some((outer_ordinal, inner_ordinal)) =
+            hash_ordinals(atom, outer_alias, outer_columns, inner_alias, inner_columns)
+        else {
+            continue;
+        };
+        let predicate = atom.render();
+        return LeftAccess::Hash {
+            outer_ordinal,
+            inner_ordinal,
+            predicate: predicate.clone(),
+            residual: residual(on, &predicate),
+        };
+    }
+    LeftAccess::NestedLoop
 }
 
 /// Pick a join path from the shape of `ON`. Row counts are applied later.
@@ -1011,5 +1074,137 @@ mod tests {
                 panic!("expected a residual hash join")
             }
         }
+    }
+
+    fn left_path(on: &Expr) -> LeftAccess {
+        let tables = users_and_orders();
+        choose_left_join("users", &tables.outer, "orders", &tables.inner, on)
+    }
+
+    #[test]
+    fn left_join_hashes_a_typed_equality_and_falls_back_otherwise() {
+        let equality = binary(
+            qualified("orders", "user_id"),
+            BinOp::Eq,
+            qualified("users", "id"),
+        );
+        match left_path(&equality) {
+            LeftAccess::Hash {
+                outer_ordinal,
+                inner_ordinal,
+                predicate,
+                residual,
+            } => {
+                assert_eq!(outer_ordinal, 0);
+                assert_eq!(inner_ordinal, 1);
+                assert_eq!(predicate, "orders.user_id = users.id");
+                assert_eq!(residual, None);
+            }
+            LeftAccess::NestedLoop => panic!("expected a hash left join"),
+        }
+        let residual_on = binary(
+            binary(
+                qualified("users", "id"),
+                BinOp::Eq,
+                qualified("orders", "user_id"),
+            ),
+            BinOp::And,
+            binary(
+                qualified("orders", "total"),
+                BinOp::Gt,
+                Expr::Literal(Value::Integer(100)),
+            ),
+        );
+        match left_path(&residual_on) {
+            LeftAccess::Hash {
+                predicate,
+                residual,
+                ..
+            } => {
+                assert_eq!(predicate, "users.id = orders.user_id");
+                assert_eq!(
+                    residual.as_deref(),
+                    Some("users.id = orders.user_id AND orders.total > 100")
+                );
+            }
+            LeftAccess::NestedLoop => panic!("expected a residual hash left join"),
+        }
+        let or_on = binary(
+            binary(
+                qualified("users", "id"),
+                BinOp::Eq,
+                qualified("orders", "user_id"),
+            ),
+            BinOp::Or,
+            binary(
+                qualified("orders", "total"),
+                BinOp::Eq,
+                Expr::Literal(Value::Integer(5)),
+            ),
+        );
+        assert!(matches!(left_path(&or_on), LeftAccess::NestedLoop));
+        let range = binary(
+            qualified("users", "id"),
+            BinOp::Gt,
+            qualified("orders", "user_id"),
+        );
+        assert!(matches!(left_path(&range), LeftAccess::NestedLoop));
+        let nulls = Expr::IsNull(Box::new(qualified("orders", "user_id")));
+        assert!(matches!(left_path(&nulls), LeftAccess::NestedLoop));
+        let two = binary(
+            binary(
+                qualified("users", "id"),
+                BinOp::Eq,
+                qualified("orders", "user_id"),
+            ),
+            BinOp::And,
+            binary(
+                qualified("users", "id"),
+                BinOp::Eq,
+                qualified("orders", "id"),
+            ),
+        );
+        match left_path(&two) {
+            LeftAccess::Hash {
+                outer_ordinal,
+                inner_ordinal,
+                predicate,
+                residual,
+            } => {
+                assert_eq!(outer_ordinal, 0);
+                assert_eq!(inner_ordinal, 1);
+                assert_eq!(predicate, "users.id = orders.user_id");
+                assert!(residual.is_some());
+            }
+            LeftAccess::NestedLoop => panic!("the first equality is the hash key"),
+        }
+        let not_eq = binary(
+            qualified("users", "id"),
+            BinOp::NotEq,
+            qualified("orders", "user_id"),
+        );
+        assert!(matches!(left_path(&not_eq), LeftAccess::NestedLoop));
+        let or_inside = binary(
+            binary(
+                qualified("users", "id"),
+                BinOp::Eq,
+                qualified("orders", "user_id"),
+            ),
+            BinOp::And,
+            binary(
+                binary(
+                    qualified("orders", "total"),
+                    BinOp::Eq,
+                    Expr::Literal(Value::Integer(1)),
+                ),
+                BinOp::Or,
+                binary(
+                    qualified("orders", "total"),
+                    BinOp::Gt,
+                    Expr::Literal(Value::Integer(2)),
+                ),
+            ),
+        );
+        assert!(matches!(left_path(&or_inside), LeftAccess::NestedLoop));
     }
 }
