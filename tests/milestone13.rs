@@ -862,8 +862,8 @@ fn explain_does_not_execute_and_a_restart_keeps_the_rows() {
 fn unsupported_distinct_forms_are_rejected() {
     let mut database = employees();
     assert_eq!(
-        failure(&mut database, "SELECT DISTINCT department FROM employees;"),
-        "DISTINCT is not supported"
+        failure(&mut database, "SELECT ALL department FROM employees;"),
+        "ALL is not supported"
     );
     assert_eq!(
         failure(

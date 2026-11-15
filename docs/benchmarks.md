@@ -481,6 +481,7 @@ The join builds 4 rows in `orders` per user and keeps 10 groups. Warm time is 54
 - The Milestone 11 table is the pre-merge review run. Nested-loop and hash samples are in memory. Index samples are on a file after `CREATE INDEX`, with the probe forced because the inner table is only four times the outer table. The warm time is the median of five repeats. The cold time is the first sample. `bytes` is the grouping state before `HAVING`. `pair_bytes` is the joined rows the streaming path does not store. The hash path still stores 16 bytes of match positions per pair when it builds the outer table. None of those figures are process RSS.
 - The Milestone 12 table is one release run on an in-memory database. The warm time is the median of five repeats. The cold time is the first sample. Scalar `bytes` is the accumulator vector. Grouped `bytes` also counts key cells and one hash-map entry per accumulated group. `HAVING` still charges the groups it drops. The join is the in-memory hash join. None of those figures are process RSS. The Milestone 10 byte formula in code now uses the 48-byte accumulator; the published Milestone 10 table still shows the earlier 16-byte estimate.
 - The Milestone 13 table is the pre-merge review run on an in-memory database. The warm time is the median of five repeats. The cold time is the first sample. `acc_bytes` is the numeric accumulator state. `set_bytes` counts, per group, the `seen` vector header and the `Option` that owns the map, then one hash, one bucket header, and one `Value` per stored cell, plus the inserted text lengths. `Option<DistinctSet>` is 48 bytes, the same as the map. It does not include hash-table control bytes, spare capacity, or process RSS. A plain aggregate has `set_bytes` 0. Low-cardinality `SUM DISTINCT` and `AVG DISTINCT` are not slower than the plain forms on this run because they stop adding after 17 values.
+- The Milestone 14 table is the pre-merge review run. Plain shapes are in memory and examine every stored row. The sequential range and the indexed range are the same migrated file and the same rows, measured before and after `CREATE INDEX`. The index examines the 30 keys in `id >= 10 AND id < 40`. The warm time is the median of five repeats. The cold time is the first sample. `bytes` counts one projected row header and one `Value` per output column, plus text lengths. `SELECT DISTINCT` also counts one hash and one bucket slot per unique row. `ORDER BY` / `LIMIT` still charges every unique label, not the three returned rows. It is not process RSS. An earlier run of the same operator on this machine recorded warm `DISTINCT id` at 15,667 µs; this run is 13,725 µs. That spread is run-to-run variation.
 
 ## Milestone 13 HAVING aliases and DISTINCT
 
@@ -525,3 +526,50 @@ Release profile `profile_milestone13`, pre-merge review, 15 Nov 2026. Apple M5, 
 | join `COUNT(DISTINCT amount)` | 100,000 | 10 | 10 | 85 | 0 | 1,680 | 6,160 | 130 | 48,624 µs | 44,821 µs |
 
 At 100,000 rows, warm `COUNT(*)` is 2,842 µs. Warm `COUNT(DISTINCT bucket)` over 10 values is 2,330 µs. Warm `COUNT(DISTINCT id)` over 100,000 values is 13,642 µs, and the set estimate is 6,400,072 bytes. Warm `COUNT(DISTINCT label)` over 8 one-byte strings is 2,431 µs. Warm `COUNT(DISTINCT tag)` over 100,000 strings, 588,890 inserted text bytes, is 16,443 µs and the set estimate is 6,988,962 bytes. Warm `SUM(amount)` is 2,575 µs and warm `SUM(DISTINCT amount)` over 17 values is 2,203 µs. Warm `AVG(amount)` is 2,507 µs and warm `AVG(DISTINCT amount)` is 2,180 µs. The `HAVING total > rows/20` alias query keeps all 10 groups, each holding its share of the 100,000 ids, in 15,711 µs warm. The hash join of 100,000 users and 400,000 orders, 10 groups and 85 distinct memberships, is 44,821 µs warm. The distinct set on that join is 6,160 bytes. The earlier table on this machine recorded 13,982 µs for `COUNT(DISTINCT id)` and 63,413 µs for the join. This run's distinct shape is 13,642 µs. The join sample is 44,821 µs here, and plain `COUNT(*)` is 2,842 µs against 2,271 µs earlier. Those two moved by more than the distinct-set change, in opposite directions, so that spread is run-to-run variation. The Milestone 12 join time is a different statement and is not a before-and-after for this one. `set_bytes` is 24 bytes per group higher than that earlier table because this run counts the `seen` vector header.
+
+## Milestone 14 SELECT DISTINCT
+
+Release profile `profile_milestone14`, 15 Nov 2026. Apple M5, 17179869184 bytes of memory, `rustc 1.100.0 (0ef1bc386 2026-11-09)`. `Value` is 32 bytes and a row vector header is 24 bytes. A distinct map entry is 40 bytes: one `u64`, one bucket header, and one position. Each size is one in-memory load. The warm time is the median of the next five samples. The cold time is the first sample. Checksums are the printed wrapping sums of the returned cells, and a wrong result fails the run.
+
+`items` has `id`, a one-character `label` (`a` through `h`), a unique `tag` of 24 spaces plus the id, `bucket = id % 10`, and `flag` true on even ids. Plain and `DISTINCT` forms read that same in-memory table and examine every stored row. The pair shape is `bucket, label` and has 40 unique pairs. `WHERE flag = TRUE` keeps buckets 0, 2, 4, 6, and 8. `ORDER BY label LIMIT 3` returns `a`, `b`, and `c` after the set has stored all 8 labels. The range is `id >= 10 AND id < 40` on one migrated file. `EXPLAIN` reports `SeqScan` before `CREATE INDEX idx_items_id` and `IndexScan` after it. Both return the same 10 buckets. The sequential scan examines every stored row. The index scan examines 30 keys. `COUNT(*)` for that predicate is 30.
+
+| Shape | Rows | Examined | Returned | Unique | Width | Text bytes | Bytes | Checksum | Cold | Warm |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| plain `bucket` | 1,000 | 1,000 | 1,000 | 1,000 | 1 | 0 | 56,000 | 4,500 | 249 µs | 21 µs |
+| `DISTINCT bucket` | 1,000 | 1,000 | 10 | 10 | 1 | 0 | 960 | 45 | 56 µs | 51 µs |
+| plain `id` | 1,000 | 1,000 | 1,000 | 1,000 | 1 | 0 | 56,000 | 499,500 | 21 µs | 19 µs |
+| `DISTINCT id` | 1,000 | 1,000 | 1,000 | 1,000 | 1 | 0 | 96,000 | 499,500 | 192 µs | 208 µs |
+| plain pair | 1,000 | 1,000 | 1,000 | 1,000 | 2 | 1,000 | 89,000 | 5,500 | 45 µs | 31 µs |
+| `DISTINCT` pair | 1,000 | 1,000 | 40 | 40 | 2 | 40 | 5,160 | 220 | 79 µs | 77 µs |
+| plain `tag` | 1,000 | 1,000 | 1,000 | 1,000 | 1 | 26,890 | 82,890 | 26,890 | 32 µs | 30 µs |
+| `DISTINCT tag` | 1,000 | 1,000 | 1,000 | 1,000 | 1 | 26,890 | 122,890 | 26,890 | 201 µs | 195 µs |
+| `DISTINCT` where | 1,000 | 1,000 | 5 | 5 | 1 | 0 | 480 | 20 | 66 µs | 36 µs |
+| `DISTINCT` order limit | 1,000 | 1,000 | 3 | 8 | 1 | 8 | 776 | 3 | 102 µs | 66 µs |
+| file seq range | 1,000 | 1,000 | 10 | 10 | 1 | 0 | 960 | 45 | 39 µs | 37 µs |
+| file index range | 1,000 | 30 | 10 | 10 | 1 | 0 | 960 | 45 | 18 µs | 16 µs |
+| plain `bucket` | 10,000 | 10,000 | 10,000 | 10,000 | 1 | 0 | 560,000 | 45,000 | 212 µs | 129 µs |
+| `DISTINCT bucket` | 10,000 | 10,000 | 10 | 10 | 1 | 0 | 960 | 45 | 365 µs | 362 µs |
+| plain `id` | 10,000 | 10,000 | 10,000 | 10,000 | 1 | 0 | 560,000 | 49,995,000 | 128 µs | 124 µs |
+| `DISTINCT id` | 10,000 | 10,000 | 10,000 | 10,000 | 1 | 0 | 960,000 | 49,995,000 | 1,496 µs | 1,429 µs |
+| plain pair | 10,000 | 10,000 | 10,000 | 10,000 | 2 | 10,000 | 890,000 | 55,000 | 285 µs | 228 µs |
+| `DISTINCT` pair | 10,000 | 10,000 | 40 | 40 | 2 | 40 | 5,160 | 220 | 528 µs | 513 µs |
+| plain `tag` | 10,000 | 10,000 | 10,000 | 10,000 | 1 | 278,890 | 838,890 | 278,890 | 228 µs | 208 µs |
+| `DISTINCT tag` | 10,000 | 10,000 | 10,000 | 10,000 | 1 | 278,890 | 1,238,890 | 278,890 | 1,468 µs | 1,440 µs |
+| `DISTINCT` where | 10,000 | 10,000 | 5 | 5 | 1 | 0 | 480 | 20 | 254 µs | 234 µs |
+| `DISTINCT` order limit | 10,000 | 10,000 | 3 | 8 | 1 | 8 | 776 | 3 | 462 µs | 449 µs |
+| file seq range | 10,000 | 10,000 | 10 | 10 | 1 | 0 | 960 | 45 | 205 µs | 198 µs |
+| file index range | 10,000 | 30 | 10 | 10 | 1 | 0 | 960 | 45 | 13 µs | 11 µs |
+| plain `bucket` | 100,000 | 100,000 | 100,000 | 100,000 | 1 | 0 | 5,600,000 | 450,000 | 2,192 µs | 1,219 µs |
+| `DISTINCT bucket` | 100,000 | 100,000 | 10 | 10 | 1 | 0 | 960 | 45 | 3,283 µs | 3,295 µs |
+| plain `id` | 100,000 | 100,000 | 100,000 | 100,000 | 1 | 0 | 5,600,000 | 4,999,950,000 | 1,356 µs | 1,201 µs |
+| `DISTINCT id` | 100,000 | 100,000 | 100,000 | 100,000 | 1 | 0 | 9,600,000 | 4,999,950,000 | 14,365 µs | 13,725 µs |
+| plain pair | 100,000 | 100,000 | 100,000 | 100,000 | 2 | 100,000 | 8,900,000 | 550,000 | 2,420 µs | 2,172 µs |
+| `DISTINCT` pair | 100,000 | 100,000 | 40 | 40 | 2 | 40 | 5,160 | 220 | 5,078 µs | 5,097 µs |
+| plain `tag` | 100,000 | 100,000 | 100,000 | 100,000 | 1 | 2,888,890 | 8,488,890 | 2,888,890 | 2,422 µs | 2,278 µs |
+| `DISTINCT tag` | 100,000 | 100,000 | 100,000 | 100,000 | 1 | 2,888,890 | 12,488,890 | 2,888,890 | 15,341 µs | 15,142 µs |
+| `DISTINCT` where | 100,000 | 100,000 | 5 | 5 | 1 | 0 | 480 | 20 | 2,437 µs | 2,306 µs |
+| `DISTINCT` order limit | 100,000 | 100,000 | 3 | 8 | 1 | 8 | 776 | 3 | 4,644 µs | 4,533 µs |
+| file seq range | 100,000 | 100,000 | 10 | 10 | 1 | 0 | 960 | 45 | 2,020 µs | 1,849 µs |
+| file index range | 100,000 | 30 | 10 | 10 | 1 | 0 | 960 | 45 | 12 µs | 11 µs |
+
+At 100,000 rows, warm plain `bucket` is 1,219 µs and warm `DISTINCT bucket` over 10 values is 3,295 µs. Warm plain `id` is 1,201 µs and warm `DISTINCT id` over 100,000 values is 13,725 µs, with a 9,600,000-byte estimate. Warm plain `tag` is 2,278 µs and warm `DISTINCT tag` is 15,142 µs. The hash table is the extra cost: a plain scan only copies the projection. Low-cardinality `DISTINCT` still hashes every input row, so it is slower than the plain scan on this run. `WHERE`, `ORDER BY`, and `LIMIT` do not remove that scan. On the same file, the sequential range examines 100,000 rows and is 1,849 µs warm. After `CREATE INDEX` the same statement examines 30 keys and is 11 µs warm. Both return the same 10 buckets. `SELECT DISTINCT` does not add a skip scan.

@@ -8,7 +8,7 @@
 
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CreateTable, CreateTableOptions, DataType as SqlDataType,
-    Delete as SqlDelete, DescribeAlias, DuplicateTreatment, Expr as SqlExpr, FromTable,
+    Delete as SqlDelete, DescribeAlias, Distinct, DuplicateTreatment, Expr as SqlExpr, FromTable,
     Function as SqlFunction, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     HiveDistributionStyle, Ident, JoinConstraint, JoinOperator, LimitClause, ObjectName,
     ObjectType, OrderBy, OrderByKind, OrderBySort, Query, Select, SelectFlavor,
@@ -536,6 +536,7 @@ fn convert_select(
     order_by: Vec<OrderKey>,
     limit: Option<u64>,
 ) -> Result<Statement, DbError> {
+    let distinct = select_distinct(&select)?;
     reject_select_clauses(&select)?;
     let table = convert_from(&select)?;
     let projection = convert_projection(&select.projection)?;
@@ -546,6 +547,9 @@ fn convert_select(
         .transpose()?;
     let group_by = convert_group_by(&select.group_by)?;
     let having = select.having.as_ref().map(convert_having).transpose()?;
+    if distinct {
+        reject_distinct_query(&table, &projection, &group_by, having.as_ref(), &order_by)?;
+    }
     Ok(Statement::Select(Box::new(SelectQuery {
         from: table,
         projection,
@@ -554,13 +558,59 @@ fn convert_select(
         having,
         order_by,
         limit,
+        distinct,
     })))
 }
 
-fn reject_select_clauses(select: &Select) -> Result<(), DbError> {
-    if select.distinct.is_some() {
-        return Err(DbError::unsupported("DISTINCT is not supported"));
+/// `DISTINCT` removes duplicate projected rows. `ALL` and `DISTINCT ON` are
+/// named and rejected. Omitted means a plain `SELECT`.
+fn select_distinct(select: &Select) -> Result<bool, DbError> {
+    match &select.distinct {
+        None => Ok(false),
+        Some(Distinct::Distinct) => Ok(true),
+        Some(Distinct::All) => Err(DbError::unsupported("ALL is not supported")),
+        Some(Distinct::On(_)) => Err(DbError::unsupported("DISTINCT ON is not supported")),
     }
+}
+
+/// This milestone deduplicates one non-aggregate table.
+fn reject_distinct_query(
+    from: &QueryFrom,
+    projection: &Projection,
+    group_by: &[SelectColumn],
+    having: Option<&Expr>,
+    order_by: &[OrderKey],
+) -> Result<(), DbError> {
+    if matches!(from, QueryFrom::Join { .. }) {
+        return Err(DbError::unsupported("DISTINCT is not supported for JOIN"));
+    }
+    if !group_by.is_empty() {
+        return Err(DbError::unsupported(
+            "DISTINCT is not supported with GROUP BY",
+        ));
+    }
+    if having.is_some() {
+        return Err(DbError::unsupported(
+            "DISTINCT is not supported with HAVING",
+        ));
+    }
+    let aggregate = match projection {
+        Projection::All | Projection::QualifiedAll { .. } => false,
+        Projection::Columns(items) => items
+            .iter()
+            .any(|item| matches!(item, SelectItem::Aggregate { .. })),
+    } || order_by
+        .iter()
+        .any(|key| matches!(key.target, OrderTarget::Aggregate(_)));
+    if aggregate {
+        return Err(DbError::unsupported(
+            "DISTINCT is not supported with aggregate functions",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_select_clauses(select: &Select) -> Result<(), DbError> {
     if select.top.is_some() {
         return Err(DbError::unsupported("TOP is not supported"));
     }

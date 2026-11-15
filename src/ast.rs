@@ -84,10 +84,14 @@ pub(crate) struct SelectQuery {
     /// Filter applied to each completed group. Absent means every group.
     pub(crate) having: Option<Expr>,
     /// Sort keys. Empty means insertion order, or first-seen group order
-    /// for an aggregate query.
+    /// for an aggregate query. For `SELECT DISTINCT`, keys name projected
+    /// output columns and run after deduplication.
     pub(crate) order_by: Vec<OrderKey>,
-    /// Maximum rows after filtering and sorting.
+    /// Maximum rows after filtering and sorting. For `SELECT DISTINCT` this
+    /// is applied after deduplication.
     pub(crate) limit: Option<u64>,
+    /// `SELECT DISTINCT`. This is a non-aggregate, single-table projection.
+    pub(crate) distinct: bool,
 }
 
 /// The `FROM` clause of a `SELECT`.
