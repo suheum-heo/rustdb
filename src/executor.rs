@@ -15,21 +15,26 @@
 //!
 //! An `INNER JOIN` walks the outer table in insertion order. For each outer
 //! row it reads inner candidates, then keeps a pair only when `ON` is TRUE.
-//! `WHERE` then runs on that pair. When the inner table has an integer index
-//! on one side of an equality in `ON`, those candidates come from that index
-//! and are put back into insertion order. The original `ON` is still
-//! evaluated. A NULL outer key skips the probe, because that equality is not
-//! TRUE. Any other shape reads the inner table from front to back. The catalog
-//! stores tables in one map, so the nested loop copies the smaller input and
-//! borrows the other. A self-join copies one side for the same reason. The
-//! index path copies the outer rows, because each probe needs to borrow the
-//! database mutably. Pairs that fail are not concatenated. With no `ORDER BY`,
-//! a match is projected immediately and `LIMIT` stores only the rows it will
-//! return; later pairs are still evaluated. `ORDER BY` keeps the joined row
-//! until the sort. The join does not write the database.
+//! `WHERE` then runs on that pair. An indexed integer equality uses the index
+//! when the outer table is empty or the inner table has more than 64 times as
+//! many rows. Otherwise that equality builds a hash table. Each bucket keeps
+//! one group per distinct key, so a fingerprint collision does not mix keys.
+//! NULL keys are left out. The original `ON` still runs on each matching key.
+//! Equal sizes build the inner table. Matches are emitted in outer insertion
+//! order, then inner insertion order. Any other shape reads the inner table
+//! from front to back. The catalog stores tables in one map, so a path that
+//! needs both inputs copies one of them and borrows the other. A self-join
+//! copies one side for the same reason. The index path copies the outer rows,
+//! because each probe needs to borrow the database mutably. Pairs that fail
+//! are not concatenated. With no `ORDER BY`, a match is projected immediately
+//! when the inner table was built, and `LIMIT` stores only the rows it will
+//! return; later pairs are still evaluated. Building the outer table buffers
+//! the matching positions so they can be ordered before projection. `ORDER BY`
+//! keeps the joined row until the sort. The join does not write the database.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use crate::ast::{Assignment, Expr, OrderKey, Projection, QueryFrom, Statement, TableRef};
 use crate::database::{Database, DurableChange};
@@ -115,6 +120,11 @@ struct IndexProbe {
     index: String,
     inner_ordinal: usize,
     outer_ordinal: usize,
+}
+
+struct HashKeys {
+    outer_ordinal: usize,
+    inner_ordinal: usize,
 }
 
 impl Database {
@@ -310,37 +320,59 @@ impl Database {
             tail.selection,
             tail.order_by,
         )?;
-        if let JoinAccess::IndexNestedLoop {
-            name,
-            inner_ordinal,
-            outer_ordinal,
-            ..
-        } = &prepared.path
-        {
-            let probe = IndexProbe {
-                index: name.clone(),
-                inner_ordinal: *inner_ordinal,
-                outer_ordinal: *outer_ordinal,
-            };
-            // Probes borrow the database, so the outer rows cannot stay borrowed
-            // from the catalog. The copy is not updated.
-            let outer_rows = self.table(&outer.name)?.rows().to_vec();
-            return self.index_nested_loop(&inner.name, &probe, &outer_rows, prepared, tail.limit);
+        let mut prepared = prepared;
+        #[cfg(test)]
+        if force_nested_join() {
+            prepared.path = JoinAccess::NestedLoop;
         }
-        // `tables` is one map, so two row slices cannot be borrowed together.
-        // A self-join is the same entry. Copy the smaller input and borrow the
-        // other. The copy is not updated: a join does not write either table.
         let outer_len = self.table(&outer.name)?.rows().len();
         let inner_len = self.table(&inner.name)?.rows().len();
-        let copy_inner = outer.name == inner.name || inner_len <= outer_len;
-        if copy_inner {
-            let inner_rows = self.table(&inner.name)?.rows().to_vec();
-            let outer_rows = self.table(&outer.name)?.rows();
-            scan_join(outer_rows, &inner_rows, prepared, tail.limit)
-        } else {
-            let outer_rows = self.table(&outer.name)?.rows().to_vec();
-            let inner_rows = self.table(&inner.name)?.rows();
-            scan_join(&outer_rows, inner_rows, prepared, tail.limit)
+        prepared.path = finish_join_path(prepared.path, outer_len, inner_len);
+        match &prepared.path {
+            JoinAccess::IndexNestedLoop {
+                name,
+                inner_ordinal,
+                outer_ordinal,
+                ..
+            } => {
+                let probe = IndexProbe {
+                    index: name.clone(),
+                    inner_ordinal: *inner_ordinal,
+                    outer_ordinal: *outer_ordinal,
+                };
+                // Probes borrow the database, so the outer rows cannot stay borrowed
+                // from the catalog. The copy is not updated.
+                let outer_rows = self.table(&outer.name)?.rows().to_vec();
+                self.index_nested_loop(&inner.name, &probe, &outer_rows, prepared, tail.limit)
+            }
+            JoinAccess::HashJoin {
+                outer_ordinal,
+                inner_ordinal,
+                ..
+            } => {
+                let keys = HashKeys {
+                    outer_ordinal: *outer_ordinal,
+                    inner_ordinal: *inner_ordinal,
+                };
+                self.hash_join(outer, inner, keys, prepared, tail.limit)
+            }
+            JoinAccess::NestedLoop => {
+                // `tables` is one map, so two row slices cannot be borrowed together.
+                // A self-join is the same entry. Copy the smaller input and borrow the
+                // other. The copy is not updated: a join does not write either table.
+                let outer_len = self.table(&outer.name)?.rows().len();
+                let inner_len = self.table(&inner.name)?.rows().len();
+                let copy_inner = outer.name == inner.name || inner_len <= outer_len;
+                if copy_inner {
+                    let inner_rows = self.table(&inner.name)?.rows().to_vec();
+                    let outer_rows = self.table(&outer.name)?.rows();
+                    scan_join(outer_rows, &inner_rows, prepared, tail.limit)
+                } else {
+                    let outer_rows = self.table(&outer.name)?.rows().to_vec();
+                    let inner_rows = self.table(&inner.name)?.rows();
+                    scan_join(&outer_rows, inner_rows, prepared, tail.limit)
+                }
+            }
         }
     }
 
@@ -371,8 +403,11 @@ impl Database {
                 }))
             }
             QueryFrom::Join { outer, inner, on } => {
-                let prepared =
+                let mut prepared =
                     self.prepare_join(outer, inner, on, projection, selection.as_ref(), order_by)?;
+                let outer_len = self.table(&outer.name)?.rows().len();
+                let inner_len = self.table(&inner.name)?.rows().len();
+                prepared.path = finish_join_path(prepared.path, outer_len, inner_len);
                 let filter = selection
                     .as_ref()
                     .map(|expr| Value::Text(expr.render()))
@@ -394,6 +429,42 @@ impl Database {
                             filter,
                         ],
                     ),
+                    JoinAccess::HashJoin {
+                        predicate,
+                        residual,
+                        ..
+                    } => {
+                        let outer_len = self.table(&outer.name)?.rows().len();
+                        let inner_len = self.table(&inner.name)?.rows().len();
+                        let build = if inner_len <= outer_len {
+                            inner.explain_name()
+                        } else {
+                            outer.explain_name()
+                        };
+                        (
+                            vec![
+                                "access".to_string(),
+                                "outer".to_string(),
+                                "inner".to_string(),
+                                "build".to_string(),
+                                "predicate".to_string(),
+                                "residual".to_string(),
+                                "filter".to_string(),
+                            ],
+                            vec![
+                                Value::Text("HashJoin".to_string()),
+                                Value::Text(outer.explain_name()),
+                                Value::Text(inner.explain_name()),
+                                Value::Text(build),
+                                Value::Text(predicate.clone()),
+                                residual
+                                    .as_ref()
+                                    .map(|text| Value::Text(text.clone()))
+                                    .unwrap_or(Value::Null),
+                                filter,
+                            ],
+                        )
+                    }
                     JoinAccess::IndexNestedLoop {
                         name,
                         predicate,
@@ -714,6 +785,33 @@ impl Database {
         Ok(())
     }
 
+    fn hash_join(
+        &self,
+        outer: &TableRef,
+        inner: &TableRef,
+        keys: HashKeys,
+        prepared: PreparedJoin,
+        limit: Option<u64>,
+    ) -> Result<StatementResult, DbError> {
+        if outer.name == inner.name {
+            let rows = self.table(&outer.name)?.rows().to_vec();
+            return run_hash_join(&rows, &rows, keys, true, prepared, limit);
+        }
+        let outer_len = self.table(&outer.name)?.rows().len();
+        let inner_len = self.table(&inner.name)?.rows().len();
+        // Equal sizes build the inner table. The probe then walks the outer
+        // table and emits each bucket in insertion order.
+        if inner_len <= outer_len {
+            let inner_rows = self.table(&inner.name)?.rows().to_vec();
+            let outer_rows = self.table(&outer.name)?.rows();
+            run_hash_join(outer_rows, &inner_rows, keys, true, prepared, limit)
+        } else {
+            let outer_rows = self.table(&outer.name)?.rows().to_vec();
+            let inner_rows = self.table(&inner.name)?.rows();
+            run_hash_join(&outer_rows, inner_rows, keys, false, prepared, limit)
+        }
+    }
+
     fn update(
         &mut self,
         table_name: &str,
@@ -940,6 +1038,424 @@ fn bind_order(scope: &Scope, keys: &[OrderKey]) -> Result<Vec<SortKey>, DbError>
     Ok(bound)
 }
 
+/// One equality key inside a hash bucket.
+///
+/// `head` is the first build row that owns the key. Later rows with the same
+/// SQL value append to `positions`. A second key that lands on the same `u64`
+/// is a different group, so the probe never treats it as a match.
+struct KeyGroup {
+    head: usize,
+    positions: Vec<usize>,
+}
+
+/// Keep an index probe when the inner table is more than this many times the
+/// outer table. At 20× the hash scan was faster. At 100× and 400× the index
+/// probe was faster. 64 sits between those measurements.
+const INDEX_PROBE_INNER_FACTOR: usize = 64;
+
+/// Replace an indexed equality with a hash join unless the inner table is the
+/// one the measurements say is cheaper to probe.
+fn finish_join_path(path: JoinAccess, outer_len: usize, inner_len: usize) -> JoinAccess {
+    let JoinAccess::IndexNestedLoop {
+        name,
+        inner_ordinal,
+        outer_ordinal,
+        predicate,
+        residual,
+    } = path
+    else {
+        return path;
+    };
+    if prefer_index_probe(outer_len, inner_len) {
+        return JoinAccess::IndexNestedLoop {
+            name,
+            inner_ordinal,
+            outer_ordinal,
+            predicate,
+            residual,
+        };
+    }
+    JoinAccess::HashJoin {
+        outer_ordinal,
+        inner_ordinal,
+        predicate,
+        residual,
+    }
+}
+
+fn prefer_index_probe(outer_len: usize, inner_len: usize) -> bool {
+    #[cfg(test)]
+    if FORCE_INDEX_JOIN.with(std::cell::Cell::get) {
+        return true;
+    }
+    if outer_len == 0 {
+        return true;
+    }
+    inner_len > outer_len.saturating_mul(INDEX_PROBE_INNER_FACTOR)
+}
+
+/// Keeps an eligible index probe for the life of the guard.
+#[cfg(test)]
+pub(crate) struct ForceIndexJoin;
+
+#[cfg(test)]
+impl ForceIndexJoin {
+    pub(crate) fn new() -> Self {
+        FORCE_INDEX_JOIN.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceIndexJoin {
+    fn drop(&mut self) {
+        FORCE_INDEX_JOIN.with(|flag| flag.set(false));
+    }
+}
+
+/// Bytes occupied by hash-join positions, key groups, and bucket headers.
+///
+/// This counts one `usize` per stored position, one group header per distinct
+/// key, and one map entry per distinct key. Colliding keys share a map entry,
+/// so this is an upper bound on the map and a lower bound on the payload. It
+/// does not count allocator slack, the copied build rows, or the probed table,
+/// and it is not process RSS.
+#[cfg(test)]
+fn hash_table_bytes(groups: usize, positions: usize) -> usize {
+    let position = std::mem::size_of::<usize>();
+    let group = std::mem::size_of::<usize>() + std::mem::size_of::<Vec<usize>>();
+    let entry = std::mem::size_of::<u64>() + std::mem::size_of::<Vec<KeyGroup>>();
+    positions
+        .saturating_mul(position)
+        .saturating_add(groups.saturating_mul(group))
+        .saturating_add(groups.saturating_mul(entry))
+}
+
+fn run_hash_join(
+    outer_rows: &[Vec<Value>],
+    inner_rows: &[Vec<Value>],
+    keys: HashKeys,
+    build_inner: bool,
+    prepared: PreparedJoin,
+    limit: Option<u64>,
+) -> Result<StatementResult, DbError> {
+    let limit_n = limit.map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+    if build_inner {
+        let table = build_hash(inner_rows, keys.inner_ordinal, hash_key)?;
+        if prepared.sort_keys.is_empty() {
+            let mut projected = Vec::new();
+            for outer_row in outer_rows {
+                visit_hash_hits(
+                    outer_row,
+                    inner_rows,
+                    keys.outer_ordinal,
+                    &table,
+                    keys.inner_ordinal,
+                    &prepared,
+                    |inner_row| {
+                        if limit_n.is_some_and(|limit_n| projected.len() >= limit_n) {
+                            return Ok(());
+                        }
+                        projected.push(project_pair(
+                            outer_row,
+                            inner_row,
+                            &prepared.output_indexes,
+                        )?);
+                        Ok(())
+                    },
+                )?;
+            }
+            return Ok(StatementResult::Query(QueryResult {
+                columns: prepared.output_names,
+                rows: projected,
+            }));
+        }
+        let mut joined = Vec::new();
+        for outer_row in outer_rows {
+            visit_hash_hits(
+                outer_row,
+                inner_rows,
+                keys.outer_ordinal,
+                &table,
+                keys.inner_ordinal,
+                &prepared,
+                |inner_row| {
+                    joined.push(concat_pair(outer_row, inner_row));
+                    Ok(())
+                },
+            )?;
+        }
+        return finish_rows(
+            joined,
+            &prepared.sort_keys,
+            limit,
+            &prepared.output_indexes,
+            prepared.output_names,
+        );
+    }
+
+    let table = build_hash(outer_rows, keys.outer_ordinal, hash_key)?;
+    let mut pairs = Vec::new();
+    for (inner_pos, inner_row) in inner_rows.iter().enumerate() {
+        let Some(hits) = matching_positions(
+            &table,
+            outer_rows,
+            keys.outer_ordinal,
+            inner_row,
+            keys.inner_ordinal,
+            hash_key,
+        )?
+        else {
+            continue;
+        };
+        for &outer_pos in hits {
+            let Some(outer_row) = outer_rows.get(outer_pos) else {
+                return Err(DbError::Internal(
+                    "hash join position is outside the build side".to_string(),
+                ));
+            };
+            if !pair_kept(&prepared, outer_row, inner_row)? {
+                continue;
+            }
+            pairs.push((outer_pos, inner_pos));
+        }
+    }
+    pairs.sort_unstable();
+    if prepared.sort_keys.is_empty() {
+        if let Some(limit_n) = limit_n
+            && pairs.len() > limit_n
+        {
+            pairs.truncate(limit_n);
+        }
+        let mut projected = Vec::with_capacity(pairs.len());
+        for (outer_pos, inner_pos) in pairs {
+            projected.push(project_pair(
+                &outer_rows[outer_pos],
+                &inner_rows[inner_pos],
+                &prepared.output_indexes,
+            )?);
+        }
+        return Ok(StatementResult::Query(QueryResult {
+            columns: prepared.output_names,
+            rows: projected,
+        }));
+    }
+    let mut joined = Vec::with_capacity(pairs.len());
+    for (outer_pos, inner_pos) in pairs {
+        joined.push(concat_pair(&outer_rows[outer_pos], &inner_rows[inner_pos]));
+    }
+    finish_rows(
+        joined,
+        &prepared.sort_keys,
+        limit,
+        &prepared.output_indexes,
+        prepared.output_names,
+    )
+}
+
+fn visit_hash_hits(
+    outer_row: &[Value],
+    inner_rows: &[Vec<Value>],
+    outer_ordinal: usize,
+    table: &HashMap<u64, Vec<KeyGroup>>,
+    inner_ordinal: usize,
+    prepared: &PreparedJoin,
+    mut visit: impl FnMut(&[Value]) -> Result<(), DbError>,
+) -> Result<(), DbError> {
+    let Some(hits) = matching_positions(
+        table,
+        inner_rows,
+        inner_ordinal,
+        outer_row,
+        outer_ordinal,
+        hash_key,
+    )?
+    else {
+        return Ok(());
+    };
+    for &position in hits {
+        let Some(inner_row) = inner_rows.get(position) else {
+            return Err(DbError::Internal(
+                "hash join position is outside the build side".to_string(),
+            ));
+        };
+        if !pair_kept(prepared, outer_row, inner_row)? {
+            continue;
+        }
+        visit(inner_row)?;
+    }
+    Ok(())
+}
+
+fn pair_kept(
+    prepared: &PreparedJoin,
+    outer_row: &[Value],
+    inner_row: &[Value],
+) -> Result<bool, DbError> {
+    if !expr::pair_matches(Some(&prepared.on), outer_row, inner_row)? {
+        return Ok(false);
+    }
+    expr::pair_matches(prepared.filter.as_ref(), outer_row, inner_row)
+}
+
+fn concat_pair(outer_row: &[Value], inner_row: &[Value]) -> Vec<Value> {
+    let mut row = Vec::with_capacity(outer_row.len().saturating_add(inner_row.len()));
+    row.extend_from_slice(outer_row);
+    row.extend_from_slice(inner_row);
+    row
+}
+
+fn build_hash(
+    rows: &[Vec<Value>],
+    ordinal: usize,
+    hash_of: fn(KeyRef<'_>) -> u64,
+) -> Result<HashMap<u64, Vec<KeyGroup>>, DbError> {
+    let mut table: HashMap<u64, Vec<KeyGroup>> = HashMap::with_capacity(rows.len());
+    for position in 0..rows.len() {
+        let Some(key) = row_key(rows, position, ordinal)? else {
+            continue;
+        };
+        let hash = hash_of(key);
+        if let Some(groups) = table.get_mut(&hash) {
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| same_key(rows, ordinal, position, group.head))
+            {
+                group.positions.push(position);
+                continue;
+            }
+            groups.push(KeyGroup {
+                head: position,
+                positions: vec![position],
+            });
+            continue;
+        }
+        table.insert(
+            hash,
+            vec![KeyGroup {
+                head: position,
+                positions: vec![position],
+            }],
+        );
+    }
+    Ok(table)
+}
+
+/// Positions whose stored key equals the probe value.
+///
+/// `None` means the probe value is NULL or absent. An empty slice means the
+/// hash missed or every group in that bucket was a different key.
+fn matching_positions<'a>(
+    table: &'a HashMap<u64, Vec<KeyGroup>>,
+    build_rows: &[Vec<Value>],
+    build_ordinal: usize,
+    probe_row: &[Value],
+    probe_ordinal: usize,
+    hash_of: fn(KeyRef<'_>) -> u64,
+) -> Result<Option<&'a [usize]>, DbError> {
+    let Some(probe) = probe_row.get(probe_ordinal) else {
+        return Err(DbError::Internal(
+            "hash join key is outside the row".to_string(),
+        ));
+    };
+    let Some(key) = key_ref(probe) else {
+        return Ok(None);
+    };
+    let Some(groups) = table.get(&hash_of(key)) else {
+        return Ok(Some(&[]));
+    };
+    for group in groups {
+        let Some(stored) = build_rows
+            .get(group.head)
+            .and_then(|row| row.get(build_ordinal))
+        else {
+            return Err(DbError::Internal(
+                "hash join position is outside the build side".to_string(),
+            ));
+        };
+        if same_cell(stored, probe) {
+            return Ok(Some(&group.positions));
+        }
+    }
+    Ok(Some(&[]))
+}
+
+fn row_key(
+    rows: &[Vec<Value>],
+    position: usize,
+    ordinal: usize,
+) -> Result<Option<KeyRef<'_>>, DbError> {
+    let Some(value) = rows.get(position).and_then(|row| row.get(ordinal)) else {
+        return Err(DbError::Internal(
+            "hash join key is outside the row".to_string(),
+        ));
+    };
+    Ok(key_ref(value))
+}
+
+fn same_key(rows: &[Vec<Value>], ordinal: usize, left: usize, right: usize) -> bool {
+    let Some(left) = rows.get(left).and_then(|row| row.get(ordinal)) else {
+        return false;
+    };
+    let Some(right) = rows.get(right).and_then(|row| row.get(ordinal)) else {
+        return false;
+    };
+    same_cell(left, right)
+}
+
+fn same_cell(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::Text(left), Value::Text(right)) => left == right,
+        (Value::Boolean(left), Value::Boolean(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// A borrowed join key. NULL is not a key.
+enum KeyRef<'a> {
+    Integer(i64),
+    Text(&'a str),
+    Boolean(bool),
+}
+
+fn key_ref(value: &Value) -> Option<KeyRef<'_>> {
+    match value {
+        Value::Null => None,
+        Value::Integer(key) => Some(KeyRef::Integer(*key)),
+        Value::Text(key) => Some(KeyRef::Text(key)),
+        Value::Boolean(key) => Some(KeyRef::Boolean(*key)),
+    }
+}
+
+/// Hash a scalar key. Equal SQL values hash equal, and the type tag keeps an
+/// integer from sharing a fingerprint with a boolean or a text value.
+///
+/// `DefaultHasher` is deterministic for one process. The hash does not include
+/// a row id, page id, or any other persistent identifier.
+fn hash_key(key: KeyRef<'_>) -> u64 {
+    #[cfg(test)]
+    if let Some(forced) = FORCED_HASH.with(std::cell::Cell::get) {
+        return forced;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match key {
+        KeyRef::Integer(key) => {
+            1u8.hash(&mut hasher);
+            key.hash(&mut hasher);
+        }
+        KeyRef::Text(key) => {
+            2u8.hash(&mut hasher);
+            key.hash(&mut hasher);
+        }
+        KeyRef::Boolean(key) => {
+            3u8.hash(&mut hasher);
+            key.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
 fn scan_join(
     outer_rows: &[Vec<Value>],
     inner_rows: &[Vec<Value>],
@@ -1084,6 +1600,56 @@ fn compare_values(left: &Value, right: &Value, ascending: bool, nulls_first: boo
 }
 
 #[cfg(test)]
+thread_local! {
+    static FORCE_NESTED_JOIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// When set, every non-NULL key hashes to this value.
+    static FORCED_HASH: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static FORCE_INDEX_JOIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn force_nested_join() -> bool {
+    FORCE_NESTED_JOIN.with(std::cell::Cell::get)
+}
+
+/// Puts every key in one hash bucket for the life of the guard.
+#[cfg(test)]
+struct ForceHashCollision;
+
+#[cfg(test)]
+impl ForceHashCollision {
+    fn new() -> Self {
+        FORCED_HASH.with(|flag| flag.set(Some(0)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceHashCollision {
+    fn drop(&mut self) {
+        FORCED_HASH.with(|flag| flag.set(None));
+    }
+}
+
+#[cfg(test)]
+struct ForceNestedJoin;
+
+#[cfg(test)]
+impl ForceNestedJoin {
+    fn new() -> Self {
+        FORCE_NESTED_JOIN.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceNestedJoin {
+    fn drop(&mut self) {
+        FORCE_NESTED_JOIN.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1139,5 +1705,335 @@ mod tests {
             error.to_string(),
             "cannot apply operator '>' to INTEGER and TEXT"
         );
+    }
+
+    #[test]
+    fn hash_join_matches_the_engine_nested_loop() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE lhs (id INT, name TEXT);").unwrap();
+        db.execute("CREATE TABLE rhs (id INT, name TEXT);").unwrap();
+        db.execute("INSERT INTO lhs VALUES (1, 'Ada'), (NULL, 'Cy'), (1, 'Dee');")
+            .unwrap();
+        db.execute("INSERT INTO rhs VALUES (1, 'x'), (1, 'y'), (NULL, 'z');")
+            .unwrap();
+        let sql = "SELECT lhs.name, rhs.name FROM lhs JOIN rhs ON lhs.id = rhs.id;";
+        let hashed = query(&mut db, sql);
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            query(&mut db, sql)
+        };
+        assert_eq!(hashed.rows, nested.rows);
+        assert_eq!(hashed.rows.len(), 4);
+        assert_eq!(key_ref(&Value::Null).map(hash_key), None);
+        assert_eq!(
+            key_ref(&Value::Integer(1)).map(hash_key),
+            key_ref(&Value::Integer(1)).map(hash_key)
+        );
+        assert_eq!(
+            key_ref(&Value::Text("Ada".to_string())).map(hash_key),
+            key_ref(&Value::Text("Ada".to_string())).map(hash_key)
+        );
+        assert_ne!(
+            key_ref(&Value::Integer(0)).map(hash_key),
+            key_ref(&Value::Boolean(false)).map(hash_key)
+        );
+        assert!(!same_cell(&Value::Integer(0), &Value::Boolean(false)));
+        assert!(!same_cell(
+            &Value::Integer(0),
+            &Value::Text("0".to_string())
+        ));
+        let position = std::mem::size_of::<usize>();
+        let group = std::mem::size_of::<usize>() + std::mem::size_of::<Vec<usize>>();
+        let entry = std::mem::size_of::<u64>() + std::mem::size_of::<Vec<KeyGroup>>();
+        assert_eq!(hash_table_bytes(2, 5), 5 * position + 2 * group + 2 * entry);
+    }
+
+    #[test]
+    fn index_probe_is_kept_only_when_the_inner_table_is_much_larger() {
+        assert!(prefer_index_probe(0, 1_000));
+        assert!(!prefer_index_probe(1, INDEX_PROBE_INNER_FACTOR));
+        assert!(prefer_index_probe(1, INDEX_PROBE_INNER_FACTOR + 1));
+        assert!(!prefer_index_probe(1_000, 20_000));
+        assert!(prefer_index_probe(100, 10_000));
+        assert!(!prefer_index_probe(10_000, 100));
+    }
+
+    #[test]
+    fn a_forced_hash_collision_does_not_mix_keys() {
+        let rows = vec![
+            vec![Value::Integer(1), Value::Text("a".to_string())],
+            vec![Value::Integer(2), Value::Text("b".to_string())],
+            vec![Value::Integer(1), Value::Text("c".to_string())],
+            vec![Value::Null, Value::Text("d".to_string())],
+            vec![Value::Boolean(false), Value::Text("e".to_string())],
+            vec![Value::Integer(0), Value::Text("f".to_string())],
+            vec![Value::Text("Ada".to_string()), Value::Integer(7)],
+            vec![Value::Text("Bea".to_string()), Value::Integer(8)],
+            vec![Value::Text("Ada".to_string()), Value::Integer(9)],
+        ];
+        let table = build_hash(&rows, 0, |_| 0).unwrap();
+        assert_eq!(table.len(), 1, "every key shares one fingerprint");
+        let groups = &table[&0];
+        assert_eq!(groups.len(), 6);
+        let hits = matching_positions(&table, &rows, 0, &rows[0], 0, |_| 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hits, &[0, 2]);
+        let zero = matching_positions(&table, &rows, 0, &rows[5], 0, |_| 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(zero, &[5]);
+        let text = matching_positions(&table, &rows, 0, &rows[6], 0, |_| 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, &[6, 8]);
+        assert!(
+            matching_positions(&table, &rows, 0, &rows[3], 0, |_| 0)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut db = Database::new();
+        db.execute("CREATE TABLE lhs (id INT, name TEXT, flag BOOLEAN);")
+            .unwrap();
+        db.execute("CREATE TABLE rhs (id INT, name TEXT, flag BOOLEAN);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO lhs VALUES (1, 'Ada', TRUE), (2, 'Bea', FALSE), (1, 'Ada', TRUE), (NULL, 'Cy', NULL), (0, 'Dee', FALSE);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO rhs VALUES (1, 'Ada', FALSE), (2, 'Bea', TRUE), (1, 'No', TRUE), (NULL, 'Ada', NULL), (0, 'Dee', TRUE);",
+        )
+        .unwrap();
+        let sql = "SELECT lhs.name, rhs.name FROM lhs JOIN rhs ON lhs.id = rhs.id AND lhs.name = rhs.name;";
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            query(&mut db, sql)
+        };
+        let collided = {
+            let _force = ForceHashCollision::new();
+            query(&mut db, sql)
+        };
+        assert_eq!(collided.rows, nested.rows);
+        let ada = Value::Text("Ada".to_string());
+        let bea = Value::Text("Bea".to_string());
+        let dee = Value::Text("Dee".to_string());
+        assert_eq!(
+            collided.rows,
+            vec![
+                vec![ada.clone(), ada.clone()],
+                vec![bea.clone(), bea],
+                vec![ada.clone(), ada],
+                vec![dee.clone(), dee],
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "release profile of hash join"]
+    fn profile_hash_join() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let memory = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!("hash_join cpu={cpu} mem_bytes={memory} rustc={rustc}");
+        let sql = "SELECT lhs.id, rhs.note FROM lhs JOIN rhs ON lhs.id = rhs.id;";
+        for rows in [100_i64, 1_000, 4_000, 10_000] {
+            profile_shape("identity", rows, rows, sql, |database, rows| {
+                load_identity(database, "lhs", rows, false);
+                load_identity(database, "rhs", rows, false);
+            });
+            profile_shape("duplicate", rows, rows, sql, |database, rows| {
+                load_identity(database, "lhs", rows, false);
+                load_mod(database, "rhs", rows, 50);
+            });
+            profile_shape("nulls", rows, rows, sql, |database, rows| {
+                load_identity(database, "lhs", rows, true);
+                load_identity(database, "rhs", rows, true);
+            });
+        }
+        profile_shape("skew-outer", 100, 10_000, sql, |database, _| {
+            load_identity(database, "lhs", 100, false);
+            load_mod(database, "rhs", 10_000, 100);
+        });
+        profile_shape("skew-inner", 10_000, 100, sql, |database, _| {
+            load_mod(database, "lhs", 10_000, 100);
+            load_identity(database, "rhs", 100, false);
+        });
+        profile_shape("skew-outer-wide", 100, 40_000, sql, |database, _| {
+            load_identity(database, "lhs", 100, false);
+            load_mod(database, "rhs", 40_000, 100);
+        });
+        profile_shape("skew-outer-mid", 1_000, 20_000, sql, |database, _| {
+            load_identity(database, "lhs", 1_000, false);
+            load_mod(database, "rhs", 20_000, 1_000);
+        });
+    }
+
+    fn profile_shape(
+        shape: &str,
+        outer_rows: i64,
+        inner_rows: i64,
+        sql: &str,
+        load: impl FnOnce(&mut Database, i64),
+    ) {
+        let dir = crate::test_dir::TestDir::new("hash-profile");
+        let path = dir.join("db");
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE TABLE lhs (id INT, note INT);")
+            .unwrap();
+        database
+            .execute("CREATE TABLE rhs (id INT, note INT);")
+            .unwrap();
+        load(&mut database, outer_rows.max(inner_rows));
+        drop(database);
+        Database::migrate(&path).unwrap();
+        let mut database = Database::open(&path).unwrap();
+        let nested = profile_samples(&mut database, sql, true);
+        let hashed = profile_samples(&mut database, sql, false);
+        database
+            .execute("CREATE INDEX idx_rhs_id ON rhs(id);")
+            .unwrap();
+        let indexed = {
+            let _force = ForceIndexJoin::new();
+            profile_samples(&mut database, sql, false)
+        };
+        let Value::Text(chosen) =
+            query(&mut database, &format!("EXPLAIN {sql}")).rows[0][0].clone()
+        else {
+            panic!("expected the access path");
+        };
+        assert_eq!(nested.matches, hashed.matches);
+        assert_eq!(hashed.matches, indexed.matches);
+        assert_eq!(nested.sum, hashed.sum);
+        assert_eq!(hashed.sum, indexed.sum);
+        let build_inner = database.table("rhs").unwrap().rows().len()
+            <= database.table("lhs").unwrap().rows().len();
+        let build_rows = if build_inner {
+            database.table("rhs").unwrap().rows()
+        } else {
+            database.table("lhs").unwrap().rows()
+        };
+        let mut groups = HashSet::new();
+        let mut positions = 0usize;
+        for row in build_rows {
+            if let Value::Integer(key) = row[0] {
+                groups.insert(key);
+                positions += 1;
+            }
+        }
+        let bytes = hash_table_bytes(groups.len(), positions);
+        let hash_speedup = speedup(nested.warm_us, hashed.warm_us);
+        let index_speedup = speedup(nested.warm_us, indexed.warm_us);
+        println!(
+            "hash_join shape={shape} outer={outer_rows} inner={inner_rows} matches={} build={} groups={} positions={} hash_bytes={bytes} chosen={chosen} nested_cold_us={} nested_warm_us={} hash_cold_us={} hash_warm_us={} index_cold_us={} index_warm_us={} hash_speedup={hash_speedup:.2} index_speedup={index_speedup:.2}",
+            nested.matches,
+            if build_inner { "rhs" } else { "lhs" },
+            groups.len(),
+            positions,
+            nested.cold_us,
+            nested.warm_us,
+            hashed.cold_us,
+            hashed.warm_us,
+            indexed.cold_us,
+            indexed.warm_us
+        );
+    }
+
+    struct ProfileSample {
+        cold_us: u128,
+        warm_us: u128,
+        matches: usize,
+        sum: i64,
+    }
+
+    fn profile_samples(database: &mut Database, sql: &str, nested: bool) -> ProfileSample {
+        let (cold_us, matches, sum) = profile_once(database, sql, nested);
+        let mut warm = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let (elapsed, rows, checksum) = profile_once(database, sql, nested);
+            assert_eq!(rows, matches);
+            assert_eq!(checksum, sum);
+            warm.push(elapsed);
+        }
+        warm.sort_unstable();
+        ProfileSample {
+            cold_us,
+            warm_us: warm[warm.len() / 2],
+            matches,
+            sum,
+        }
+    }
+
+    fn profile_once(database: &mut Database, sql: &str, nested: bool) -> (u128, usize, i64) {
+        let _force = nested.then(ForceNestedJoin::new);
+        let started = std::time::Instant::now();
+        let result = query(database, sql);
+        let elapsed = started.elapsed().as_micros();
+        let mut sum = 0i64;
+        for row in &result.rows {
+            let Value::Integer(id) = row[0] else {
+                panic!("expected an integer id");
+            };
+            sum = sum.wrapping_add(id);
+        }
+        std::hint::black_box(sum);
+        std::hint::black_box(result.rows.len());
+        (elapsed, result.rows.len(), sum)
+    }
+
+    fn speedup(base: u128, faster: u128) -> f64 {
+        if faster == 0 {
+            0.0
+        } else {
+            base as f64 / faster as f64
+        }
+    }
+
+    fn load_identity(database: &mut Database, table: &str, rows: i64, nulls: bool) {
+        let mut start = 0_i64;
+        while start < rows {
+            let end = (start + 499).min(rows - 1);
+            let mut sql = format!("INSERT INTO {table} VALUES ");
+            for id in start..=end {
+                if id != start {
+                    sql.push(',');
+                }
+                if nulls && id % 2 == 0 {
+                    sql.push_str(&format!("(NULL, {id})"));
+                } else {
+                    sql.push_str(&format!("({id}, {id})"));
+                }
+            }
+            database.execute(&sql).unwrap();
+            start = end + 1;
+        }
+    }
+
+    fn load_mod(database: &mut Database, table: &str, rows: i64, modulus: i64) {
+        let mut start = 0_i64;
+        while start < rows {
+            let end = (start + 499).min(rows - 1);
+            let mut sql = format!("INSERT INTO {table} VALUES ");
+            for id in start..=end {
+                if id != start {
+                    sql.push(',');
+                }
+                sql.push_str(&format!("({}, {id})", id % modulus));
+            }
+            database.execute(&sql).unwrap();
+            start = end + 1;
+        }
+    }
+
+    fn profile_command(program: &str, args: &[&str]) -> String {
+        let Ok(output) = std::process::Command::new(program).args(args).output() else {
+            return "unknown".to_string();
+        };
+        if !output.status.success() {
+            return "unknown".to_string();
+        }
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 }

@@ -272,6 +272,48 @@ The warm time is the median of five repeats. The cold time is the first sample. 
 
 From 1,000 to 10,000 identity rows the pair count grows by 100× and the nested warm time grows from 8,735 µs to 622,670 µs, about 71×. The index warm time grows from 805 µs to 7,982 µs, about 10×, which tracks the outer row count rather than `N × M`. Both shapes return `N` rows. On this run the index warm time is lower at every measured point, including 100 identity rows (76 µs against 111 µs). An earlier run on this machine measured that same 100-row identity case at 125 µs against 99 µs, a 0.79× speedup. The planner still chooses the index. There is no cost model.
 
+## Milestone 9 in-memory hash join
+
+Measured on 14 November 2026. The database is a file. Rows are loaded and migrated before timing. The statement is `SELECT lhs.id, rhs.note FROM lhs JOIN rhs ON lhs.id = rhs.id`. Nested-loop samples run first, with the planner forced onto `NestedLoopJoin`. Hash samples run next, before any index exists. Index samples run after `CREATE INDEX idx_rhs_id ON rhs(id)`. Index build time is not included. Cold is the first sample. Warm is the median of the next five. All three paths must return the same row count and the same sum of left ids. `std::hint::black_box` consumes that sum and the row count.
+
+Identity rows use `id = note = 0..N-1` on both sides, so the join returns `N` rows. The duplicate shape sets each right id to `id % 50` and still returns `N` rows. The null shape stores `NULL` for every even id on both sides and returns `N / 2` rows. `skew-outer` is 100 left rows against 10,000 right rows whose ids are `id % 100`, returning 10,000 rows. `skew-inner` is 10,000 left rows whose ids are `id % 100` against 100 right rows, returning 10,000 rows. `skew-outer-wide` is 100 left rows against 40,000 right rows whose ids are `id % 100`. `skew-outer-mid` is 1,000 left rows against 20,000 right rows whose ids are `id % 1000`. Equal sizes build the right table. The skew shapes build the smaller side.
+
+`hash_bytes` is `positions * size_of::<usize>() + groups * (size_of::<usize>() + size_of::<Vec<usize>>()) + groups * (size_of::<u64>() + size_of::<Vec<KeyGroup>>())`. On this machine that is `positions * 8 + groups * 64`. `positions` is the number of non-NULL build keys. `groups` is the number of distinct build keys. A hash collision shares one map entry and adds another key group, so this count is an upper bound on map entries and the payload of one group per key. It does not include allocator slack, the copied build rows, or the probed table, and it is not process RSS.
+
+```bash
+cargo test --release --lib profile_hash_join -- --ignored --nocapture
+```
+
+| Item | Value |
+| --- | --- |
+| Machine | Apple M5, 16 GiB RAM (`hw.memsize` 17,179,869,184), `arm64` |
+| Compiler | `rustc 1.100.0 (0ef1bc386 2026-11-09)` |
+| Build | `cargo test --release --offline --lib profile_hash_join -- --ignored --nocapture` |
+| Algorithm | Nested loop, then hash join, then one equality probe per outer row. The index sample forces the index path. The planner chooses hash unless the inner table is empty-probed or more than 64 times the outer table. |
+
+Speedup is the nested warm time divided by the other warm time.
+
+| Shape | Outer | Inner | Chosen | Matches | Build | Hash bytes | Nested warm | Hash warm | Index warm | Hash speedup | Index speedup |
+| --- | ---: | ---: | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| identity | 100 | 100 | HashJoin | 100 | rhs | 7,200 | 124 µs | 34 µs | 94 µs | 3.65× | 1.32× |
+| duplicate | 100 | 100 | HashJoin | 100 | rhs | 4,000 | 102 µs | 25 µs | 132 µs | 4.08× | 0.77× |
+| nulls | 100 | 100 | HashJoin | 50 | rhs | 3,600 | 150 µs | 33 µs | 64 µs | 4.55× | 2.34× |
+| identity | 1,000 | 1,000 | HashJoin | 1,000 | rhs | 72,000 | 8,191 µs | 144 µs | 846 µs | 56.88× | 9.68× |
+| duplicate | 1,000 | 1,000 | HashJoin | 1,000 | rhs | 11,200 | 6,811 µs | 102 µs | 952 µs | 66.77× | 7.15× |
+| nulls | 1,000 | 1,000 | HashJoin | 500 | rhs | 36,000 | 6,030 µs | 76 µs | 400 µs | 79.34× | 15.07× |
+| identity | 4,000 | 4,000 | HashJoin | 4,000 | rhs | 288,000 | 92,453 µs | 465 µs | 2,819 µs | 198.82× | 32.80× |
+| duplicate | 4,000 | 4,000 | HashJoin | 4,000 | rhs | 35,200 | 91,343 µs | 343 µs | 3,742 µs | 266.31× | 24.41× |
+| nulls | 4,000 | 4,000 | HashJoin | 2,000 | rhs | 144,000 | 89,085 µs | 278 µs | 1,425 µs | 320.45× | 62.52× |
+| identity | 10,000 | 10,000 | HashJoin | 10,000 | rhs | 720,000 | 570,614 µs | 1,157 µs | 7,669 µs | 493.18× | 74.41× |
+| duplicate | 10,000 | 10,000 | HashJoin | 10,000 | rhs | 83,200 | 589,898 µs | 831 µs | 10,896 µs | 709.87× | 54.14× |
+| nulls | 10,000 | 10,000 | HashJoin | 5,000 | rhs | 360,000 | 543,034 µs | 698 µs | 3,780 µs | 777.99× | 143.66× |
+| skew-outer | 100 | 10,000 | IndexNestedLoopJoin | 10,000 | lhs | 7,200 | 6,783 µs | 572 µs | 524 µs | 11.86× | 12.94× |
+| skew-inner | 10,000 | 100 | HashJoin | 10,000 | rhs | 7,200 | 6,616 µs | 413 µs | 4,835 µs | 16.02× | 1.37× |
+| skew-outer-wide | 100 | 40,000 | IndexNestedLoopJoin | 40,000 | lhs | 7,200 | 24,409 µs | 2,289 µs | 2,054 µs | 10.66× | 11.88× |
+| skew-outer-mid | 1,000 | 20,000 | HashJoin | 20,000 | lhs | 72,000 | 117,962 µs | 1,177 µs | 1,850 µs | 100.22× | 63.76× |
+
+Hash is faster than the nested loop at every point. It is also faster than the index except when the inner table is much larger than the outer table: 100× is 572 µs against 524 µs, and 400× is 2,289 µs against 2,054 µs. At 20× the hash scan is still faster, 1,177 µs against 1,850 µs. The planner therefore hashes a same-type equality unless the outer table is empty or the inner table has more than 64 times as many rows. There is no cost model and no histogram. The index column is the cost of forcing that path; it is not the path chosen for the equal-size rows.
+
 ## Limitations
 
 - One machine and one load per size in each session. The five scan, update, and insert samples are repeats on that same file, so they share cache and allocator state.
@@ -286,3 +328,4 @@ From 1,000 to 10,000 identity rows the pair count grows by 100× and the nested 
 - The Milestone 6 tables are one release run each. The warm time is the median of nine repeats on one open file. The cold time is one sample after clearing the pager cache. A sequential `SELECT` does not read heap pages, because open has already loaded the heap into memory. The later `all` plan still reads the index endpoints on the cold sample before scanning memory.
 - The Milestone 7 rows are two release runs on one in-memory database, taken immediately before and after the scan stopped copying both inputs. The warm time is the median of five repeats. The cold time is the first sample. The copied-byte column counts the row vectors that the scan clones. It is not process RSS. The join does not read an index, so the pair count is `N × M` for every shape. The 4,000-row times differ by a few percent between the runs; that spread is larger than the cost of the removed copy.
 - The Milestone 8 rows are one release run on a file database, retaken after the sibling-link check. The nested-loop samples run before the index exists. The index samples run after `CREATE INDEX`, with the tree in the pager cache after the cold sample. The warm time is the median of five repeats. The cold time is the first sample. Both paths are checked against the same checksum. On this run the index is faster at every measured point. An earlier run on the same machine measured the 100-row identity join slower on the index path (125 µs against 99 µs).
+- The Milestone 9 rows are one release run on a file database, retaken after key groups replaced the bare fingerprint. Nested-loop samples are forced through the nested-loop executor. Hash samples run before the index exists. Index samples force the index path after `CREATE INDEX`. The warm time is the median of five repeats. The cold time is the first sample. `hash_bytes` counts positions, key-group headers, and map entries. It is not process RSS. The planner hashes unless the inner table is more than 64 times the outer table.
