@@ -6,7 +6,7 @@
 //! a column reference keeps the column's declared type even when the stored
 //! value is null.
 
-use crate::ast::{BinOp, Expr, SelectColumn};
+use crate::ast::{AggregateCall, BinOp, Expr, SelectColumn};
 use crate::error::DbError;
 use crate::table::Table;
 use crate::value::{DataType, Value};
@@ -217,6 +217,81 @@ pub(crate) fn bind_where(expr: &Expr, scope: &Scope) -> Result<BoundExpr, DbErro
     bind_filter(expr, scope, "WHERE")
 }
 
+/// Bind `HAVING` against one completed group.
+///
+/// `column` returns the group's slot and the column's declared type.
+/// `aggregate` returns the slot of a shared accumulator. That slot's type is
+/// `INTEGER`. The clause must be boolean, or an untyped null literal.
+pub(crate) fn bind_having(
+    expr: &Expr,
+    mut column: impl FnMut(&SelectColumn) -> Result<(usize, DataType), DbError>,
+    mut aggregate: impl FnMut(&AggregateCall) -> Result<usize, DbError>,
+) -> Result<BoundExpr, DbError> {
+    let mut types = Vec::new();
+    let bound = bind_having_expr(expr, &mut column, &mut aggregate, &mut types)?;
+    match expr_type(&bound, &types)? {
+        ExprType::Null | ExprType::Value(DataType::Boolean) => Ok(bound),
+        ExprType::Value(found) => Err(DbError::TypeError(format!(
+            "HAVING clause must evaluate to BOOLEAN, got {found}"
+        ))),
+    }
+}
+
+type GroupColumnFn<'a> = dyn FnMut(&SelectColumn) -> Result<(usize, DataType), DbError> + 'a;
+type GroupAggregateFn<'a> = dyn FnMut(&AggregateCall) -> Result<usize, DbError> + 'a;
+
+fn bind_having_expr(
+    expr: &Expr,
+    column: &mut GroupColumnFn<'_>,
+    aggregate: &mut GroupAggregateFn<'_>,
+    types: &mut Vec<DataType>,
+) -> Result<BoundExpr, DbError> {
+    match expr {
+        Expr::Literal(value) => Ok(BoundExpr::Literal(value.clone())),
+        Expr::Column { name, qualifier } => {
+            let (index, data_type) = column(&SelectColumn {
+                name: name.clone(),
+                qualifier: qualifier.clone(),
+            })?;
+            note_type(types, index, data_type);
+            Ok(BoundExpr::Column(index))
+        }
+        Expr::Aggregate(call) => {
+            let index = aggregate(call)?;
+            note_type(types, index, DataType::Integer);
+            Ok(BoundExpr::Column(index))
+        }
+        Expr::Not(inner) => {
+            let inner = bind_having_expr(inner, column, aggregate, types)?;
+            expect_boolean("NOT", expr_type(&inner, types)?)?;
+            Ok(BoundExpr::Not(Box::new(inner)))
+        }
+        Expr::IsNull(inner) => Ok(BoundExpr::IsNull(Box::new(bind_having_expr(
+            inner, column, aggregate, types,
+        )?))),
+        Expr::IsNotNull(inner) => Ok(BoundExpr::IsNotNull(Box::new(bind_having_expr(
+            inner, column, aggregate, types,
+        )?))),
+        Expr::Binary { left, op, right } => {
+            let left = bind_having_expr(left, column, aggregate, types)?;
+            let right = bind_having_expr(right, column, aggregate, types)?;
+            check_binary(*op, &left, &right, types)?;
+            Ok(BoundExpr::Binary {
+                left: Box::new(left),
+                op: *op,
+                right: Box::new(right),
+            })
+        }
+    }
+}
+
+fn note_type(types: &mut Vec<DataType>, index: usize, data_type: DataType) {
+    if types.len() <= index {
+        types.resize(index + 1, DataType::Integer);
+    }
+    types[index] = data_type;
+}
+
 /// Bind an assignment value. Null is compatible with every column type.
 pub(crate) fn bind_assignment(
     expr: &Expr,
@@ -343,6 +418,9 @@ fn bind(expr: &Expr, scope: &Scope) -> Result<BoundExpr, DbError> {
                 right: Box::new(right),
             })
         }
+        Expr::Aggregate(_) => Err(DbError::unsupported(
+            "aggregates are not allowed in this expression",
+        )),
     }
 }
 

@@ -355,6 +355,69 @@ Few keys is `SELECT bucket, COUNT(*) FROM samples GROUP BY bucket`. Many keys is
 
 From 10,000 to 100,000 rows every shape grows by about 8× to 10×. `COUNT(*)` goes from 26 µs to 204 µs. The 10-group queries go from 210 µs and 241 µs to 1,930 µs and 2,256 µs. The 100,000-group query goes from 1,525 µs to 14,591 µs. Its grouping state grows with the input, from 1,280,000 bytes to 12,800,000 bytes. Against the earlier run, the 100,000-row scalar shapes differ by 15 µs and 25 µs, the 10-group shapes differ by 11 µs and 64 µs, and the 100,000-group shape is 1,476 µs faster. That spread is two runs of the same operator. The 1,000-row samples are too small for a slope.
 
+## Milestone 11 join aggregation
+
+Measured on 14 November 2026 and retaken in the pre-merge review, after a failing aggregate row stopped changing accumulators that earlier aggregates in that row had already updated. Each size builds `users(id INT, name TEXT, bucket INT)` and `orders(user_id INT, amount INT)`. `bucket` is `id % 10`. There are four orders per user. An order whose id is divisible by 3 points at user 0; every other order points at `id % users`. `amount` is `NULL` when the order id is even and the order id otherwise. Every order matches a user, so the match count is the order count. Insert time is not included.
+
+The query is `SELECT u.bucket, COUNT(*), SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.bucket`, or the same query grouped by `u.id`. The `HAVING` form adds `HAVING COUNT(*) >= users * 4 / 10`. Each query runs six times. Cold is the first sample. Warm is the median of the next five. The harness adds every returned `COUNT(*)` into a checksum and passes the rows to `std::hint::black_box`.
+
+Nested-loop samples are forced through the nested-loop executor on an in-memory database. Hash samples use the planner's hash join on an in-memory database. Index samples open a file, migrate it, create `idx_orders_user` on `orders(user_id)`, and force the index probe. The inner table is four times the outer table, which is below the planner's 64× rule, so the forced index is the only reason those samples probe. The hash join builds the smaller side. Here that is the outer table, so it buffers one pair of `usize` positions per match and then emits pairs in outer-then-inner order. That buffer is 16 bytes per match. It is not included in `bytes`.
+
+`bytes` estimates the grouping state after every pair has been accumulated, before `HAVING` drops groups. A group stores a key vector (`size_of::<Vec<Value>>() + size_of::<Value>()`), an accumulator vector (`size_of::<Vec<AccValue>>() + 32` for `COUNT` and `SUM`), and one map entry (`size_of::<u64>() + size_of::<Vec<usize>>() + size_of::<usize>()`). On this machine that is 144 bytes per group. `AccValue` is 16 bytes. The bucket queries accumulate 10 groups even when `HAVING` returns one of them. `pair_bytes` is the joined rows a materialized aggregate would store and the streaming path does not: one 24-byte vector header plus five 24-byte cells per match. It is not process RSS. The materialized samples collect those rows, then group them. The streaming samples hand each pair to the accumulators.
+
+```bash
+cargo test --release --offline --lib profile_join_aggregation -- --ignored --nocapture
+```
+
+| Item | Value |
+| --- | --- |
+| Machine | Apple M5, 16 GiB RAM (`hw.memsize` 17,179,869,184), `arm64` |
+| Compiler | `rustc 1.100.0 (0ef1bc386 2026-11-09)` |
+| Build | `cargo test --release --offline --lib profile_join_aggregation -- --ignored --nocapture` |
+| Algorithm | Join, then one hash table of groups, then `HAVING`. No spill. |
+
+| Algorithm | Mode | Users | Orders | Matches | Key | Returned | Groups | Bytes | Pair bytes | Cold | Warm |
+| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Nested loop | stream | 200 | 800 | 800 | bucket | 10 | 10 | 1,440 | 115,200 | 1,679 µs | 1,361 µs |
+| Hash | stream | 200 | 800 | 800 | bucket | 10 | 10 | 1,440 | 115,200 | 143 µs | 117 µs |
+| Nested loop | stream | 200 | 800 | 800 | id | 200 | 200 | 28,800 | 115,200 | 1,236 µs | 1,196 µs |
+| Hash | stream | 200 | 800 | 800 | id | 200 | 200 | 28,800 | 115,200 | 179 µs | 140 µs |
+| Nested loop | stream | 200 | 800 | 800 | bucket | 1 | 10 | 1,440 | 115,200 | 1,121 µs | 1,062 µs |
+| Hash | stream | 200 | 800 | 800 | bucket | 1 | 10 | 1,440 | 115,200 | 109 µs | 99 µs |
+| Index | stream | 200 | 800 | 800 | bucket | 10 | 10 | 1,440 | 115,200 | 553 µs | 289 µs |
+| Index | stream | 200 | 800 | 800 | id | 200 | 200 | 28,800 | 115,200 | 318 µs | 290 µs |
+| Index | stream | 200 | 800 | 800 | bucket | 1 | 10 | 1,440 | 115,200 | 261 µs | 254 µs |
+| Nested loop | stream | 1,000 | 4,000 | 4,000 | bucket | 10 | 10 | 1,440 | 576,000 | 23,401 µs | 22,797 µs |
+| Hash | stream | 1,000 | 4,000 | 4,000 | bucket | 10 | 10 | 1,440 | 576,000 | 408 µs | 399 µs |
+| Nested loop | stream | 1,000 | 4,000 | 4,000 | id | 1,000 | 1,000 | 144,000 | 576,000 | 23,063 µs | 23,007 µs |
+| Hash | stream | 1,000 | 4,000 | 4,000 | id | 1,000 | 1,000 | 144,000 | 576,000 | 527 µs | 506 µs |
+| Nested loop | stream | 1,000 | 4,000 | 4,000 | bucket | 1 | 10 | 1,440 | 576,000 | 22,886 µs | 22,877 µs |
+| Hash | stream | 1,000 | 4,000 | 4,000 | bucket | 1 | 10 | 1,440 | 576,000 | 398 µs | 412 µs |
+| Index | stream | 1,000 | 4,000 | 4,000 | bucket | 10 | 10 | 1,440 | 576,000 | 2,355 µs | 1,349 µs |
+| Index | stream | 1,000 | 4,000 | 4,000 | id | 1,000 | 1,000 | 144,000 | 576,000 | 1,431 µs | 1,428 µs |
+| Index | stream | 1,000 | 4,000 | 4,000 | bucket | 1 | 10 | 1,440 | 576,000 | 1,189 µs | 1,113 µs |
+| Nested loop | materialized | 1,000 | 4,000 | 4,000 | bucket | 10 | 10 | 1,440 | 576,000 | 23,799 µs | 23,190 µs |
+| Hash | materialized | 1,000 | 4,000 | 4,000 | bucket | 10 | 10 | 1,440 | 576,000 | 597 µs | 600 µs |
+| Nested loop | materialized | 1,000 | 4,000 | 4,000 | id | 1,000 | 1,000 | 144,000 | 576,000 | 23,126 µs | 23,804 µs |
+| Hash | materialized | 1,000 | 4,000 | 4,000 | id | 1,000 | 1,000 | 144,000 | 576,000 | 692 µs | 667 µs |
+| Nested loop | stream | 4,000 | 16,000 | 16,000 | bucket | 10 | 10 | 1,440 | 2,304,000 | 365,024 µs | 362,340 µs |
+| Hash | stream | 4,000 | 16,000 | 16,000 | bucket | 10 | 10 | 1,440 | 2,304,000 | 1,589 µs | 1,575 µs |
+| Nested loop | stream | 4,000 | 16,000 | 16,000 | id | 4,000 | 4,000 | 576,000 | 2,304,000 | 362,432 µs | 364,137 µs |
+| Hash | stream | 4,000 | 16,000 | 16,000 | id | 4,000 | 4,000 | 576,000 | 2,304,000 | 2,137 µs | 2,028 µs |
+| Nested loop | stream | 4,000 | 16,000 | 16,000 | bucket | 1 | 10 | 1,440 | 2,304,000 | 363,090 µs | 370,212 µs |
+| Hash | stream | 4,000 | 16,000 | 16,000 | bucket | 1 | 10 | 1,440 | 2,304,000 | 1,647 µs | 1,583 µs |
+| Index | stream | 4,000 | 16,000 | 16,000 | bucket | 10 | 10 | 1,440 | 2,304,000 | 6,830 µs | 4,269 µs |
+| Index | stream | 4,000 | 16,000 | 16,000 | id | 4,000 | 4,000 | 576,000 | 2,304,000 | 4,863 µs | 4,867 µs |
+| Index | stream | 4,000 | 16,000 | 16,000 | bucket | 1 | 10 | 1,440 | 2,304,000 | 4,355 µs | 4,287 µs |
+| Nested loop | materialized | 4,000 | 16,000 | 16,000 | bucket | 10 | 10 | 1,440 | 2,304,000 | 372,850 µs | 373,546 µs |
+| Hash | materialized | 4,000 | 16,000 | 16,000 | bucket | 10 | 10 | 1,440 | 2,304,000 | 2,327 µs | 2,217 µs |
+| Nested loop | materialized | 4,000 | 16,000 | 16,000 | id | 4,000 | 4,000 | 576,000 | 2,304,000 | 371,215 µs | 374,993 µs |
+| Hash | materialized | 4,000 | 16,000 | 16,000 | id | 4,000 | 4,000 | 576,000 | 2,304,000 | 2,726 µs | 2,719 µs |
+
+Rows whose `Returned` column is 1 are the `HAVING` samples. The threshold keeps the one bucket that received the extra orders. Its `COUNT(*)` checksum is 320, 1,600, and 6,400 at 200, 1,000, and 4,000 users. The other bucket samples return all 10 groups. Grouping by `id` returns one group per user. Checksums match across the three join algorithms and both execution modes.
+
+At 4,000 users the streaming hash join takes 1,575 µs for 10 groups and 2,028 µs for 4,000 groups. The nested loop takes 362,340 µs and 364,137 µs. Both of those paths stream, so that gap is the join algorithm. The index probe takes 4,269 µs and 4,867 µs, also streaming. Storing the joined rows before grouping adds 642 µs on the 10-group hash path (2,217 µs) and 691 µs on the 4,000-group hash path (2,719 µs). The nested-loop materialized times are 373,546 µs and 374,993 µs. The stored pairs would be 2,304,000 bytes. The grouping state is 1,440 bytes for 10 groups and 576,000 bytes for 4,000 groups. `HAVING` warm times are 1,583 µs for the hash join and 370,212 µs for the nested loop. The filter drops nine groups after they have been accumulated, so the 10-group estimate still applies. The outer-build hash path also keeps 256,000 bytes of match positions at this size. That buffer is separate from `bytes` and from `pair_bytes`.
+
 ## Limitations
 
 - One machine and one load per size in each session. The five scan, update, and insert samples are repeats on that same file, so they share cache and allocator state.
@@ -371,3 +434,4 @@ From 10,000 to 100,000 rows every shape grows by about 8× to 10×. `COUNT(*)` g
 - The Milestone 8 rows are one release run on a file database, retaken after the sibling-link check. The nested-loop samples run before the index exists. The index samples run after `CREATE INDEX`, with the tree in the pager cache after the cold sample. The warm time is the median of five repeats. The cold time is the first sample. Both paths are checked against the same checksum. On this run the index is faster at every measured point. An earlier run on the same machine measured the 100-row identity join slower on the index path (125 µs against 99 µs).
 - The Milestone 9 rows are one release run on a file database, retaken after key groups replaced the bare fingerprint. Nested-loop samples are forced through the nested-loop executor. Hash samples run before the index exists. Index samples force the index path after `CREATE INDEX`. The warm time is the median of five repeats. The cold time is the first sample. `hash_bytes` counts positions, key-group headers, and map entries. It is not process RSS. The planner hashes unless the inner table is more than 64 times the outer table.
 - The Milestone 10 table is a second release run on an in-memory database. The warm time is the median of five repeats. The cold time is the first sample. `bytes` counts the key vector, the accumulator vector, and one hash-map entry per group. It is not process RSS. A scalar aggregate has no hash map. The input table and the returned rows are not included. The earlier warm column is the first run of the same operator. The 100,000-group sample moved by 1,476 µs between those runs.
+- The Milestone 11 table is the pre-merge review run. Nested-loop and hash samples are in memory. Index samples are on a file after `CREATE INDEX`, with the probe forced because the inner table is only four times the outer table. The warm time is the median of five repeats. The cold time is the first sample. `bytes` is the grouping state before `HAVING`. `pair_bytes` is the joined rows the streaming path does not store. The hash path still stores 16 bytes of match positions per pair when it builds the outer table. None of those figures are process RSS.

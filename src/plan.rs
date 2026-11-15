@@ -527,7 +527,7 @@ fn contains_or(expr: &Expr) -> bool {
         Expr::Binary { op: BinOp::Or, .. } => true,
         Expr::Binary { left, right, .. } => contains_or(left) || contains_or(right),
         Expr::Not(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => contains_or(inner),
-        Expr::Literal(_) | Expr::Column { .. } => false,
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Aggregate(_) => false,
     }
 }
 
