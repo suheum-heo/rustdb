@@ -21,10 +21,15 @@
 //! group and emits groups in first-seen order. A group hash mixes a type tag
 //! with each key, and a shared fingerprint still compares the stored cells, so
 //! unequal tuples stay apart. The same aggregate call shares one accumulator
-//! across the select list, `HAVING`, and `ORDER BY`. `HAVING` then keeps a
-//! group only when it evaluates to TRUE. `ORDER BY` and `LIMIT` run after
-//! that. A joined aggregate consumes each kept pair as it is produced and does
-//! not store the pair. When a hash join builds the outer table, it still
+//! across the select list, `HAVING`, and `ORDER BY`. An unqualified `HAVING`
+//! name uses a unique explicit select alias before an implicit output name,
+//! then a grouped source column. A qualified name ignores aliases. `HAVING`
+//! then keeps a group only when it evaluates to TRUE. `COUNT(DISTINCT column)`,
+//! `SUM(DISTINCT column)`, and `AVG(DISTINCT column)` keep one set of values
+//! per group. A new member is recorded only after every aggregate of that
+//! input row succeeds. `ORDER BY` and `LIMIT` run after that. A joined
+//! aggregate consumes each kept pair as it is produced and does not store the
+//! pair. When a hash join builds the outer table, it still
 //! buffers match positions so that first-seen order stays outer-then-inner.
 //!
 //! An `INNER JOIN` walks the outer table in insertion order. For each outer
@@ -661,6 +666,8 @@ impl Database {
                 "predicate".to_string(),
                 "residual".to_string(),
                 "filter".to_string(),
+                "slots".to_string(),
+                "aliases".to_string(),
             ],
             rows: vec![vec![
                 Value::Text(plan.access),
@@ -675,6 +682,8 @@ impl Database {
                 predicate,
                 residual,
                 filter,
+                slot_text(&plan.slot_labels),
+                text_list(&plan.alias_labels),
             ]],
         }))
     }
@@ -1247,6 +1256,10 @@ struct AggPlan {
     /// Indexes into a row laid out as group keys, then aggregate values.
     outputs: Vec<usize>,
     output_names: Vec<String>,
+    /// One label per accumulator, in slot order. A shared call appears once.
+    slot_labels: Vec<String>,
+    /// Explicit select aliases and the group or aggregate slot they name.
+    alias_labels: Vec<String>,
     aggregate_labels: Vec<String>,
     sort_keys: Vec<SortKey>,
     filter: Option<BoundExpr>,
@@ -1258,10 +1271,22 @@ struct AggPlan {
 enum AggFn {
     CountStar,
     CountColumn(usize),
+    CountDistinct(usize),
     Sum(usize),
+    SumDistinct(usize),
     Avg(usize),
+    AvgDistinct(usize),
     Min(usize),
     Max(usize),
+}
+
+impl AggFn {
+    fn is_distinct(&self) -> bool {
+        matches!(
+            self,
+            AggFn::CountDistinct(_) | AggFn::SumDistinct(_) | AggFn::AvgDistinct(_)
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1275,6 +1300,118 @@ enum AccValue {
 struct AggGroup {
     key: Vec<Value>,
     acc: Vec<AccValue>,
+    seen: Vec<Option<DistinctSet>>,
+}
+
+/// Exact values already admitted to one `DISTINCT` accumulator in one group.
+///
+/// The map key is a fingerprint. Each bucket stores the values so a hash
+/// collision cannot merge unequal cells. A text value is cloned only while a
+/// new admission is prepared, after every aggregate of that row has accepted
+/// it, and the clone is dropped if the set cannot reserve room. The set is
+/// not inside [`AccValue`], so a plain `COUNT` does not carry a map. There is
+/// no disk spill: every distinct value of every group stays in memory until
+/// the query finishes.
+struct DistinctSet {
+    buckets: HashMap<u64, Vec<Value>>,
+}
+
+impl DistinctSet {
+    fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buckets.values().map(Vec::len).sum()
+    }
+
+    fn contains(&self, value: &Value) -> bool {
+        self.buckets
+            .get(&fingerprint(value))
+            .is_some_and(|bucket| bucket.iter().any(|stored| same_cell(stored, value)))
+    }
+
+    /// Reserve the map and the collision bucket without storing `value`.
+    ///
+    /// `Some` is a new bucket that the caller owns until commit. `None` means
+    /// the existing bucket has room for one more cell. A reservation failure
+    /// leaves membership unchanged.
+    fn prepare_admit(&mut self, value: &Value) -> Result<Option<Vec<Value>>, DbError> {
+        let hash = fingerprint(value);
+        if self.buckets.contains_key(&hash) {
+            take_reserve_budget()?;
+            let Some(bucket) = self.buckets.get_mut(&hash) else {
+                return Err(DbError::Internal("DISTINCT bucket disappeared".to_string()));
+            };
+            bucket.try_reserve(1).map_err(|_| distinct_capacity())?;
+            return Ok(None);
+        }
+        take_reserve_budget()?;
+        self.buckets
+            .try_reserve(1)
+            .map_err(|_| distinct_capacity())?;
+        let mut bucket = Vec::new();
+        take_reserve_budget()?;
+        bucket.try_reserve(1).map_err(|_| distinct_capacity())?;
+        Ok(Some(bucket))
+    }
+
+    /// Store a value whose bucket was reserved by [`Self::prepare_admit`].
+    ///
+    /// `try_reserve` has already made the map and the bucket able to hold one
+    /// more element. Push and insert must not grow those buffers: this runs
+    /// after earlier slots in the same row may already have been published.
+    fn commit_admit(&mut self, value: Value, fresh: Option<Vec<Value>>) {
+        let hash = fingerprint(&value);
+        if let Some(mut bucket) = fresh {
+            debug_assert!(!self.buckets.contains_key(&hash));
+            debug_assert!(bucket.capacity() > bucket.len());
+            debug_assert!(self.buckets.capacity() > self.buckets.len());
+            let bucket_capacity = bucket.capacity();
+            let map_capacity = self.buckets.capacity();
+            bucket.push(value);
+            debug_assert_eq!(bucket.capacity(), bucket_capacity);
+            self.buckets.insert(hash, bucket);
+            debug_assert_eq!(self.buckets.capacity(), map_capacity);
+            return;
+        }
+        let Some(bucket) = self.buckets.get_mut(&hash) else {
+            unreachable!("DISTINCT bucket was not reserved");
+        };
+        debug_assert!(bucket.capacity() > bucket.len());
+        debug_assert!(!bucket.iter().any(|stored| same_cell(stored, &value)));
+        let bucket_capacity = bucket.capacity();
+        bucket.push(value);
+        debug_assert_eq!(bucket.capacity(), bucket_capacity);
+    }
+}
+
+fn distinct_capacity() -> DbError {
+    DbError::Internal("DISTINCT set is too large".to_string())
+}
+
+/// Test runs can fail the Nth set reservation before any group is modified.
+fn take_reserve_budget() -> Result<(), DbError> {
+    #[cfg(test)]
+    {
+        let blocked = DISTINCT_RESERVE_BUDGET.with(|budget| {
+            let Some(left) = budget.get() else {
+                return false;
+            };
+            if left == 0 {
+                return true;
+            }
+            budget.set(Some(left - 1));
+            false
+        });
+        if blocked {
+            return Err(distinct_capacity());
+        }
+    }
+    Ok(())
 }
 
 fn prepare_groups(
@@ -1295,6 +1432,7 @@ fn prepare_groups(
         ));
     };
     let mut aggs = Vec::new();
+    let mut slot_labels = Vec::new();
     let mut outputs = OutputPlan::new();
     let mut aggregate_labels = Vec::new();
     let mut explicit_aliases = HashSet::new();
@@ -1318,17 +1456,19 @@ fn prepare_groups(
                     slot,
                     alias.clone().unwrap_or_else(|| implicit.to_string()),
                     alias.is_some(),
+                    stored_scalar(scope, ordinal)?,
                 );
             }
             SelectItem::Aggregate { call, alias } => {
                 note_explicit_alias(&mut explicit_aliases, alias.as_deref())?;
-                let (slot, _) = bind_aggregate(call, scope, &mut aggs)?;
-                aggregate_labels.push(call.render());
+                let (slot, scalar) = bind_shared(call, scope, &mut aggs, &mut slot_labels)?;
+                remember_aggregate(call, &mut aggregate_labels);
                 let index = group_ordinals.len() + slot;
                 outputs.push(
                     index,
                     alias.clone().unwrap_or_else(|| call.render()),
                     alias.is_some(),
+                    scalar,
                 );
             }
         }
@@ -1339,9 +1479,15 @@ fn prepare_groups(
         .map(|expr| {
             expr::bind_having(
                 expr,
-                |column| grouped_column(scope, &group_ordinals, column),
+                |column| {
+                    if let Some(resolved) = having_output(column, &outputs)? {
+                        return Ok(resolved);
+                    }
+                    let (slot, data_type) = grouped_column(scope, &group_ordinals, column)?;
+                    Ok((slot, expr::ScalarType::from(data_type)))
+                },
                 |call| {
-                    let (slot, scalar) = bind_aggregate(call, scope, &mut aggs)?;
+                    let (slot, scalar) = bind_shared(call, scope, &mut aggs, &mut slot_labels)?;
                     remember_aggregate(call, &mut aggregate_labels);
                     Ok((group_width + slot, scalar))
                 },
@@ -1355,7 +1501,7 @@ fn prepare_groups(
                 Ok(grouped_column(scope, &group_ordinals, column)?.0)
             })?,
             OrderTarget::Aggregate(call) => {
-                let (slot, _) = bind_aggregate(call, scope, &mut aggs)?;
+                let (slot, _) = bind_shared(call, scope, &mut aggs, &mut slot_labels)?;
                 remember_aggregate(call, &mut aggregate_labels);
                 group_width + slot
             }
@@ -1371,12 +1517,15 @@ fn prepare_groups(
     } else {
         "HashAggregate"
     };
+    let alias_labels = alias_report(&outputs, &group_labels, &slot_labels);
     Ok(AggPlan {
         group_ordinals,
         group_labels,
         aggs,
         outputs: outputs.indexes,
         output_names: outputs.names,
+        slot_labels,
+        alias_labels,
         aggregate_labels,
         sort_keys,
         filter,
@@ -1384,6 +1533,45 @@ fn prepare_groups(
         path,
         access: access.to_string(),
     })
+}
+
+fn bind_shared(
+    call: &AggregateCall,
+    scope: &Scope,
+    aggs: &mut Vec<AggFn>,
+    slot_labels: &mut Vec<String>,
+) -> Result<(usize, expr::ScalarType), DbError> {
+    let before = aggs.len();
+    let bound = bind_aggregate(call, scope, aggs)?;
+    if aggs.len() != before {
+        slot_labels.push(call.render());
+    }
+    Ok(bound)
+}
+
+fn alias_report(
+    outputs: &OutputPlan,
+    group_labels: &[String],
+    slot_labels: &[String],
+) -> Vec<String> {
+    let mut labels = Vec::new();
+    for (index, name) in outputs.names.iter().enumerate() {
+        if !outputs.explicit[index] {
+            continue;
+        }
+        let slot = outputs.indexes[index];
+        if slot < group_labels.len() {
+            labels.push(format!("{name} -> group {slot} {}", group_labels[slot]));
+        } else {
+            let aggregate = slot - group_labels.len();
+            let rendered = slot_labels
+                .get(aggregate)
+                .map(String::as_str)
+                .unwrap_or("aggregate");
+            labels.push(format!("{name} -> aggregate {aggregate} {rendered}"));
+        }
+    }
+    labels
 }
 
 fn grouped_column(
@@ -1439,6 +1627,8 @@ fn aggregate_explain_row(
             "bounds".to_string(),
             "filter".to_string(),
             "having".to_string(),
+            "slots".to_string(),
+            "aliases".to_string(),
         ],
         rows: vec![vec![
             Value::Text(plan.access.clone()),
@@ -1449,8 +1639,24 @@ fn aggregate_explain_row(
             bounds,
             filter,
             having,
+            slot_text(&plan.slot_labels),
+            text_list(&plan.alias_labels),
         ]],
     }
+}
+
+fn slot_text(labels: &[String]) -> Value {
+    if labels.is_empty() {
+        return Value::Null;
+    }
+    Value::Text(
+        labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| format!("{index}:{label}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 fn text_list(labels: &[String]) -> Value {
@@ -1491,20 +1697,42 @@ fn bind_aggregate(
 ) -> Result<(usize, expr::ScalarType), DbError> {
     let (function, scalar) = match call.function {
         AggregateFunction::Count => match &call.argument {
+            AggregateArg::Star if call.distinct => {
+                return Err(DbError::unsupported("DISTINCT requires a column"));
+            }
             AggregateArg::Star => (AggFn::CountStar, expr::ScalarType::Integer),
-            AggregateArg::Column(column) => (
-                AggFn::CountColumn(scope.resolve(column)?),
-                expr::ScalarType::Integer,
-            ),
+            AggregateArg::Column(column) => {
+                let ordinal = scope.resolve(column)?;
+                let function = if call.distinct {
+                    AggFn::CountDistinct(ordinal)
+                } else {
+                    AggFn::CountColumn(ordinal)
+                };
+                (function, expr::ScalarType::Integer)
+            }
         },
-        AggregateFunction::Sum => (
-            integer_aggregate("SUM", call, scope, AggFn::Sum)?,
-            expr::ScalarType::Integer,
-        ),
-        AggregateFunction::Avg => (
-            integer_aggregate("AVG", call, scope, AggFn::Avg)?,
-            expr::ScalarType::Ratio,
-        ),
+        AggregateFunction::Sum => {
+            let make = if call.distinct {
+                AggFn::SumDistinct
+            } else {
+                AggFn::Sum
+            };
+            (
+                integer_aggregate("SUM", call, scope, make)?,
+                expr::ScalarType::Integer,
+            )
+        }
+        AggregateFunction::Avg => {
+            let make = if call.distinct {
+                AggFn::AvgDistinct
+            } else {
+                AggFn::Avg
+            };
+            (
+                integer_aggregate("AVG", call, scope, make)?,
+                expr::ScalarType::Ratio,
+            )
+        }
         AggregateFunction::Min => extreme_aggregate("MIN", call, scope, true)?,
         AggregateFunction::Max => extreme_aggregate("MAX", call, scope, false)?,
     };
@@ -1544,6 +1772,11 @@ fn extreme_aggregate(
     scope: &Scope,
     min: bool,
 ) -> Result<(AggFn, expr::ScalarType), DbError> {
+    if call.distinct {
+        return Err(DbError::unsupported(format!(
+            "DISTINCT is not supported for {name}"
+        )));
+    }
     let ordinal = aggregate_column(&format!("{name} requires a column"), call, scope)?;
     let Some(data_type) = scope.type_at(ordinal) else {
         return Err(DbError::Internal(
@@ -1569,8 +1802,11 @@ fn agg_same(left: &AggFn, right: &AggFn) -> bool {
     match (left, right) {
         (AggFn::CountStar, AggFn::CountStar) => true,
         (AggFn::CountColumn(left), AggFn::CountColumn(right)) => left == right,
+        (AggFn::CountDistinct(left), AggFn::CountDistinct(right)) => left == right,
         (AggFn::Sum(left), AggFn::Sum(right)) => left == right,
+        (AggFn::SumDistinct(left), AggFn::SumDistinct(right)) => left == right,
         (AggFn::Avg(left), AggFn::Avg(right)) => left == right,
+        (AggFn::AvgDistinct(left), AggFn::AvgDistinct(right)) => left == right,
         (AggFn::Min(left), AggFn::Min(right)) => left == right,
         (AggFn::Max(left), AggFn::Max(right)) => left == right,
         _ => false,
@@ -1613,6 +1849,7 @@ impl<'a> InputRow<'a> {
 struct GroupSink<'a> {
     plan: &'a AggPlan,
     scalar: Option<Vec<AccValue>>,
+    scalar_seen: Vec<Option<DistinctSet>>,
     groups: Vec<AggGroup>,
     buckets: HashMap<u64, Vec<usize>>,
 }
@@ -1624,9 +1861,15 @@ impl<'a> GroupSink<'a> {
         } else {
             None
         };
+        let scalar_seen = if scalar.is_some() {
+            fresh_seen(&plan.aggs)
+        } else {
+            Vec::new()
+        };
         Self {
             plan,
             scalar,
+            scalar_seen,
             groups: Vec::new(),
             buckets: HashMap::new(),
         }
@@ -1634,7 +1877,7 @@ impl<'a> GroupSink<'a> {
 
     fn push(&mut self, row: InputRow<'_>) -> Result<(), DbError> {
         if let Some(acc) = &mut self.scalar {
-            return update_acc(acc, row, &self.plan.aggs);
+            return update_acc(acc, &mut self.scalar_seen, row, &self.plan.aggs);
         }
         absorb_row(row, self.plan, &mut self.groups, &mut self.buckets)
     }
@@ -1668,16 +1911,18 @@ fn absorb_row(
         }
     }
     if let Some(slot) = matched {
-        return update_acc(&mut groups[slot].acc, row, &plan.aggs);
+        let group = &mut groups[slot];
+        return update_acc(&mut group.acc, &mut group.seen, row, &plan.aggs);
     }
     let mut key = Vec::with_capacity(plan.group_ordinals.len());
     for &ordinal in &plan.group_ordinals {
         key.push(cell(row, ordinal)?.clone());
     }
     let mut acc = fresh_acc(&plan.aggs);
-    update_acc(&mut acc, row, &plan.aggs)?;
+    let mut seen = fresh_seen(&plan.aggs);
+    update_acc(&mut acc, &mut seen, row, &plan.aggs)?;
     let slot = groups.len();
-    groups.push(AggGroup { key, acc });
+    groups.push(AggGroup { key, acc, seen });
     buckets.entry(hash).or_default().push(slot);
     Ok(())
 }
@@ -1712,53 +1957,260 @@ fn visit_filtered(
 fn fresh_acc(aggs: &[AggFn]) -> Vec<AccValue> {
     aggs.iter()
         .map(|agg| match agg {
-            AggFn::CountStar | AggFn::CountColumn(_) => AccValue::Count(0),
-            AggFn::Sum(_) => AccValue::Sum(None),
-            AggFn::Avg(_) => AccValue::Avg { sum: 0, count: 0 },
+            AggFn::CountStar | AggFn::CountColumn(_) | AggFn::CountDistinct(_) => {
+                AccValue::Count(0)
+            }
+            AggFn::Sum(_) | AggFn::SumDistinct(_) => AccValue::Sum(None),
+            AggFn::Avg(_) | AggFn::AvgDistinct(_) => AccValue::Avg { sum: 0, count: 0 },
             AggFn::Min(_) | AggFn::Max(_) => AccValue::Extreme(None),
         })
         .collect()
 }
 
-fn update_acc(acc: &mut [AccValue], row: InputRow<'_>, aggs: &[AggFn]) -> Result<(), DbError> {
-    if acc.len() != aggs.len() {
+fn fresh_seen(aggs: &[AggFn]) -> Vec<Option<DistinctSet>> {
+    aggs.iter()
+        .map(|agg| agg.is_distinct().then(DistinctSet::new))
+        .collect()
+}
+
+/// A numeric replacement, or a distinct column held until the whole row succeeds.
+enum Staged {
+    Replace(AccValue),
+    Admit { ordinal: usize, numbers: AccValue },
+}
+
+/// One aggregate update whose allocations have already been reserved.
+enum Ready {
+    Replace {
+        slot: usize,
+        numbers: AccValue,
+    },
+    Admit {
+        slot: usize,
+        value: Value,
+        numbers: AccValue,
+        fresh: Option<Vec<Value>>,
+    },
+}
+
+fn update_acc(
+    acc: &mut [AccValue],
+    seen: &mut [Option<DistinctSet>],
+    row: InputRow<'_>,
+    aggs: &[AggFn],
+) -> Result<(), DbError> {
+    if acc.len() != aggs.len() || seen.len() != aggs.len() {
         return Err(DbError::Internal(
             "aggregate accumulator has the wrong width".to_string(),
         ));
     }
-    // Replacements stay in `pending` until every aggregate of this row succeeds.
-    // A text extreme is cloned only when it actually changes. Dropping `pending`
-    // leaves the committed slots untouched.
+    // Checked arithmetic finishes before any slot changes. Distinct clones and
+    // bucket reservations finish next. Only then are numbers and membership
+    // written, so a later error drops the prepared row.
     let mut pending = Vec::new();
     for (slot, agg) in aggs.iter().enumerate() {
-        if let Some(next) = next_acc(&acc[slot], row, agg)? {
+        if let Some(next) = next_acc(&acc[slot], seen[slot].as_ref(), row, agg)? {
             pending.push((slot, next));
         }
     }
-    for (slot, next) in pending {
-        acc[slot] = next;
+    if pending
+        .iter()
+        .all(|(_, staged)| matches!(staged, Staged::Replace(_)))
+    {
+        for (slot, staged) in pending {
+            let Staged::Replace(numbers) = staged else {
+                unreachable!("pending row was filtered to replacements");
+            };
+            acc[slot] = numbers;
+        }
+        return Ok(());
+    }
+    if pending.len() == 1 && matches!(pending[0].1, Staged::Admit { .. }) {
+        let Some((slot, staged)) = pending.pop() else {
+            unreachable!("the pending row has one update");
+        };
+        let Staged::Admit { ordinal, numbers } = staged else {
+            unreachable!("pending row is one admission");
+        };
+        let value = cell(row, ordinal)?.clone();
+        let fresh = {
+            let Some(set) = seen[slot].as_mut() else {
+                return Err(DbError::Internal(
+                    "DISTINCT aggregate is missing its set".to_string(),
+                ));
+            };
+            set.prepare_admit(&value)?
+        };
+        let Some(set) = seen[slot].as_mut() else {
+            unreachable!("DISTINCT aggregate is missing its set");
+        };
+        set.commit_admit(value, fresh);
+        acc[slot] = numbers;
+        return Ok(());
+    }
+    let mut ready = Vec::with_capacity(pending.len());
+    for (slot, staged) in pending {
+        match staged {
+            Staged::Replace(numbers) => ready.push(Ready::Replace { slot, numbers }),
+            Staged::Admit { ordinal, numbers } => {
+                let value = cell(row, ordinal)?.clone();
+                let fresh = {
+                    let Some(set) = seen[slot].as_mut() else {
+                        return Err(DbError::Internal(
+                            "DISTINCT aggregate is missing its set".to_string(),
+                        ));
+                    };
+                    set.prepare_admit(&value)?
+                };
+                ready.push(Ready::Admit {
+                    slot,
+                    value,
+                    numbers,
+                    fresh,
+                });
+            }
+        }
+    }
+    for item in ready {
+        match item {
+            Ready::Replace { slot, numbers } => acc[slot] = numbers,
+            Ready::Admit {
+                slot,
+                value,
+                numbers,
+                fresh,
+            } => {
+                let Some(set) = seen[slot].as_mut() else {
+                    unreachable!("DISTINCT aggregate is missing its set");
+                };
+                set.commit_admit(value, fresh);
+                acc[slot] = numbers;
+            }
+        }
     }
     Ok(())
 }
 
 fn next_acc(
     current: &AccValue,
+    seen: Option<&DistinctSet>,
     row: InputRow<'_>,
     agg: &AggFn,
-) -> Result<Option<AccValue>, DbError> {
+) -> Result<Option<Staged>, DbError> {
     match agg {
-        AggFn::CountStar => Ok(Some(bumped_count(current, "COUNT")?)),
+        AggFn::CountStar => Ok(Some(Staged::Replace(bumped_count(current, "COUNT")?))),
         AggFn::CountColumn(ordinal) => {
             if cell(row, *ordinal)?.is_null() {
                 Ok(None)
             } else {
-                Ok(Some(bumped_count(current, "COUNT")?))
+                Ok(Some(Staged::Replace(bumped_count(current, "COUNT")?)))
             }
         }
-        AggFn::Sum(ordinal) => next_sum(current, row, *ordinal),
-        AggFn::Avg(ordinal) => next_avg(current, row, *ordinal),
-        AggFn::Min(ordinal) => next_extreme(current, row, *ordinal, true),
-        AggFn::Max(ordinal) => next_extreme(current, row, *ordinal, false),
+        AggFn::CountDistinct(ordinal) => stage_count_distinct(current, seen, row, *ordinal),
+        AggFn::Sum(ordinal) => Ok(next_sum(current, row, *ordinal)?.map(Staged::Replace)),
+        AggFn::SumDistinct(ordinal) => stage_sum_distinct(current, seen, row, *ordinal),
+        AggFn::Avg(ordinal) => Ok(next_avg(current, row, *ordinal)?.map(Staged::Replace)),
+        AggFn::AvgDistinct(ordinal) => stage_avg_distinct(current, seen, row, *ordinal),
+        AggFn::Min(ordinal) => Ok(next_extreme(current, row, *ordinal, true)?.map(Staged::Replace)),
+        AggFn::Max(ordinal) => {
+            Ok(next_extreme(current, row, *ordinal, false)?.map(Staged::Replace))
+        }
+    }
+}
+
+fn stage_count_distinct(
+    current: &AccValue,
+    seen: Option<&DistinctSet>,
+    row: InputRow<'_>,
+    ordinal: usize,
+) -> Result<Option<Staged>, DbError> {
+    if new_distinct(seen, row, ordinal)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Staged::Admit {
+        ordinal,
+        numbers: bumped_count(current, "COUNT")?,
+    }))
+}
+
+fn stage_sum_distinct(
+    current: &AccValue,
+    seen: Option<&DistinctSet>,
+    row: InputRow<'_>,
+    ordinal: usize,
+) -> Result<Option<Staged>, DbError> {
+    let Some(value) = new_distinct(seen, row, ordinal)? else {
+        return Ok(None);
+    };
+    let Value::Integer(amount) = value else {
+        return Err(DbError::Internal(
+            "SUM received a non-integer value".to_string(),
+        ));
+    };
+    let AccValue::Sum(total) = current else {
+        return Err(DbError::Internal(
+            "SUM accumulator has the wrong shape".to_string(),
+        ));
+    };
+    let numbers = AccValue::Sum(Some(
+        total
+            .unwrap_or(0)
+            .checked_add(*amount)
+            .ok_or_else(|| DbError::invalid("SUM overflows INTEGER"))?,
+    ));
+    Ok(Some(Staged::Admit { ordinal, numbers }))
+}
+
+fn stage_avg_distinct(
+    current: &AccValue,
+    seen: Option<&DistinctSet>,
+    row: InputRow<'_>,
+    ordinal: usize,
+) -> Result<Option<Staged>, DbError> {
+    let Some(value) = new_distinct(seen, row, ordinal)? else {
+        return Ok(None);
+    };
+    let Value::Integer(amount) = value else {
+        return Err(DbError::Internal(
+            "AVG received a non-integer value".to_string(),
+        ));
+    };
+    let AccValue::Avg { sum, count } = current else {
+        return Err(DbError::Internal(
+            "AVG accumulator has the wrong shape".to_string(),
+        ));
+    };
+    let sum = sum
+        .checked_add(i128::from(*amount))
+        .ok_or_else(|| DbError::invalid("AVG overflows"))?;
+    let count = count
+        .checked_add(1)
+        .ok_or_else(|| DbError::invalid("AVG overflows INTEGER"))?;
+    Ok(Some(Staged::Admit {
+        ordinal,
+        numbers: AccValue::Avg { sum, count },
+    }))
+}
+
+/// A NULL input and a value already in the set are not candidates.
+fn new_distinct<'a>(
+    seen: Option<&DistinctSet>,
+    row: InputRow<'a>,
+    ordinal: usize,
+) -> Result<Option<&'a Value>, DbError> {
+    let value = cell(row, ordinal)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(set) = seen else {
+        return Err(DbError::Internal(
+            "DISTINCT aggregate is missing its set".to_string(),
+        ));
+    };
+    if set.contains(value) {
+        Ok(None)
+    } else {
+        Ok(Some(value))
     }
 }
 
@@ -1862,6 +2314,13 @@ fn bumped_count(slot: &AccValue, name: &str) -> Result<AccValue, DbError> {
     })?))
 }
 
+#[cfg(test)]
+fn update_plain(acc: &mut [AccValue], row: InputRow<'_>, aggs: &[AggFn]) -> Result<(), DbError> {
+    let mut seen = Vec::new();
+    seen.resize_with(aggs.len(), || None);
+    update_acc(acc, &mut seen, row, aggs)
+}
+
 fn cell(row: InputRow<'_>, ordinal: usize) -> Result<&Value, DbError> {
     row.get(ordinal)
         .ok_or_else(|| DbError::Internal("aggregate column is outside the row".to_string()))
@@ -1885,6 +2344,40 @@ fn materialize_group(key: &[Value], acc: &[AccValue]) -> Vec<Value> {
         });
     }
     row
+}
+
+fn fingerprint(value: &Value) -> u64 {
+    #[cfg(test)]
+    if let Some(forced) = FORCED_HASH.with(std::cell::Cell::get)
+        && !value.is_null()
+    {
+        return forced;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match value {
+        Value::Null => 0u8.hash(&mut hasher),
+        Value::Integer(item) => {
+            1u8.hash(&mut hasher);
+            item.hash(&mut hasher);
+        }
+        Value::Text(item) => {
+            2u8.hash(&mut hasher);
+            item.hash(&mut hasher);
+        }
+        Value::Boolean(item) => {
+            3u8.hash(&mut hasher);
+            item.hash(&mut hasher);
+        }
+        Value::Ratio {
+            numerator,
+            denominator,
+        } => {
+            4u8.hash(&mut hasher);
+            numerator.hash(&mut hasher);
+            denominator.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 fn hash_group(row: InputRow<'_>, ordinals: &[usize]) -> Result<u64, DbError> {
@@ -1998,6 +2491,7 @@ struct OutputPlan {
     indexes: Vec<usize>,
     names: Vec<String>,
     explicit: Vec<bool>,
+    types: Vec<expr::ScalarType>,
 }
 
 impl OutputPlan {
@@ -2006,14 +2500,23 @@ impl OutputPlan {
             indexes: Vec::new(),
             names: Vec::new(),
             explicit: Vec::new(),
+            types: Vec::new(),
         }
     }
 
-    fn push(&mut self, index: usize, name: String, explicit: bool) {
+    fn push(&mut self, index: usize, name: String, explicit: bool, scalar: expr::ScalarType) {
         self.indexes.push(index);
         self.names.push(name);
         self.explicit.push(explicit);
+        self.types.push(scalar);
     }
+}
+
+fn stored_scalar(scope: &Scope, index: usize) -> Result<expr::ScalarType, DbError> {
+    scope
+        .type_at(index)
+        .map(expr::ScalarType::from)
+        .ok_or_else(|| DbError::Internal("select column is outside the table".to_string()))
 }
 
 fn output_columns(scope: &Scope, projection: &Projection) -> Result<OutputPlan, DbError> {
@@ -2027,7 +2530,7 @@ fn output_columns(scope: &Scope, projection: &Projection) -> Result<OutputPlan, 
                         "select column is outside the table".to_string(),
                     ));
                 };
-                outputs.push(index, name.to_string(), false);
+                outputs.push(index, name.to_string(), false, stored_scalar(scope, index)?);
             }
         }
         Projection::QualifiedAll { qualifier } => {
@@ -2037,7 +2540,7 @@ fn output_columns(scope: &Scope, projection: &Projection) -> Result<OutputPlan, 
                         "select column is outside the table".to_string(),
                     ));
                 };
-                outputs.push(index, name.to_string(), false);
+                outputs.push(index, name.to_string(), false, stored_scalar(scope, index)?);
             }
         }
         Projection::Columns(columns) => {
@@ -2055,6 +2558,7 @@ fn output_columns(scope: &Scope, projection: &Projection) -> Result<OutputPlan, 
                             index,
                             alias.clone().unwrap_or_else(|| implicit.to_string()),
                             alias.is_some(),
+                            stored_scalar(scope, index)?,
                         );
                     }
                     SelectItem::Aggregate { .. } => {
@@ -2201,23 +2705,50 @@ fn order_output_index(
     outputs: &OutputPlan,
     fallback: impl FnOnce(&SelectColumn) -> Result<usize, DbError>,
 ) -> Result<usize, DbError> {
-    if column.qualifier.is_none() {
-        let explicit = output_hits(outputs, &column.name, true);
-        if explicit.len() > 1 {
-            return Err(ambiguous_column(&column.name));
-        }
-        if let [hit] = explicit.as_slice() {
-            return Ok(outputs.indexes[*hit]);
-        }
-        let implicit = output_hits(outputs, &column.name, false);
-        if implicit.len() > 1 {
-            return Err(ambiguous_column(&column.name));
-        }
-        if let [hit] = implicit.as_slice() {
-            return Ok(outputs.indexes[*hit]);
-        }
+    if let Some(hit) = output_name_index(column, outputs)? {
+        return Ok(outputs.indexes[hit]);
     }
     fallback(column)
+}
+
+/// Unqualified output lookup shared by `ORDER BY` and `HAVING`.
+///
+/// A unique explicit alias wins, including over a source column of the same
+/// name. A unique implicit output name is next. A qualified name returns
+/// `None` so the caller resolves it in the source scope. There is no second
+/// substitution: the hit is that select item's own slot.
+fn output_name_index(
+    column: &SelectColumn,
+    outputs: &OutputPlan,
+) -> Result<Option<usize>, DbError> {
+    if column.qualifier.is_some() {
+        return Ok(None);
+    }
+    let explicit = output_hits(outputs, &column.name, true);
+    if explicit.len() > 1 {
+        return Err(ambiguous_column(&column.name));
+    }
+    if let [hit] = explicit.as_slice() {
+        return Ok(Some(*hit));
+    }
+    let implicit = output_hits(outputs, &column.name, false);
+    if implicit.len() > 1 {
+        return Err(ambiguous_column(&column.name));
+    }
+    if let [hit] = implicit.as_slice() {
+        return Ok(Some(*hit));
+    }
+    Ok(None)
+}
+
+fn having_output(
+    column: &SelectColumn,
+    outputs: &OutputPlan,
+) -> Result<Option<(usize, expr::ScalarType)>, DbError> {
+    let Some(hit) = output_name_index(column, outputs)? else {
+        return Ok(None);
+    };
+    Ok(Some((outputs.indexes[hit], outputs.types[hit])))
 }
 
 fn output_hits(outputs: &OutputPlan, name: &str, explicit: bool) -> Vec<usize> {
@@ -2830,6 +3361,9 @@ thread_local! {
     static FORCED_HASH: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static FORCE_INDEX_JOIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static MATERIALIZE_AGGREGATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `Some(0)` fails the next distinct reservation. `None` does not.
+    static DISTINCT_RESERVE_BUDGET: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -2877,6 +3411,28 @@ impl ForceHashCollision {
 impl Drop for ForceHashCollision {
     fn drop(&mut self) {
         FORCED_HASH.with(|flag| flag.set(None));
+    }
+}
+
+/// Fails distinct-set reservation after `calls` successful charges.
+#[cfg(test)]
+struct DistinctReserveBudget {
+    previous: Option<usize>,
+}
+
+#[cfg(test)]
+impl DistinctReserveBudget {
+    fn limit(calls: usize) -> Self {
+        let previous = DISTINCT_RESERVE_BUDGET.with(std::cell::Cell::get);
+        DISTINCT_RESERVE_BUDGET.with(|budget| budget.set(Some(calls)));
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for DistinctReserveBudget {
+    fn drop(&mut self) {
+        DISTINCT_RESERVE_BUDGET.with(|budget| budget.set(self.previous));
     }
 }
 
@@ -3309,7 +3865,7 @@ mod tests {
             AccValue::Sum(Some(4)),
         ];
         let row = [Value::Integer(2), Value::Integer(9)];
-        let error = update_acc(
+        let error = update_plain(
             &mut acc,
             InputRow::One(&row),
             &[AggFn::CountStar, AggFn::Sum(0), AggFn::Sum(1)],
@@ -3320,7 +3876,7 @@ mod tests {
         assert!(matches!(acc[1], AccValue::Sum(Some(value)) if value == i64::MAX - 1));
         assert!(matches!(acc[2], AccValue::Sum(Some(4))));
 
-        update_acc(
+        update_plain(
             &mut acc,
             InputRow::One(&[Value::Integer(1), Value::Null]),
             &[AggFn::CountStar, AggFn::Sum(0), AggFn::Sum(1)],
@@ -3346,7 +3902,7 @@ mod tests {
             },
         ];
         let row = [Value::Text("aaa".to_string()), Value::Integer(1)];
-        let error = update_acc(
+        let error = update_plain(
             &mut acc,
             InputRow::One(&row),
             &[AggFn::Min(0), AggFn::Avg(1)],
@@ -3360,7 +3916,7 @@ mod tests {
             AccValue::Extreme(Some(Value::Text("mmm".to_string()))),
             AccValue::Avg { sum: 1, count: 1 },
         ];
-        update_acc(
+        update_plain(
             &mut acc,
             InputRow::One(&[Value::Text("zzz".to_string()), Value::Integer(4)]),
             &[AggFn::Min(0), AggFn::Avg(1)],
@@ -3395,14 +3951,14 @@ mod tests {
             AggFn::Avg(2),
             AggFn::CountStar,
         ];
-        let error = update_acc(&mut acc, InputRow::One(&row), &aggs).unwrap_err();
+        let error = update_plain(&mut acc, InputRow::One(&row), &aggs).unwrap_err();
         assert_eq!(error.to_string(), "SUM overflows INTEGER");
         assert_eq!(acc, original);
 
         acc[2] = AccValue::Sum(Some(1));
         acc[4] = AccValue::Count(i64::MAX);
         let before_count = acc.clone();
-        let error = update_acc(&mut acc, InputRow::One(&row), &aggs).unwrap_err();
+        let error = update_plain(&mut acc, InputRow::One(&row), &aggs).unwrap_err();
         assert_eq!(error.to_string(), "COUNT overflows INTEGER");
         assert_eq!(acc, before_count);
 
@@ -3412,7 +3968,7 @@ mod tests {
         };
         acc[4] = AccValue::Count(1);
         let before_avg = acc.clone();
-        let error = update_acc(&mut acc, InputRow::One(&row), &aggs).unwrap_err();
+        let error = update_plain(&mut acc, InputRow::One(&row), &aggs).unwrap_err();
         assert_eq!(error.to_string(), "AVG overflows INTEGER");
         assert_eq!(acc, before_avg);
 
@@ -3421,7 +3977,7 @@ mod tests {
             count: 1,
         };
         let before_sum = acc.clone();
-        let error = update_acc(&mut acc, InputRow::One(&row), &aggs).unwrap_err();
+        let error = update_plain(&mut acc, InputRow::One(&row), &aggs).unwrap_err();
         assert_eq!(error.to_string(), "AVG overflows");
         assert_eq!(acc, before_sum);
 
@@ -3429,12 +3985,12 @@ mod tests {
         acc[3] = AccValue::Avg { sum: 1, count: 1 };
         let nulls = [Value::Null, Value::Null, Value::Integer(1)];
         let before_null = acc.clone();
-        let error = update_acc(&mut acc, InputRow::One(&nulls), &aggs).unwrap_err();
+        let error = update_plain(&mut acc, InputRow::One(&nulls), &aggs).unwrap_err();
         assert_eq!(error.to_string(), "SUM overflows INTEGER");
         assert_eq!(acc, before_null);
 
         acc[2] = AccValue::Sum(Some(1));
-        update_acc(
+        update_plain(
             &mut acc,
             InputRow::One(&[
                 Value::Text("aaa".to_string()),
@@ -3559,6 +4115,7 @@ mod tests {
         let scope = Scope::from_table(&table, "items");
         let sum = AggregateCall {
             function: AggregateFunction::Sum,
+            distinct: false,
             argument: AggregateArg::Column(SelectColumn {
                 name: "n".to_string(),
                 qualifier: None,
@@ -3566,6 +4123,7 @@ mod tests {
         };
         let qualified = AggregateCall {
             function: AggregateFunction::Sum,
+            distinct: false,
             argument: AggregateArg::Column(SelectColumn {
                 name: "n".to_string(),
                 qualifier: Some("items".to_string()),
@@ -3578,12 +4136,14 @@ mod tests {
         assert_eq!((first, second, third, aggs.len()), (0, 0, 0, 1));
         let count = AggregateCall {
             function: AggregateFunction::Count,
+            distinct: false,
             argument: AggregateArg::Star,
         };
         assert_eq!(bind_aggregate(&count, &scope, &mut aggs).unwrap().0, 1);
         assert_eq!(aggs.len(), 2);
         let avg = AggregateCall {
             function: AggregateFunction::Avg,
+            distinct: false,
             argument: AggregateArg::Column(SelectColumn {
                 name: "n".to_string(),
                 qualifier: Some("items".to_string()),
@@ -3591,6 +4151,7 @@ mod tests {
         };
         let again = AggregateCall {
             function: AggregateFunction::Avg,
+            distinct: false,
             argument: AggregateArg::Column(SelectColumn {
                 name: "n".to_string(),
                 qualifier: None,
@@ -5170,5 +5731,756 @@ mod tests {
             database.execute(&sql).unwrap();
             start = end + 1;
         }
+    }
+
+    #[test]
+    fn a_failed_aggregate_does_not_admit_distinct_membership() {
+        let label = Value::Text("a".to_string());
+        let row = [label.clone(), Value::Integer(1)];
+        let mut acc = [AccValue::Count(0), AccValue::Sum(Some(i64::MAX))];
+        let mut seen = vec![Some(DistinctSet::new()), None];
+        let error = update_acc(
+            &mut acc,
+            &mut seen,
+            InputRow::One(&row),
+            &[AggFn::CountDistinct(0), AggFn::Sum(1)],
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "SUM overflows INTEGER");
+        assert!(matches!(acc[0], AccValue::Count(0)));
+        assert!(!seen[0].as_ref().unwrap().contains(&label));
+
+        let mut acc = [AccValue::Sum(Some(i64::MAX)), AccValue::Count(0)];
+        let mut seen = vec![None, Some(DistinctSet::new())];
+        let error = update_acc(
+            &mut acc,
+            &mut seen,
+            InputRow::One(&row),
+            &[AggFn::Sum(1), AggFn::CountDistinct(0)],
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "SUM overflows INTEGER");
+        assert!(matches!(acc[1], AccValue::Count(0)));
+        assert!(!seen[1].as_ref().unwrap().contains(&label));
+
+        let mut acc = [AccValue::Sum(Some(i64::MAX))];
+        let mut seen = vec![Some(DistinctSet::new())];
+        let amount = [Value::Integer(1)];
+        let error = update_acc(
+            &mut acc,
+            &mut seen,
+            InputRow::One(&amount),
+            &[AggFn::SumDistinct(0)],
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "SUM overflows INTEGER");
+        assert!(matches!(acc[0], AccValue::Sum(Some(value)) if value == i64::MAX));
+        assert!(!seen[0].as_ref().unwrap().contains(&amount[0]));
+        let again = update_acc(
+            &mut acc,
+            &mut seen,
+            InputRow::One(&amount),
+            &[AggFn::SumDistinct(0)],
+        )
+        .unwrap_err();
+        assert_eq!(again.to_string(), "SUM overflows INTEGER");
+
+        let mut acc = [AccValue::Avg {
+            sum: i128::MAX,
+            count: 1,
+        }];
+        let mut seen = vec![Some(DistinctSet::new())];
+        let error = update_acc(
+            &mut acc,
+            &mut seen,
+            InputRow::One(&amount),
+            &[AggFn::AvgDistinct(0)],
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "AVG overflows");
+        assert!(matches!(acc[0], AccValue::Avg { sum, count } if sum == i128::MAX && count == 1));
+        assert!(!seen[0].as_ref().unwrap().contains(&amount[0]));
+
+        let mut acc = [AccValue::Count(0), AccValue::Sum(Some(0))];
+        let mut seen = vec![Some(DistinctSet::new()), None];
+        let aggs = [AggFn::CountDistinct(0), AggFn::Sum(1)];
+        update_acc(
+            &mut acc,
+            &mut seen,
+            InputRow::One(&[Value::Text("a".to_string()), Value::Integer(1)]),
+            &aggs,
+        )
+        .unwrap();
+        update_acc(
+            &mut acc,
+            &mut seen,
+            InputRow::One(&[Value::Text("a".to_string()), Value::Integer(2)]),
+            &aggs,
+        )
+        .unwrap();
+        assert!(matches!(acc[0], AccValue::Count(1)));
+        assert!(matches!(acc[1], AccValue::Sum(Some(3))));
+        let error = update_acc(
+            &mut acc,
+            &mut seen,
+            InputRow::One(&[Value::Text("b".to_string()), Value::Integer(i64::MAX)]),
+            &aggs,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "SUM overflows INTEGER");
+        assert!(matches!(acc[0], AccValue::Count(1)));
+        assert!(
+            !seen[0]
+                .as_ref()
+                .unwrap()
+                .contains(&Value::Text("b".to_string()))
+        );
+        update_acc(
+            &mut acc,
+            &mut seen,
+            InputRow::One(&[Value::Text("b".to_string()), Value::Integer(4)]),
+            &aggs,
+        )
+        .unwrap();
+        assert!(matches!(acc[0], AccValue::Count(2)));
+        assert!(matches!(acc[1], AccValue::Sum(Some(7))));
+        assert_eq!(seen[0].as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_failed_reservation_does_not_admit_any_slot() {
+        let row = [
+            Value::Text("a".to_string()),
+            Value::Text("b".to_string()),
+            Value::Integer(4),
+        ];
+        let aggs = [
+            AggFn::CountDistinct(0),
+            AggFn::CountDistinct(1),
+            AggFn::AvgDistinct(2),
+        ];
+        let mut acc = [
+            AccValue::Count(0),
+            AccValue::Count(i64::MAX),
+            AccValue::Avg { sum: 5, count: 1 },
+        ];
+        let mut seen = vec![
+            Some(DistinctSet::new()),
+            Some(DistinctSet::new()),
+            Some(DistinctSet::new()),
+        ];
+        let error = update_acc(&mut acc, &mut seen, InputRow::One(&row), &aggs).unwrap_err();
+        assert_eq!(error.to_string(), "COUNT overflows INTEGER");
+        assert!(matches!(acc[0], AccValue::Count(0)));
+        assert!(matches!(acc[1], AccValue::Count(i64::MAX)));
+        assert!(matches!(acc[2], AccValue::Avg { sum: 5, count: 1 }));
+        assert!(seen.iter().all(|set| set.as_ref().unwrap().len() == 0));
+
+        let mut acc = [AccValue::Avg {
+            sum: 5,
+            count: i64::MAX,
+        }];
+        let mut seen = vec![Some(DistinctSet::new())];
+        let amount = [Value::Integer(3)];
+        let error = update_acc(
+            &mut acc,
+            &mut seen,
+            InputRow::One(&amount),
+            &[AggFn::AvgDistinct(0)],
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "AVG overflows INTEGER");
+        assert!(matches!(
+            acc[0],
+            AccValue::Avg { sum, count } if sum == 5 && count == i64::MAX
+        ));
+        assert_eq!(seen[0].as_ref().unwrap().len(), 0);
+
+        let mut acc = [AccValue::Count(0), AccValue::Count(0)];
+        let mut seen = vec![Some(DistinctSet::new()), Some(DistinctSet::new())];
+        let texts = [AggFn::CountDistinct(0), AggFn::CountDistinct(1)];
+        {
+            let _budget = DistinctReserveBudget::limit(2);
+            let error = update_acc(&mut acc, &mut seen, InputRow::One(&row), &texts).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "internal error: DISTINCT set is too large"
+            );
+        }
+        assert!(matches!(acc[0], AccValue::Count(0)));
+        assert!(matches!(acc[1], AccValue::Count(0)));
+        assert_eq!(seen[0].as_ref().unwrap().len(), 0);
+        assert_eq!(seen[1].as_ref().unwrap().len(), 0);
+        update_acc(&mut acc, &mut seen, InputRow::One(&row), &texts).unwrap();
+        assert!(matches!(acc[0], AccValue::Count(1)));
+        assert!(matches!(acc[1], AccValue::Count(1)));
+        assert_eq!(seen[0].as_ref().unwrap().len(), 1);
+        assert_eq!(seen[1].as_ref().unwrap().len(), 1);
+        {
+            let _budget = DistinctReserveBudget::limit(0);
+            update_acc(&mut acc, &mut seen, InputRow::One(&row), &texts).unwrap();
+            let error = update_acc(
+                &mut acc,
+                &mut seen,
+                InputRow::One(&[Value::Text("c".to_string()), Value::Text("d".to_string())]),
+                &texts,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "internal error: DISTINCT set is too large"
+            );
+        }
+        assert!(matches!(acc[0], AccValue::Count(1)));
+        assert_eq!(seen[0].as_ref().unwrap().len(), 1);
+        assert!(
+            !seen[0]
+                .as_ref()
+                .unwrap()
+                .contains(&Value::Text("c".to_string()))
+        );
+
+        let mut acc = [AccValue::Count(0)];
+        let mut seen = vec![Some(DistinctSet::new())];
+        {
+            let _budget = DistinctReserveBudget::limit(0);
+            update_acc(
+                &mut acc,
+                &mut seen,
+                InputRow::One(&[Value::Null]),
+                &[AggFn::CountDistinct(0)],
+            )
+            .unwrap();
+        }
+        assert!(matches!(acc[0], AccValue::Count(0)));
+        assert_eq!(seen[0].as_ref().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn commit_does_not_reserve_after_the_first_mutation() {
+        let row = [
+            Value::Text("left".to_string()),
+            Value::Text("right".to_string()),
+        ];
+        let aggs = [AggFn::CountDistinct(0), AggFn::CountDistinct(1)];
+        let mut acc = [AccValue::Count(0), AccValue::Count(0)];
+        let mut seen = vec![Some(DistinctSet::new()), Some(DistinctSet::new())];
+        {
+            // Each new key charges the map and its bucket during preparation.
+            // A charge inside commit would fail this exact budget after the
+            // first slot had already been published.
+            let _budget = DistinctReserveBudget::limit(4);
+            update_acc(&mut acc, &mut seen, InputRow::One(&row), &aggs).unwrap();
+        }
+        assert!(matches!(acc[0], AccValue::Count(1)));
+        assert!(matches!(acc[1], AccValue::Count(1)));
+        assert_eq!(seen[0].as_ref().unwrap().len(), 1);
+        assert_eq!(seen[1].as_ref().unwrap().len(), 1);
+        assert!(
+            seen[0]
+                .as_ref()
+                .unwrap()
+                .contains(&Value::Text("left".to_string()))
+        );
+        assert!(
+            seen[1]
+                .as_ref()
+                .unwrap()
+                .contains(&Value::Text("right".to_string()))
+        );
+
+        let mut acc = [AccValue::Count(0), AccValue::Count(0)];
+        let mut seen = vec![Some(DistinctSet::new()), Some(DistinctSet::new())];
+        {
+            let _budget = DistinctReserveBudget::limit(3);
+            let error = update_acc(&mut acc, &mut seen, InputRow::One(&row), &aggs).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "internal error: DISTINCT set is too large"
+            );
+        }
+        assert!(matches!(acc[0], AccValue::Count(0)));
+        assert!(matches!(acc[1], AccValue::Count(0)));
+        assert_eq!(seen[0].as_ref().unwrap().len(), 0);
+        assert_eq!(seen[1].as_ref().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn colliding_distinct_values_are_stored_once_each() {
+        let _force = ForceHashCollision::new();
+        let mut acc = [AccValue::Count(0)];
+        let mut seen = vec![Some(DistinctSet::new())];
+        let aggs = [AggFn::CountDistinct(0)];
+        for label in ["a", "a", "b"] {
+            update_acc(
+                &mut acc,
+                &mut seen,
+                InputRow::One(&[Value::Text(label.to_string())]),
+                &aggs,
+            )
+            .unwrap();
+        }
+        let set = seen[0].as_ref().unwrap();
+        assert_eq!(set.buckets.len(), 1);
+        assert_eq!(set.len(), 2);
+        assert!(matches!(acc[0], AccValue::Count(2)));
+    }
+
+    #[test]
+    fn distinct_groups_keep_first_seen_order_when_hashes_collide() {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE items (dept TEXT, amount INT);")
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO items VALUES ('b', 1), ('a', 1), ('b', 2), ('c', NULL), ('a', 1);",
+            )
+            .unwrap();
+        let _force = ForceHashCollision::new();
+        assert_eq!(
+            query(
+                &mut database,
+                "SELECT dept, COUNT(DISTINCT amount), SUM(DISTINCT amount)
+                 FROM items GROUP BY dept;",
+            )
+            .rows,
+            vec![
+                vec![
+                    Value::Text("b".to_string()),
+                    Value::Integer(2),
+                    Value::Integer(3),
+                ],
+                vec![
+                    Value::Text("a".to_string()),
+                    Value::Integer(1),
+                    Value::Integer(1),
+                ],
+                vec![Value::Text("c".to_string()), Value::Integer(0), Value::Null,],
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_values_stay_apart_when_every_hash_collides() {
+        let mut database = Database::new();
+        database
+            .execute("CREATE TABLE items (label TEXT, amount INT, flag BOOLEAN);")
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO items VALUES
+                    ('a', 1, TRUE),
+                    ('b', 2, FALSE),
+                    ('a', 1, TRUE),
+                    ('b', 2, TRUE),
+                    (NULL, NULL, NULL);",
+            )
+            .unwrap();
+        let sql = "SELECT COUNT(DISTINCT label), COUNT(DISTINCT amount), COUNT(DISTINCT flag),
+            SUM(DISTINCT amount), AVG(DISTINCT amount) FROM items;";
+        let _force = ForceHashCollision::new();
+        assert_eq!(
+            query(&mut database, sql).rows,
+            vec![vec![
+                Value::Integer(2),
+                Value::Integer(2),
+                Value::Integer(2),
+                Value::Integer(3),
+                Value::ratio(3, 2),
+            ]]
+        );
+    }
+
+    #[test]
+    fn distinct_join_agrees_across_algorithms_and_materialization() {
+        let sql = "SELECT u.name, COUNT(*), COUNT(DISTINCT o.amount), SUM(o.amount), SUM(DISTINCT o.amount)
+            FROM users u JOIN orders o ON u.id = o.user_id
+            GROUP BY u.name
+            ORDER BY u.name ASC;";
+        let mut memory = Database::new();
+        load_algorithm_shop(&mut memory, 4, 8);
+        let hash_rows = query(&mut memory, sql).rows;
+        let nested_rows = {
+            let _force = ForceNestedJoin::new();
+            query(&mut memory, sql).rows
+        };
+        let materialized = {
+            let _guard = MaterializeAggregate::new();
+            query(&mut memory, sql).rows
+        };
+        assert_eq!(nested_rows, hash_rows);
+        assert_eq!(materialized, hash_rows);
+        assert!(hash_rows.len() > 1);
+
+        let dir = crate::test_dir::TestDir::new("distinct-join-algorithms");
+        let path = dir.join("db");
+        let mut database = Database::open(&path).unwrap();
+        load_algorithm_shop(&mut database, 4, 8);
+        let hash_rows = query(&mut database, sql).rows;
+        drop(database);
+        Database::migrate(&path).unwrap();
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE INDEX idx_orders_user ON orders(user_id);")
+            .unwrap();
+        let indexed = {
+            let _force = ForceIndexJoin::new();
+            query(&mut database, sql).rows
+        };
+        let nested_rows = {
+            let _force = ForceNestedJoin::new();
+            let _guard = MaterializeAggregate::new();
+            query(&mut database, sql).rows
+        };
+        assert_eq!(indexed, hash_rows);
+        assert_eq!(nested_rows, hash_rows);
+        let explained = {
+            let _force = ForceIndexJoin::new();
+            query(&mut database, &format!("EXPLAIN {sql}"))
+        };
+        assert_eq!(
+            explained.rows[0][4],
+            Value::Text("IndexNestedLoopJoin".to_string())
+        );
+        assert_eq!(
+            explained.rows[0][2],
+            Value::Text(
+                "COUNT(*), COUNT(DISTINCT o.amount), SUM(o.amount), SUM(DISTINCT o.amount)"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    #[ignore = "release profile of DISTINCT aggregates and HAVING aliases"]
+    fn profile_milestone13() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone13 cpu={cpu} mem_bytes={mem} rustc={rustc} acc_bytes={} value_bytes={} map_bytes={} option_bytes={} seen_vec_bytes={}",
+            std::mem::size_of::<AccValue>(),
+            std::mem::size_of::<Value>(),
+            std::mem::size_of::<DistinctSet>(),
+            std::mem::size_of::<Option<DistinctSet>>(),
+            std::mem::size_of::<Vec<Option<DistinctSet>>>()
+        );
+        for rows in [1_000_i64, 10_000, 100_000] {
+            let mut database = Database::new();
+            let text_bytes = load_distinct_profile(&mut database, rows);
+            let amount_sum = expected_amount_sum(rows);
+            let join_values = join_distinct_values(rows);
+            profile_distinct_shape(
+                &mut database,
+                rows,
+                "count",
+                "SELECT COUNT(*) FROM items;",
+                true,
+                1,
+                0,
+                0,
+                0,
+                |result| {
+                    assert_eq!(result.rows, vec![vec![Value::Integer(rows)]]);
+                },
+            );
+            profile_distinct_shape(
+                &mut database,
+                rows,
+                "count_distinct_low",
+                "SELECT COUNT(DISTINCT bucket) FROM items;",
+                true,
+                1,
+                1,
+                10,
+                0,
+                |result| {
+                    assert_eq!(result.rows, vec![vec![Value::Integer(10)]]);
+                },
+            );
+            profile_distinct_shape(
+                &mut database,
+                rows,
+                "count_distinct_high",
+                "SELECT COUNT(DISTINCT id) FROM items;",
+                true,
+                1,
+                1,
+                usize::try_from(rows).unwrap_or(usize::MAX),
+                0,
+                |result| {
+                    assert_eq!(result.rows, vec![vec![Value::Integer(rows)]]);
+                },
+            );
+            profile_distinct_shape(
+                &mut database,
+                rows,
+                "text_distinct_low",
+                "SELECT COUNT(DISTINCT label) FROM items;",
+                true,
+                1,
+                1,
+                8,
+                8,
+                |result| {
+                    assert_eq!(result.rows, vec![vec![Value::Integer(8)]]);
+                },
+            );
+            profile_distinct_shape(
+                &mut database,
+                rows,
+                "text_distinct_high",
+                "SELECT COUNT(DISTINCT tag) FROM items;",
+                true,
+                1,
+                1,
+                usize::try_from(rows).unwrap_or(usize::MAX),
+                text_bytes,
+                |result| {
+                    assert_eq!(result.rows, vec![vec![Value::Integer(rows)]]);
+                },
+            );
+            profile_distinct_shape(
+                &mut database,
+                rows,
+                "sum",
+                "SELECT SUM(amount) FROM items;",
+                true,
+                1,
+                0,
+                0,
+                0,
+                |result| {
+                    assert_eq!(result.rows, vec![vec![Value::Integer(amount_sum)]]);
+                },
+            );
+            profile_distinct_shape(
+                &mut database,
+                rows,
+                "sum_distinct",
+                "SELECT SUM(DISTINCT amount) FROM items;",
+                true,
+                1,
+                1,
+                17,
+                0,
+                |result| {
+                    assert_eq!(result.rows, vec![vec![Value::Integer(136)]]);
+                },
+            );
+            profile_distinct_shape(
+                &mut database,
+                rows,
+                "avg",
+                "SELECT AVG(amount) FROM items;",
+                true,
+                1,
+                0,
+                0,
+                0,
+                |_| {},
+            );
+            profile_distinct_shape(
+                &mut database,
+                rows,
+                "avg_distinct",
+                "SELECT AVG(DISTINCT amount) FROM items;",
+                true,
+                1,
+                1,
+                17,
+                0,
+                |result| {
+                    assert_eq!(result.rows, vec![vec![Value::ratio(136, 17)]]);
+                },
+            );
+            let threshold = rows / 20;
+            profile_distinct_shape(
+                &mut database,
+                rows,
+                "having_alias",
+                &format!(
+                    "SELECT bucket AS dept, COUNT(DISTINCT id) AS total
+                     FROM items GROUP BY bucket HAVING total > {threshold};"
+                ),
+                false,
+                10,
+                10,
+                usize::try_from(rows).unwrap_or(usize::MAX),
+                0,
+                |result| {
+                    assert_eq!(result.rows.len(), 10);
+                },
+            );
+            profile_distinct_shape(
+                &mut database,
+                rows,
+                "join_distinct",
+                "SELECT u.bucket, COUNT(DISTINCT o.amount)
+                 FROM users u JOIN orders o ON u.id = o.user_id
+                 GROUP BY u.bucket;",
+                false,
+                10,
+                10,
+                join_values,
+                0,
+                |result| {
+                    assert_eq!(result.rows.len(), 10);
+                    let membership: i64 = result
+                        .rows
+                        .iter()
+                        .map(|row| match row[1] {
+                            Value::Integer(count) => count,
+                            _ => panic!("expected a count"),
+                        })
+                        .sum();
+                    assert_eq!(membership, i64::try_from(join_values).unwrap_or(i64::MAX));
+                },
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn profile_distinct_shape(
+        database: &mut Database,
+        rows: i64,
+        shape: &str,
+        sql: &str,
+        scalar: bool,
+        groups: usize,
+        set_groups: usize,
+        distinct_values: usize,
+        text_bytes: usize,
+        check: impl Fn(&QueryResult),
+    ) {
+        let mut samples = Vec::with_capacity(6);
+        let mut checksum = 0i64;
+        let mut returned = 0usize;
+        for _ in 0..6 {
+            let started = std::time::Instant::now();
+            let result = query(database, sql);
+            samples.push(started.elapsed().as_micros());
+            check(&result);
+            checksum = 0;
+            for row in &result.rows {
+                for cell in row {
+                    checksum = checksum.wrapping_add(profile_cell(cell));
+                }
+            }
+            returned = result.rows.len();
+            std::hint::black_box(&result.rows);
+        }
+        let cold = samples[0];
+        let mut warm = samples[1..].to_vec();
+        warm.sort_unstable();
+        let warm = warm[warm.len() / 2];
+        let acc_bytes = if scalar {
+            std::mem::size_of::<Vec<AccValue>>().saturating_add(std::mem::size_of::<AccValue>())
+        } else {
+            join_group_bytes(groups, 1, 1)
+        };
+        let set_bytes = distinct_set_bytes(set_groups, distinct_values, text_bytes);
+        println!(
+            "milestone13 shape={shape} rows={rows} returned={returned} groups={groups} distinct={distinct_values} text_bytes={text_bytes} acc_bytes={acc_bytes} set_bytes={set_bytes} checksum={checksum} cold_us={cold} warm_us={warm}"
+        );
+    }
+
+    /// One `seen` vector and one `Option<DistinctSet>` per group, then one hash,
+    /// bucket header, and `Value` per stored cell, plus inserted text lengths.
+    /// Hash-table control bytes, spare capacity, and process RSS are not included.
+    /// A group with no stored values contributes nothing. The profiled queries
+    /// have one distinct aggregate, so each counted group owns one set.
+    fn distinct_set_bytes(groups: usize, values: usize, text_bytes: usize) -> usize {
+        if values == 0 {
+            return 0;
+        }
+        let group = std::mem::size_of::<Vec<Option<DistinctSet>>>()
+            .saturating_add(std::mem::size_of::<Option<DistinctSet>>());
+        let entry = std::mem::size_of::<u64>()
+            + std::mem::size_of::<Vec<Value>>()
+            + std::mem::size_of::<Value>();
+        groups
+            .saturating_mul(group)
+            .saturating_add(values.saturating_mul(entry))
+            .saturating_add(text_bytes)
+    }
+
+    fn expected_amount_sum(rows: i64) -> i64 {
+        (0..rows).filter(|id| id % 11 != 0).map(|id| id % 17).sum()
+    }
+
+    fn join_distinct_values(rows: i64) -> usize {
+        let mut seen = vec![HashSet::<i64>::new(); 10];
+        let orders = rows.saturating_mul(4);
+        for id in 0..orders {
+            if id % 2 == 0 {
+                continue;
+            }
+            let bucket = usize::try_from((id % rows) % 10).unwrap_or(0);
+            seen[bucket].insert(id % 17);
+        }
+        seen.iter().map(HashSet::len).sum()
+    }
+
+    fn load_distinct_profile(database: &mut Database, rows: i64) -> usize {
+        database
+            .execute("CREATE TABLE items (id INT, label TEXT, tag TEXT, bucket INT, amount INT);")
+            .unwrap();
+        database
+            .execute("CREATE TABLE users (id INT, bucket INT);")
+            .unwrap();
+        database
+            .execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        let mut text_bytes = 0usize;
+        let mut start = 0_i64;
+        while start < rows {
+            let end = (start + 499).min(rows - 1);
+            let mut items = String::from("INSERT INTO items VALUES ");
+            let mut users = String::from("INSERT INTO users VALUES ");
+            for id in start..=end {
+                if id != start {
+                    items.push(',');
+                    users.push(',');
+                }
+                let label = (b'a' + u8::try_from(id % 8).unwrap()) as char;
+                let tag = format!("n{id}");
+                text_bytes += tag.len();
+                let amount = if id % 11 == 0 {
+                    "NULL".to_string()
+                } else {
+                    (id % 17).to_string()
+                };
+                items.push_str(&format!(
+                    "({id}, '{label}', '{tag}', {}, {amount})",
+                    id % 10
+                ));
+                users.push_str(&format!("({id}, {})", id % 10));
+            }
+            database.execute(&items).unwrap();
+            database.execute(&users).unwrap();
+            start = end + 1;
+        }
+        let orders = rows.saturating_mul(4);
+        let mut start = 0_i64;
+        while start < orders {
+            let end = (start + 499).min(orders - 1);
+            let mut sql = String::from("INSERT INTO orders VALUES ");
+            for id in start..=end {
+                if id != start {
+                    sql.push(',');
+                }
+                let user = id % rows;
+                if id % 2 == 0 {
+                    sql.push_str(&format!("({user}, NULL)"));
+                } else {
+                    sql.push_str(&format!("({user}, {})", id % 17));
+                }
+            }
+            database.execute(&sql).unwrap();
+            start = end + 1;
+        }
+        text_bytes
     }
 }

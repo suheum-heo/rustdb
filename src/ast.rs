@@ -204,6 +204,10 @@ pub(crate) struct AggregateCall {
     pub(crate) function: AggregateFunction,
     /// `*` or one column.
     pub(crate) argument: AggregateArg,
+    /// `COUNT(DISTINCT column)`, `SUM(DISTINCT column)`, or `AVG(DISTINCT column)`.
+    ///
+    /// `MIN` and `MAX` reject the flag instead of treating it as an ordinary extreme.
+    pub(crate) distinct: bool,
 }
 
 /// Aggregate functions this engine evaluates.
@@ -240,9 +244,10 @@ impl AggregateCall {
             AggregateFunction::Min => "MIN",
             AggregateFunction::Max => "MAX",
         };
+        let distinct = if self.distinct { "DISTINCT " } else { "" };
         match &self.argument {
-            AggregateArg::Star => format!("{name}(*)"),
-            AggregateArg::Column(column) => format!("{name}({})", column.render()),
+            AggregateArg::Star => format!("{name}({distinct}*)"),
+            AggregateArg::Column(column) => format!("{name}({distinct}{})", column.render()),
         }
     }
 }

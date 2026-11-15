@@ -514,7 +514,6 @@ fn select_aliases_bind_in_order_by_and_nowhere_else() {
     for sql in [
         "SELECT department AS dept FROM employees WHERE dept = 'eng';",
         "SELECT department AS dept FROM employees GROUP BY dept;",
-        "SELECT department AS dept, COUNT(*) AS total FROM employees GROUP BY department HAVING total > 1;",
     ] {
         let error = failure(&mut database, sql);
         assert!(
@@ -522,6 +521,17 @@ fn select_aliases_bind_in_order_by_and_nowhere_else() {
             "{sql} -> {error}"
         );
     }
+    assert_eq!(
+        rows(
+            &mut database,
+            "SELECT department AS dept, COUNT(*) AS total
+             FROM employees GROUP BY department HAVING total > 1;"
+        ),
+        vec![
+            vec![text("eng"), integer(3)],
+            vec![text("sales"), integer(2)]
+        ]
+    );
     let mut database = staff();
     database
         .execute("CREATE TABLE rooms (department TEXT, name TEXT);")

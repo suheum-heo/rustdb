@@ -258,14 +258,15 @@ pub(crate) fn bind_where(expr: &Expr, scope: &Scope) -> Result<BoundExpr, DbErro
 
 /// Bind `HAVING` against one completed group.
 ///
-/// `column` returns the group's slot and the column's declared type.
+/// `column` returns the group's slot and the value's scalar type. An alias of
+/// `AVG` is a ratio, so the type is not limited to a stored [`DataType`].
 /// `aggregate` returns the slot of a shared accumulator and that slot's
 /// result type. `COUNT` and `SUM` are integers. `AVG` is a ratio. `MIN` and
 /// `MAX` keep the argument type. The clause must be boolean, or an untyped
 /// null literal.
 pub(crate) fn bind_having(
     expr: &Expr,
-    mut column: impl FnMut(&SelectColumn) -> Result<(usize, DataType), DbError>,
+    mut column: impl FnMut(&SelectColumn) -> Result<(usize, ScalarType), DbError>,
     mut aggregate: impl FnMut(&AggregateCall) -> Result<(usize, ScalarType), DbError>,
 ) -> Result<BoundExpr, DbError> {
     let mut types = Vec::new();
@@ -278,7 +279,7 @@ pub(crate) fn bind_having(
     }
 }
 
-type GroupColumnFn<'a> = dyn FnMut(&SelectColumn) -> Result<(usize, DataType), DbError> + 'a;
+type GroupColumnFn<'a> = dyn FnMut(&SelectColumn) -> Result<(usize, ScalarType), DbError> + 'a;
 type GroupAggregateFn<'a> = dyn FnMut(&AggregateCall) -> Result<(usize, ScalarType), DbError> + 'a;
 
 fn bind_having_expr(
@@ -290,11 +291,11 @@ fn bind_having_expr(
     match expr {
         Expr::Literal(value) => Ok(BoundExpr::Literal(value.clone())),
         Expr::Column { name, qualifier } => {
-            let (index, data_type) = column(&SelectColumn {
+            let (index, scalar) = column(&SelectColumn {
                 name: name.clone(),
                 qualifier: qualifier.clone(),
             })?;
-            note_type(types, index, ScalarType::from(data_type));
+            note_type(types, index, scalar);
             Ok(BoundExpr::Column(index))
         }
         Expr::Aggregate(call) => {

@@ -13,8 +13,9 @@
 //! columns of one table or of one `INNER JOIN` and compute `COUNT`, `SUM`,
 //! `AVG`, `MIN`, and `MAX`. `AVG` is an exact ratio and is not stored.
 //! `HAVING` keeps a group only when it is TRUE. A select-list alias is an
-//! output name and an `ORDER BY` name. Other filters scan the
-//! in-memory table.
+//! output name, an `ORDER BY` name, and an unqualified `HAVING` name.
+//! `COUNT`, `SUM`, and `AVG` accept `DISTINCT` on one column. Other filters
+//! scan the in-memory table.
 //!
 //! # Example
 //!

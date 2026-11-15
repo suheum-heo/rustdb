@@ -285,11 +285,8 @@ fn invalid_aggregates_are_rejected_before_reading_rows() {
         "function calls are not supported"
     );
     assert_eq!(
-        failure(
-            &mut database,
-            "SELECT COUNT(DISTINCT salary) FROM employees;"
-        ),
-        "DISTINCT aggregates are not supported"
+        failure(&mut database, "SELECT MIN(DISTINCT salary) FROM employees;"),
+        "DISTINCT is not supported for MIN"
     );
     assert_eq!(
         failure(
@@ -425,6 +422,8 @@ fn explain_names_the_aggregate_and_leaves_ordinary_selects_alone() {
             "bounds".to_string(),
             "filter".to_string(),
             "having".to_string(),
+            "slots".to_string(),
+            "aliases".to_string(),
         ]
     );
     assert_eq!(explained.rows[0][0], text("HashAggregate"));
