@@ -7,14 +7,17 @@
 //!
 //! A plain `SELECT` applies `WHERE`, then `ORDER BY`, then `LIMIT`, then
 //! projection. Its sort keys may name columns that are not in the select list.
-//! `SELECT DISTINCT` is a non-aggregate query on one table. It projects the
-//! chosen columns, then keeps the first copy of each output row. NULL equals
-//! NULL in that comparison. A fingerprint collision still compares every cell.
-//! `ORDER BY` names a selected output column or its alias, and an unselected
-//! column is rejected because the hidden value would be ambiguous after
-//! deduplication. `ORDER BY` and `LIMIT` run after deduplication, and `LIMIT`
-//! does not stop the scan. The distinct rows stay in memory until the query
-//! finishes. An aggregate query groups after `WHERE` and applies `HAVING`
+//! `SELECT DISTINCT` is a non-aggregate query on one table or on one
+//! `INNER JOIN`. It projects the chosen columns, then keeps the first copy of
+//! each output row. NULL equals NULL in that comparison. A fingerprint
+//! collision still compares every cell. `ORDER BY` names a selected output
+//! column or its alias, and an unselected column is rejected because the
+//! hidden value would be ambiguous after deduplication. `ORDER BY` and
+//! `LIMIT` run after deduplication, and `LIMIT` does not stop the scan. The
+//! distinct rows stay in memory until the query finishes. A distinct join
+//! visits pairs through the same nested, hash, or index path as a plain join
+//! and admits each projected pair immediately. It does not store the joined
+//! rows beside the distinct set. An aggregate query groups after `WHERE` and applies `HAVING`
 //! before the sort. An indexed integer comparison on one table may supply
 //! candidate rows first. The original `WHERE` is still applied to those
 //! candidates. Equal keys keep the order produced above because the sort is
@@ -263,10 +266,12 @@ impl Database {
     ) -> Result<StatementResult, DbError> {
         reject_runtime_distinct(from, tail)?;
         if tail.distinct {
-            let QueryFrom::Table(source) = from else {
-                return Err(DbError::unsupported("DISTINCT is not supported for JOIN"));
+            return match from {
+                QueryFrom::Table(source) => self.query_table(source, tail),
+                QueryFrom::Join { outer, inner, on } => {
+                    self.query_distinct_join(outer, inner, on, tail)
+                }
             };
-            return self.query_table(source, tail);
         }
         if is_aggregate_query(tail.projection, tail.group_by, tail.having, tail.order_by) {
             return match from {
@@ -411,6 +416,7 @@ impl Database {
             tail.projection,
             tail.selection,
             tail.order_by,
+            false,
         )?;
         let mut prepared = prepared;
         #[cfg(test)]
@@ -454,6 +460,42 @@ impl Database {
                 })
             }
         }
+    }
+
+    fn query_distinct_join(
+        &mut self,
+        outer: &TableRef,
+        inner: &TableRef,
+        on: &Expr,
+        tail: SelectTail<'_>,
+    ) -> Result<StatementResult, DbError> {
+        let mut prepared = self.prepare_join(
+            outer,
+            inner,
+            on,
+            tail.projection,
+            tail.selection,
+            tail.order_by,
+            true,
+        )?;
+        #[cfg(test)]
+        if force_nested_join() {
+            prepared.path = JoinAccess::NestedLoop;
+        }
+        let outer_len = self.table(&outer.name)?.rows().len();
+        let inner_len = self.table(&inner.name)?.rows().len();
+        prepared.path = finish_join_path(prepared.path, outer_len, inner_len);
+        let outputs = prepared.output_indexes.clone();
+        let mut distinct = DistinctRows::new();
+        self.visit_join_pairs(outer, inner, &prepared, |outer_row, inner_row| {
+            distinct.admit(project_pair(outer_row, inner_row, &outputs)?)
+        })?;
+        Ok(finish_distinct_rows(
+            distinct,
+            &prepared.sort_keys,
+            tail.limit,
+            prepared.output_names,
+        ))
     }
 
     fn aggregate_join(
@@ -734,10 +776,12 @@ impl Database {
         };
         reject_runtime_distinct(&query.from, tail)?;
         if query.distinct {
-            let QueryFrom::Table(source) = &query.from else {
-                return Err(DbError::unsupported("DISTINCT is not supported for JOIN"));
+            return match &query.from {
+                QueryFrom::Table(source) => self.explain_distinct(source, query),
+                QueryFrom::Join { outer, inner, on } => {
+                    self.explain_distinct_join(outer, inner, on, query)
+                }
             };
-            return self.explain_distinct(source, query);
         }
         if is_aggregate_query(
             &query.projection,
@@ -780,6 +824,7 @@ impl Database {
                     &query.projection,
                     query.selection.as_ref(),
                     &query.order_by,
+                    false,
                 )?;
                 #[cfg(test)]
                 if force_nested_join() {
@@ -938,6 +983,123 @@ impl Database {
         }))
     }
 
+    fn explain_distinct_join(
+        &self,
+        outer: &TableRef,
+        inner: &TableRef,
+        on: &Expr,
+        query: &crate::ast::SelectQuery,
+    ) -> Result<StatementResult, DbError> {
+        let mut prepared = self.prepare_join(
+            outer,
+            inner,
+            on,
+            &query.projection,
+            query.selection.as_ref(),
+            &query.order_by,
+            true,
+        )?;
+        #[cfg(test)]
+        if force_nested_join() {
+            prepared.path = JoinAccess::NestedLoop;
+        }
+        let outer_len = self.table(&outer.name)?.rows().len();
+        let inner_len = self.table(&inner.name)?.rows().len();
+        prepared.path = finish_join_path(prepared.path, outer_len, inner_len);
+        let filter = query
+            .selection
+            .as_ref()
+            .map(|expr| Value::Text(expr.render()))
+            .unwrap_or(Value::Null);
+        let order = if query.order_by.is_empty() {
+            Value::Null
+        } else {
+            Value::Text(
+                query
+                    .order_by
+                    .iter()
+                    .map(render_order_key)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        };
+        let (access, build, index, predicate, residual) = match &prepared.path {
+            JoinAccess::NestedLoop => (
+                "NestedLoopJoin",
+                Value::Null,
+                Value::Null,
+                Value::Text(on.render()),
+                Value::Null,
+            ),
+            JoinAccess::HashJoin {
+                predicate,
+                residual,
+                ..
+            } => {
+                let build = if inner_len <= outer_len {
+                    inner.explain_name()
+                } else {
+                    outer.explain_name()
+                };
+                (
+                    "HashJoin",
+                    Value::Text(build),
+                    Value::Null,
+                    Value::Text(predicate.clone()),
+                    residual
+                        .as_ref()
+                        .map(|text| Value::Text(text.clone()))
+                        .unwrap_or(Value::Null),
+                )
+            }
+            JoinAccess::IndexNestedLoop {
+                name,
+                predicate,
+                residual,
+                ..
+            } => (
+                "IndexNestedLoopJoin",
+                Value::Null,
+                Value::Text(name.clone()),
+                Value::Text(predicate.clone()),
+                residual
+                    .as_ref()
+                    .map(|text| Value::Text(text.clone()))
+                    .unwrap_or(Value::Null),
+            ),
+        };
+        Ok(StatementResult::Query(QueryResult {
+            columns: vec![
+                "access".to_string(),
+                "outer".to_string(),
+                "inner".to_string(),
+                "build".to_string(),
+                "index".to_string(),
+                "predicate".to_string(),
+                "residual".to_string(),
+                "filter".to_string(),
+                "distinct".to_string(),
+                "projection".to_string(),
+                "order_by".to_string(),
+                "limit".to_string(),
+            ],
+            rows: vec![vec![
+                Value::Text(access.to_string()),
+                Value::Text(outer.explain_name()),
+                Value::Text(inner.explain_name()),
+                build,
+                index,
+                predicate,
+                residual,
+                filter,
+                Value::Text("HashDistinct".to_string()),
+                Value::Text(projection_label(&query.projection)),
+                order,
+                limit_cell(query.limit),
+            ]],
+        }))
+    }
+
     fn prepare_select(
         &self,
         source: &TableRef,
@@ -967,6 +1129,7 @@ impl Database {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_join(
         &self,
         outer: &TableRef,
@@ -975,6 +1138,7 @@ impl Database {
         projection: &Projection,
         selection: Option<&Expr>,
         order_by: &[OrderKey],
+        distinct: bool,
     ) -> Result<PreparedJoin, DbError> {
         let outer_columns = Scope::columns(self.table(&outer.name)?);
         let inner_columns = Scope::columns(self.table(&inner.name)?);
@@ -987,7 +1151,11 @@ impl Database {
         let bound_on = expr::bind_filter(on, &scope, "ON")?;
         let filter = bind_optional_where(selection, &scope)?;
         let outputs = output_columns(&scope, projection)?;
-        let sort_keys = bind_order(&scope, order_by, &outputs)?;
+        let sort_keys = if distinct {
+            bind_distinct_order(&scope, order_by, &outputs)?
+        } else {
+            bind_order(&scope, order_by, &outputs)?
+        };
         let indexes = self.index_images().to_vec();
         let choices = index_choices(self.table(&inner.name)?, &indexes)?;
         let path = plan::choose_join(
@@ -1773,12 +1941,9 @@ fn text_list(labels: &[String]) -> Value {
     }
 }
 
-fn reject_runtime_distinct(from: &QueryFrom, tail: SelectTail<'_>) -> Result<(), DbError> {
+fn reject_runtime_distinct(_from: &QueryFrom, tail: SelectTail<'_>) -> Result<(), DbError> {
     if !tail.distinct {
         return Ok(());
-    }
-    if matches!(from, QueryFrom::Join { .. }) {
-        return Err(DbError::unsupported("DISTINCT is not supported for JOIN"));
     }
     if !tail.group_by.is_empty() {
         return Err(DbError::unsupported(
@@ -1814,7 +1979,9 @@ fn is_aggregate_query(
         return true;
     }
     match projection {
-        Projection::All | Projection::QualifiedAll { .. } => false,
+        Projection::All | Projection::QualifiedAll { .. } | Projection::QualifiedStars { .. } => {
+            false
+        }
         Projection::Columns(items) => items
             .iter()
             .any(|item| matches!(item, SelectItem::Aggregate { .. })),
@@ -2643,6 +2810,18 @@ impl OutputPlan {
     }
 }
 
+fn push_star(outputs: &mut OutputPlan, scope: &Scope, qualifier: &str) -> Result<(), DbError> {
+    for index in scope.columns_of(qualifier)? {
+        let Some(name) = scope.name_at(index) else {
+            return Err(DbError::Internal(
+                "select column is outside the table".to_string(),
+            ));
+        };
+        outputs.push(index, name.to_string(), false, stored_scalar(scope, index)?);
+    }
+    Ok(())
+}
+
 fn stored_scalar(scope: &Scope, index: usize) -> Result<expr::ScalarType, DbError> {
     scope
         .type_at(index)
@@ -2665,13 +2844,11 @@ fn output_columns(scope: &Scope, projection: &Projection) -> Result<OutputPlan, 
             }
         }
         Projection::QualifiedAll { qualifier } => {
-            for index in scope.columns_of(qualifier)? {
-                let Some(name) = scope.name_at(index) else {
-                    return Err(DbError::Internal(
-                        "select column is outside the table".to_string(),
-                    ));
-                };
-                outputs.push(index, name.to_string(), false, stored_scalar(scope, index)?);
+            push_star(&mut outputs, scope, qualifier)?;
+        }
+        Projection::QualifiedStars { qualifiers } => {
+            for qualifier in qualifiers {
+                push_star(&mut outputs, scope, qualifier)?;
             }
         }
         Projection::Columns(columns) => {
@@ -2913,9 +3090,23 @@ fn finish_distinct(
             admit(row)?;
         }
     }
+    Ok(finish_distinct_rows(
+        distinct,
+        &prepared.sort_keys,
+        limit,
+        prepared.output_names.clone(),
+    ))
+}
+
+fn finish_distinct_rows(
+    distinct: DistinctRows,
+    sort_keys: &[SortKey],
+    limit: Option<u64>,
+    columns: Vec<String>,
+) -> StatementResult {
     let mut rows = distinct.into_rows();
-    if !prepared.sort_keys.is_empty() {
-        rows.sort_by(|left, right| compare_rows(left, right, &prepared.sort_keys));
+    if !sort_keys.is_empty() {
+        rows.sort_by(|left, right| compare_rows(left, right, sort_keys));
     }
     if let Some(limit) = limit {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -2923,10 +3114,7 @@ fn finish_distinct(
             rows.truncate(limit);
         }
     }
-    Ok(StatementResult::Query(QueryResult {
-        columns: prepared.output_names.clone(),
-        rows,
-    }))
+    StatementResult::Query(QueryResult { columns, rows })
 }
 
 /// First-seen projected rows of one `SELECT DISTINCT`.
@@ -3104,6 +3292,11 @@ fn projection_label(projection: &Projection) -> String {
     match projection {
         Projection::All => "*".to_string(),
         Projection::QualifiedAll { qualifier } => format!("{qualifier}.*"),
+        Projection::QualifiedStars { qualifiers } => qualifiers
+            .iter()
+            .map(|qualifier| format!("{qualifier}.*"))
+            .collect::<Vec<_>>()
+            .join(", "),
         Projection::Columns(items) => items
             .iter()
             .map(select_item_label)
@@ -3295,6 +3488,25 @@ impl ForceIndexJoin {
 impl Drop for ForceIndexJoin {
     fn drop(&mut self) {
         FORCE_INDEX_JOIN.with(|flag| flag.set(false));
+    }
+}
+
+/// Forces the nested-loop join for the life of the guard.
+#[cfg(test)]
+pub(crate) struct ForceNestedJoin;
+
+#[cfg(test)]
+impl ForceNestedJoin {
+    pub(crate) fn new() -> Self {
+        FORCE_NESTED_JOIN.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceNestedJoin {
+    fn drop(&mut self) {
+        FORCE_NESTED_JOIN.with(|flag| flag.set(false));
     }
 }
 
@@ -3891,24 +4103,6 @@ impl DistinctReserveBudget {
 impl Drop for DistinctReserveBudget {
     fn drop(&mut self) {
         DISTINCT_RESERVE_BUDGET.with(|budget| budget.set(self.previous));
-    }
-}
-
-#[cfg(test)]
-struct ForceNestedJoin;
-
-#[cfg(test)]
-impl ForceNestedJoin {
-    fn new() -> Self {
-        FORCE_NESTED_JOIN.with(|flag| flag.set(true));
-        Self
-    }
-}
-
-#[cfg(test)]
-impl Drop for ForceNestedJoin {
-    fn drop(&mut self) {
-        FORCE_NESTED_JOIN.with(|flag| flag.set(false));
     }
 }
 
@@ -6658,6 +6852,635 @@ mod tests {
     }
 
     #[test]
+    fn distinct_join_strategies_keep_the_same_first_seen_rows() {
+        let dir = crate::test_dir::TestDir::new("distinct-join-strategies");
+        let path = dir.join("db");
+        let sql = "SELECT DISTINCT u.name, o.amount
+            FROM users u
+            JOIN orders o ON u.id = o.user_id;";
+        let expected = vec![
+            vec![Value::Text("Ada".to_string()), Value::Integer(10)],
+            vec![Value::Text("Ada".to_string()), Value::Null],
+            vec![Value::Null, Value::Integer(10)],
+        ];
+        {
+            let mut db = Database::open(&path).unwrap();
+            load_distinct_join(&mut db);
+            let explained = query(&mut db, &format!("EXPLAIN {sql}"));
+            assert_eq!(explained.rows[0][0], Value::Text("HashJoin".to_string()));
+            assert_eq!(explained.rows[0][3], Value::Text("u (users)".to_string()));
+            assert_eq!(query(&mut db, sql).rows, expected);
+            let _nested = ForceNestedJoin::new();
+            let nested_plan = query(&mut db, &format!("EXPLAIN {sql}"));
+            assert_eq!(
+                nested_plan.rows[0][0],
+                Value::Text("NestedLoopJoin".to_string())
+            );
+            assert_eq!(query(&mut db, sql).rows, expected);
+        }
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_orders_user ON orders (user_id);")
+            .unwrap();
+        let _index = ForceIndexJoin::new();
+        let explained = query(&mut db, &format!("EXPLAIN {sql}"));
+        assert_eq!(
+            explained.rows[0][0],
+            Value::Text("IndexNestedLoopJoin".to_string())
+        );
+        assert_eq!(
+            explained.rows[0][4],
+            Value::Text("idx_orders_user".to_string())
+        );
+        assert_eq!(query(&mut db, sql).rows, expected);
+
+        let wide = "SELECT DISTINCT u.name, o.note
+            FROM users u JOIN orders o ON o.user_id = u.id
+            WHERE o.amount > 0;";
+        let _force = ForceHashCollision::new();
+        let collided = query(&mut db, wide);
+        let mut linear = Vec::new();
+        for row in &query_without_distinct(&mut db, wide.replace("DISTINCT ", "")) {
+            if !linear.iter().any(|kept| kept == row) {
+                linear.push(row.clone());
+            }
+        }
+        assert_eq!(collided.rows, linear);
+    }
+
+    #[test]
+    fn a_distinct_join_limit_does_not_hide_a_reservation_failure() {
+        let mut db = Database::new();
+        load_distinct_join(&mut db);
+        let _budget = DistinctReserveBudget::limit(3);
+        let error = db
+            .execute(
+                "SELECT DISTINCT u.name FROM users u
+                 JOIN orders o ON u.id = o.user_id
+                 LIMIT 1;",
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "internal error: SELECT DISTINCT result is too large"
+        );
+        drop(_budget);
+        let rows = query(
+            &mut db,
+            "SELECT DISTINCT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+        );
+        assert_eq!(
+            rows.rows,
+            vec![vec![Value::Text("Ada".to_string())], vec![Value::Null]]
+        );
+    }
+
+    fn load_distinct_join(db: &mut Database) {
+        db.execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INT, amount INT, note TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Ada'), (3, NULL);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO orders VALUES
+                (1, 10, 'alpha'),
+                (1, 10, 'alpha'),
+                (2, 10, 'beta'),
+                (2, NULL, 'gamma'),
+                (NULL, 10, 'none'),
+                (3, 10, 'delta');",
+        )
+        .unwrap();
+    }
+
+    fn query_without_distinct(db: &mut Database, sql: String) -> Vec<Vec<Value>> {
+        query(db, &sql).rows
+    }
+
+    #[test]
+    fn the_first_distinct_tuple_comes_from_the_earlier_outer_row() {
+        let expected = vec![
+            vec![Value::Text("A".to_string()), Value::Integer(30)],
+            vec![Value::Text("A".to_string()), Value::Integer(10)],
+        ];
+        let sql = "SELECT DISTINCT u.name, o.amount
+            FROM users u JOIN orders o ON u.id = o.user_id;";
+        let reversed = "SELECT DISTINCT u.name, o.amount
+            FROM users u JOIN orders o ON o.user_id = u.id;";
+        for (users, build) in [("build-outer", "u (users)"), ("build-inner", "o (orders)")] {
+            let mut db = Database::new();
+            load_later_inner(&mut db, users == "build-inner");
+            let explained = query(&mut db, &format!("EXPLAIN {sql}"));
+            assert_eq!(explained.rows[0][0], Value::Text("HashJoin".to_string()));
+            assert_eq!(
+                explained.rows[0][3],
+                Value::Text(build.to_string()),
+                "{users}"
+            );
+            assert_eq!(query(&mut db, sql).rows, expected, "{users}");
+            assert_eq!(query(&mut db, reversed).rows, expected, "{users}");
+            let _nested = ForceNestedJoin::new();
+            assert_eq!(
+                query(&mut db, &format!("EXPLAIN {sql}")).rows[0][0],
+                Value::Text("NestedLoopJoin".to_string())
+            );
+            assert_eq!(query(&mut db, sql).rows, expected, "{users}");
+        }
+        let dir = crate::test_dir::TestDir::new("distinct-first-seen");
+        let path = dir.join("db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            load_later_inner(&mut db, false);
+        }
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_orders_user ON orders (user_id);")
+            .unwrap();
+        let _index = ForceIndexJoin::new();
+        let explained = query(&mut db, &format!("EXPLAIN {reversed}"));
+        assert_eq!(
+            explained.rows[0][0],
+            Value::Text("IndexNestedLoopJoin".to_string())
+        );
+        assert_eq!(
+            explained.rows[0][4],
+            Value::Text("idx_orders_user".to_string())
+        );
+        assert_eq!(query(&mut db, sql).rows, expected);
+        assert_eq!(query(&mut db, reversed).rows, expected);
+    }
+
+    #[test]
+    fn distinct_joins_match_an_independent_nested_loop() {
+        let sql = "SELECT DISTINCT u.name, o.amount, o.paid
+            FROM users u
+            JOIN orders o ON u.id = o.user_id AND o.paid = TRUE
+            WHERE o.amount > 0;";
+        let reversed = "SELECT DISTINCT u.name, o.amount, o.paid
+            FROM users u
+            JOIN orders o ON o.user_id = u.id AND o.paid = TRUE
+            WHERE o.amount > 0;";
+        let ordered = "SELECT DISTINCT u.name, o.amount, o.paid
+            FROM users u
+            JOIN orders o ON u.id = o.user_id AND o.paid = TRUE
+            WHERE o.amount > 0
+            ORDER BY name ASC, amount DESC NULLS FIRST
+            LIMIT 3;";
+        let nested_sql = "SELECT DISTINCT u.name, o.amount
+            FROM users u JOIN orders o ON u.id < o.user_id;";
+        for seed in [0x16a1_u64, 0x16b2, 0x16c3, 0x16d4] {
+            for (users_n, orders_n) in [(0, 0), (0, 6), (6, 0), (4, 15), (15, 4), (8, 8)] {
+                let (users, orders) = sample_join(seed, users_n, orders_n);
+                let expected = independent_join(&users, &orders, true);
+                let ordered_rows = order_independent(expected.clone());
+                let lower = independent_join(&users, &orders, false);
+                let label = format!("seed {seed:#x} users {users_n} orders {orders_n}");
+                let mut db = Database::new();
+                load_sample(&mut db, &users, &orders);
+                assert_join(&mut db, sql, "HashJoin", &expected, &label);
+                assert_join(&mut db, reversed, "HashJoin", &expected, &label);
+                assert_join(&mut db, ordered, "HashJoin", &ordered_rows, &label);
+                let build = if orders_n <= users_n {
+                    "o (orders)"
+                } else {
+                    "u (users)"
+                };
+                assert_eq!(
+                    query(&mut db, &format!("EXPLAIN {sql}")).rows[0][3],
+                    Value::Text(build.to_string()),
+                    "{label}"
+                );
+                assert_join(&mut db, nested_sql, "NestedLoopJoin", &lower, &label);
+                {
+                    let _nested = ForceNestedJoin::new();
+                    assert_join(&mut db, sql, "NestedLoopJoin", &expected, &label);
+                    assert_join(&mut db, reversed, "NestedLoopJoin", &expected, &label);
+                }
+                let dir = crate::test_dir::TestDir::new("distinct-ref");
+                let path = dir.join("db");
+                {
+                    let mut file = Database::open(&path).unwrap();
+                    load_sample(&mut file, &users, &orders);
+                }
+                Database::migrate(&path).unwrap();
+                let mut file = Database::open(&path).unwrap();
+                file.execute("CREATE INDEX idx_orders_user ON orders (user_id);")
+                    .unwrap();
+                let _index = ForceIndexJoin::new();
+                assert_join(&mut file, sql, "IndexNestedLoopJoin", &expected, &label);
+                assert_join(
+                    &mut file,
+                    reversed,
+                    "IndexNestedLoopJoin",
+                    &expected,
+                    &label,
+                );
+                assert_eq!(
+                    query(&mut file, &format!("EXPLAIN {sql}")).rows[0][4],
+                    Value::Text("idx_orders_user".to_string()),
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_distinct_join_collision_does_not_merge_unequal_tuples() {
+        let mut db = Database::new();
+        load_charge_join(&mut db);
+        let expected = independent_charge();
+        let sql = "SELECT DISTINCT u.name, o.amount
+            FROM users u JOIN orders o ON u.id = o.user_id;";
+        let _force = ForceHashCollision::new();
+        assert_eq!(query(&mut db, sql).rows, expected);
+        let _nested = ForceNestedJoin::new();
+        assert_eq!(query(&mut db, sql).rows, expected);
+    }
+
+    #[test]
+    fn duplicate_join_tuples_do_not_reserve_and_limit_does_not_hide_failure() {
+        let mut db = Database::new();
+        load_charge_join(&mut db);
+        {
+            let _budget = DistinctReserveBudget::limit(3);
+            assert_eq!(
+                query(
+                    &mut db,
+                    "SELECT DISTINCT u.name FROM users u
+                     JOIN orders o ON u.id = o.user_id
+                     WHERE u.name = 'Ada';",
+                )
+                .rows,
+                vec![vec![Value::Text("Ada".to_string())]]
+            );
+        }
+        {
+            let _budget = DistinctReserveBudget::limit(3);
+            let error = db
+                .execute(
+                    "SELECT DISTINCT u.name, o.amount
+                     FROM users u JOIN orders o ON u.id = o.user_id
+                     LIMIT 0;",
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "internal error: SELECT DISTINCT result is too large"
+            );
+        }
+        assert_eq!(
+            query(&mut db, "SELECT id FROM users;").rows,
+            vec![
+                vec![Value::Integer(1)],
+                vec![Value::Integer(1)],
+                vec![Value::Integer(2)]
+            ]
+        );
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT DISTINCT u.name, o.amount
+                 FROM users u JOIN orders o ON u.id = o.user_id;",
+            )
+            .rows,
+            independent_charge()
+        );
+    }
+
+    #[test]
+    fn explain_and_a_failed_distinct_join_do_not_write() {
+        let dir = crate::test_dir::TestDir::new("distinct-no-write");
+        let path = dir.join("db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            load_charge_join(&mut db);
+        }
+        let before = std::fs::read(&path).unwrap();
+        let wal = wal_len(&path);
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute(
+                "EXPLAIN SELECT DISTINCT u.name, o.amount
+                 FROM users u JOIN orders o ON u.id = o.user_id
+                 ORDER BY name ASC NULLS LAST LIMIT 1;",
+            )
+            .unwrap();
+            let _budget = DistinctReserveBudget::limit(3);
+            let error = db
+                .execute(
+                    "SELECT DISTINCT u.name, o.amount
+                     FROM users u JOIN orders o ON u.id = o.user_id
+                     LIMIT 1;",
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "internal error: SELECT DISTINCT result is too large"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(wal_len(&path), wal);
+        {
+            let mut db = Database::open(&path).unwrap();
+            assert_eq!(
+                query(
+                    &mut db,
+                    "SELECT DISTINCT u.name, o.amount
+                     FROM users u JOIN orders o ON u.id = o.user_id;",
+                )
+                .rows,
+                independent_charge()
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(wal_len(&path), wal);
+    }
+
+    fn wal_len(path: &std::path::Path) -> u64 {
+        let mut wal = path.as_os_str().to_owned();
+        wal.push(".wal");
+        std::fs::metadata(wal).map(|meta| meta.len()).unwrap_or(0)
+    }
+
+    fn load_later_inner(db: &mut Database, extra_users: bool) {
+        db.execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'A'), (2, 'A');")
+            .unwrap();
+        if extra_users {
+            db.execute("INSERT INTO users VALUES (3, 'Z'), (4, 'Y');")
+                .unwrap();
+        }
+        db.execute("INSERT INTO orders VALUES (2, 10), (1, 30), (1, 10);")
+            .unwrap();
+    }
+
+    fn load_charge_join(db: &mut Database) {
+        db.execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada'), (1, 'Ada'), (2, 'Bea');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 10), (1, 10), (2, 10), (2, 20);")
+            .unwrap();
+    }
+
+    fn independent_charge() -> Vec<Vec<Value>> {
+        vec![
+            vec![Value::Text("Ada".to_string()), Value::Integer(10)],
+            vec![Value::Text("Bea".to_string()), Value::Integer(10)],
+            vec![Value::Text("Bea".to_string()), Value::Integer(20)],
+        ]
+    }
+
+    fn assert_join(
+        db: &mut Database,
+        sql: &str,
+        access: &str,
+        expected: &[Vec<Value>],
+        label: &str,
+    ) {
+        let explained = query(db, &format!("EXPLAIN {sql}"));
+        assert_eq!(
+            explained.rows[0][0],
+            Value::Text(access.to_string()),
+            "{label} {sql}"
+        );
+        assert_eq!(
+            explained.rows[0][8],
+            Value::Text("HashDistinct".to_string()),
+            "{label}"
+        );
+        assert_eq!(query(db, sql).rows, expected, "{label} {sql}");
+    }
+
+    struct RefUser {
+        id: Option<i64>,
+        name: Option<String>,
+        active: Option<bool>,
+    }
+
+    struct RefOrder {
+        user_id: Option<i64>,
+        amount: Option<i64>,
+        paid: Option<bool>,
+    }
+
+    fn sample_join(seed: u64, users_n: usize, orders_n: usize) -> (Vec<RefUser>, Vec<RefOrder>) {
+        let mut state = seed | 1;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            state
+        };
+        let mut users = Vec::new();
+        for index in 0..users_n {
+            let draw = next();
+            let id = if draw % 5 == 0 {
+                None
+            } else if draw % 2 == 0 {
+                Some(i64::try_from(index % 3).unwrap_or(0))
+            } else {
+                Some(i64::try_from(index).unwrap_or(0))
+            };
+            let name = match draw % 7 {
+                0 => None,
+                1 => Some("Ada".to_string()),
+                2 => Some(format!("Ada{}", "x".repeat(40))),
+                _ => Some(format!("n{index}")),
+            };
+            let active = match draw % 3 {
+                0 => None,
+                1 => Some(true),
+                _ => Some(false),
+            };
+            users.push(RefUser { id, name, active });
+        }
+        let mut orders = Vec::new();
+        for index in 0..orders_n {
+            let draw = next();
+            let user_id = if draw % 6 == 0 {
+                None
+            } else {
+                Some(i64::try_from(index % 3).unwrap_or(0))
+            };
+            let amount = if draw % 4 == 0 {
+                None
+            } else {
+                Some(i64::try_from(index % 6).unwrap_or(0))
+            };
+            let paid = match draw % 3 {
+                0 => None,
+                1 => Some(true),
+                _ => Some(false),
+            };
+            orders.push(RefOrder {
+                user_id,
+                amount,
+                paid,
+            });
+        }
+        (users, orders)
+    }
+
+    fn independent_join(users: &[RefUser], orders: &[RefOrder], equality: bool) -> Vec<Vec<Value>> {
+        let mut kept = Vec::new();
+        for user in users {
+            for order in orders {
+                let keep = if equality {
+                    user.id.is_some()
+                        && user.id == order.user_id
+                        && order.paid == Some(true)
+                        && order.amount.is_some_and(|amount| amount > 0)
+                } else {
+                    matches!((user.id, order.user_id), (Some(left), Some(right)) if left < right)
+                };
+                if !keep {
+                    continue;
+                }
+                let row = if equality {
+                    vec![
+                        ref_text(&user.name),
+                        ref_int(order.amount),
+                        ref_bool(order.paid),
+                    ]
+                } else {
+                    vec![ref_text(&user.name), ref_int(order.amount)]
+                };
+                if !kept.iter().any(|seen| seen == &row) {
+                    kept.push(row);
+                }
+            }
+        }
+        kept
+    }
+
+    fn order_independent(mut rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+        rows.sort_by(|left, right| {
+            sql_order(&left[0], &right[0], true, false)
+                .then(sql_order(&left[1], &right[1], false, true))
+        });
+        rows.truncate(3);
+        rows
+    }
+
+    fn sql_order(left: &Value, right: &Value, ascending: bool, nulls_first: bool) -> Ordering {
+        match (left, right) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => {
+                if nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (_, Value::Null) => {
+                if nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (Value::Integer(left), Value::Integer(right)) => directed(left.cmp(right), ascending),
+            (Value::Text(left), Value::Text(right)) => directed(left.cmp(right), ascending),
+            (Value::Boolean(left), Value::Boolean(right)) => directed(left.cmp(right), ascending),
+            _ => Ordering::Equal,
+        }
+    }
+
+    fn directed(ordering: Ordering, ascending: bool) -> Ordering {
+        if ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        }
+    }
+
+    fn ref_text(value: &Option<String>) -> Value {
+        value.clone().map(Value::Text).unwrap_or(Value::Null)
+    }
+
+    fn ref_int(value: Option<i64>) -> Value {
+        value.map(Value::Integer).unwrap_or(Value::Null)
+    }
+
+    fn ref_bool(value: Option<bool>) -> Value {
+        value.map(Value::Boolean).unwrap_or(Value::Null)
+    }
+
+    fn load_sample(db: &mut Database, users: &[RefUser], orders: &[RefOrder]) {
+        db.execute("CREATE TABLE users (id INT, name TEXT, active BOOLEAN);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INT, amount INT, paid BOOLEAN);")
+            .unwrap();
+        if !users.is_empty() {
+            let mut sql = String::from("INSERT INTO users VALUES ");
+            for (index, user) in users.iter().enumerate() {
+                if index > 0 {
+                    sql.push(',');
+                }
+                sql.push('(');
+                push_sql_int(&mut sql, user.id);
+                sql.push(',');
+                push_sql_text(&mut sql, user.name.as_deref());
+                sql.push(',');
+                push_sql_bool(&mut sql, user.active);
+                sql.push(')');
+            }
+            sql.push(';');
+            db.execute(&sql).unwrap();
+        }
+        if !orders.is_empty() {
+            let mut sql = String::from("INSERT INTO orders VALUES ");
+            for (index, order) in orders.iter().enumerate() {
+                if index > 0 {
+                    sql.push(',');
+                }
+                sql.push('(');
+                push_sql_int(&mut sql, order.user_id);
+                sql.push(',');
+                push_sql_int(&mut sql, order.amount);
+                sql.push(',');
+                push_sql_bool(&mut sql, order.paid);
+                sql.push(')');
+            }
+            sql.push(';');
+            db.execute(&sql).unwrap();
+        }
+    }
+
+    fn push_sql_int(sql: &mut String, value: Option<i64>) {
+        match value {
+            Some(value) => sql.push_str(&value.to_string()),
+            None => sql.push_str("NULL"),
+        }
+    }
+
+    fn push_sql_text(sql: &mut String, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                sql.push('\'');
+                sql.push_str(value);
+                sql.push('\'');
+            }
+            None => sql.push_str("NULL"),
+        }
+    }
+
+    fn push_sql_bool(sql: &mut String, value: Option<bool>) {
+        match value {
+            Some(true) => sql.push_str("TRUE"),
+            Some(false) => sql.push_str("FALSE"),
+            None => sql.push_str("NULL"),
+        }
+    }
+
+    #[test]
     fn select_distinct_limit_does_not_hide_a_reservation_failure() {
         let mut db = Database::new();
         db.execute("CREATE TABLE names (name TEXT);").unwrap();
@@ -7452,6 +8275,420 @@ mod tests {
         println!(
             "milestone14 shape={shape} rows={rows} examined={examined} returned={returned} unique={unique} width={width} text_bytes={text_bytes} bytes={bytes} checksum={checksum} cold_us={cold} warm_us={warm}"
         );
+    }
+
+    #[test]
+    #[ignore = "release profile of SELECT DISTINCT over an INNER JOIN"]
+    fn profile_milestone16() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone16 cpu={cpu} mem_bytes={mem} rustc={rustc} value_bytes={} row_vec_bytes={} pair_pos_bytes={}",
+            std::mem::size_of::<Value>(),
+            std::mem::size_of::<Vec<Value>>(),
+            std::mem::size_of::<usize>().saturating_mul(2)
+        );
+        for rows in [100_i64, 1_000, 4_000, 10_000] {
+            profile_equal_hash(rows);
+            profile_duplicate_hash(rows);
+            profile_skew_hash(rows);
+            if rows <= 1_000 || rows == 4_000 {
+                profile_equal_nested(rows);
+            }
+            profile_equal_index(rows);
+            profile_skew_index(rows);
+        }
+    }
+
+    fn profile_equal_hash(rows: i64) {
+        let mut database = Database::new();
+        load_profile_join(&mut database, rows, rows, rows);
+        let names = 8_usize;
+        let amounts = profile_amount_count(rows);
+        let pairs = profile_name_amount_count(rows, rows, rows);
+        let tag_bytes = usize::try_from(rows)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(64);
+        profile_distinct_join_query(
+            &mut database,
+            "HashJoin",
+            rows,
+            rows,
+            rows,
+            "plain_name",
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+            usize::try_from(rows).unwrap_or(usize::MAX),
+            1,
+            usize::try_from(rows).unwrap_or(usize::MAX),
+            false,
+        );
+        profile_distinct_join_query(
+            &mut database,
+            "HashJoin",
+            rows,
+            rows,
+            rows,
+            "distinct_name",
+            "SELECT DISTINCT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+            names,
+            1,
+            names,
+            true,
+        );
+        profile_distinct_join_query(
+            &mut database,
+            "HashJoin",
+            rows,
+            rows,
+            rows,
+            "plain_ids",
+            "SELECT u.id, o.id FROM users u JOIN orders o ON u.id = o.user_id;",
+            usize::try_from(rows).unwrap_or(usize::MAX),
+            2,
+            0,
+            false,
+        );
+        profile_distinct_join_query(
+            &mut database,
+            "HashJoin",
+            rows,
+            rows,
+            rows,
+            "distinct_ids",
+            "SELECT DISTINCT u.id, o.id FROM users u JOIN orders o ON u.id = o.user_id;",
+            usize::try_from(rows).unwrap_or(usize::MAX),
+            2,
+            0,
+            true,
+        );
+        profile_distinct_join_query(
+            &mut database,
+            "HashJoin",
+            rows,
+            rows,
+            rows,
+            "distinct_amount",
+            "SELECT DISTINCT o.amount FROM users u JOIN orders o ON u.id = o.user_id;",
+            amounts,
+            1,
+            0,
+            true,
+        );
+        profile_distinct_join_query(
+            &mut database,
+            "HashJoin",
+            rows,
+            rows,
+            rows,
+            "distinct_tag",
+            "SELECT DISTINCT u.tag FROM users u JOIN orders o ON u.id = o.user_id;",
+            usize::try_from(rows).unwrap_or(usize::MAX),
+            1,
+            tag_bytes,
+            true,
+        );
+        profile_distinct_join_query(
+            &mut database,
+            "HashJoin",
+            rows,
+            rows,
+            rows,
+            "distinct_order_limit",
+            "SELECT DISTINCT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id ORDER BY name ASC, amount ASC LIMIT 5;",
+            pairs,
+            2,
+            pairs,
+            true,
+        );
+    }
+
+    fn profile_duplicate_hash(rows: i64) {
+        let mut database = Database::new();
+        load_profile_join(&mut database, rows, rows, 10);
+        profile_distinct_join_query(
+            &mut database,
+            "HashJoin",
+            rows,
+            rows,
+            rows,
+            "dup_plain_name",
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+            usize::try_from(rows).unwrap_or(usize::MAX),
+            1,
+            usize::try_from(rows).unwrap_or(usize::MAX),
+            false,
+        );
+        profile_distinct_join_query(
+            &mut database,
+            "HashJoin",
+            rows,
+            rows,
+            rows,
+            "dup_distinct_name",
+            "SELECT DISTINCT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+            8,
+            1,
+            8,
+            true,
+        );
+    }
+
+    fn profile_skew_hash(rows: i64) {
+        let users = (rows / 100).max(1);
+        let mut database = Database::new();
+        load_profile_join(&mut database, users, rows, users);
+        profile_distinct_join_query(
+            &mut database,
+            "HashJoin",
+            users,
+            rows,
+            rows,
+            "skew_distinct_name",
+            "SELECT DISTINCT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+            profile_name_count(users),
+            1,
+            profile_name_count(users),
+            true,
+        );
+    }
+
+    fn profile_equal_nested(rows: i64) {
+        let mut database = Database::new();
+        load_profile_join(&mut database, rows, rows, rows);
+        let _force = ForceNestedJoin::new();
+        profile_distinct_join_query(
+            &mut database,
+            "NestedLoopJoin",
+            rows,
+            rows,
+            rows,
+            "distinct_name",
+            "SELECT DISTINCT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+            8,
+            1,
+            8,
+            true,
+        );
+        if rows <= 1_000 {
+            profile_distinct_join_query(
+                &mut database,
+                "NestedLoopJoin",
+                rows,
+                rows,
+                rows,
+                "distinct_ids",
+                "SELECT DISTINCT u.id, o.id FROM users u JOIN orders o ON u.id = o.user_id;",
+                usize::try_from(rows).unwrap_or(usize::MAX),
+                2,
+                0,
+                true,
+            );
+        }
+    }
+
+    fn profile_equal_index(rows: i64) {
+        let dir = crate::test_dir::TestDir::new("profile-m16-equal");
+        let path = dir.join("db");
+        {
+            let mut database = Database::open(&path).unwrap();
+            load_profile_join(&mut database, rows, rows, rows);
+        }
+        Database::migrate(&path).unwrap();
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE INDEX idx_orders_user ON orders (user_id);")
+            .unwrap();
+        let _force = ForceIndexJoin::new();
+        profile_distinct_join_query(
+            &mut database,
+            "IndexNestedLoopJoin",
+            rows,
+            rows,
+            rows,
+            "distinct_name",
+            "SELECT DISTINCT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+            8,
+            1,
+            8,
+            true,
+        );
+        profile_distinct_join_query(
+            &mut database,
+            "IndexNestedLoopJoin",
+            rows,
+            rows,
+            rows,
+            "distinct_ids",
+            "SELECT DISTINCT u.id, o.id FROM users u JOIN orders o ON u.id = o.user_id;",
+            usize::try_from(rows).unwrap_or(usize::MAX),
+            2,
+            0,
+            true,
+        );
+    }
+
+    fn profile_skew_index(rows: i64) {
+        let users = (rows / 100).max(1);
+        let dir = crate::test_dir::TestDir::new("profile-m16-skew");
+        let path = dir.join("db");
+        {
+            let mut database = Database::open(&path).unwrap();
+            load_profile_join(&mut database, users, rows, users);
+        }
+        Database::migrate(&path).unwrap();
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE INDEX idx_orders_user ON orders (user_id);")
+            .unwrap();
+        let names = profile_name_count(users);
+        profile_distinct_join_query(
+            &mut database,
+            "IndexNestedLoopJoin",
+            users,
+            rows,
+            rows,
+            "skew_distinct_name",
+            "SELECT DISTINCT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+            names,
+            1,
+            names,
+            true,
+        );
+    }
+
+    fn load_profile_join(database: &mut Database, users: i64, orders: i64, user_mod: i64) {
+        database
+            .execute("CREATE TABLE users (id INT, name TEXT, tag TEXT);")
+            .unwrap();
+        database
+            .execute("CREATE TABLE orders (id INT, user_id INT, amount INT);")
+            .unwrap();
+        let mut start = 0_i64;
+        while start < users {
+            let end = (start + 200).min(users);
+            let mut sql = String::from("INSERT INTO users VALUES ");
+            for id in start..end {
+                if id > start {
+                    sql.push(',');
+                }
+                let name = (b'a' + u8::try_from(id % 8).unwrap_or(0)) as char;
+                sql.push_str(&format!("({id}, '{name}', '{id:064}')"));
+            }
+            sql.push(';');
+            database.execute(&sql).unwrap();
+            start = end;
+        }
+        start = 0;
+        while start < orders {
+            let end = (start + 200).min(orders);
+            let mut sql = String::from("INSERT INTO orders VALUES ");
+            for id in start..end {
+                if id > start {
+                    sql.push(',');
+                }
+                let user = id % user_mod;
+                if id % 2 == 0 {
+                    sql.push_str(&format!("({id}, {user}, NULL)"));
+                } else {
+                    sql.push_str(&format!("({id}, {user}, {})", id % 5));
+                }
+            }
+            sql.push(';');
+            database.execute(&sql).unwrap();
+            start = end;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn profile_distinct_join_query(
+        database: &mut Database,
+        strategy: &str,
+        users: i64,
+        orders: i64,
+        matches: i64,
+        shape: &str,
+        sql: &str,
+        unique: usize,
+        width: usize,
+        text_bytes: usize,
+        distinct: bool,
+    ) {
+        let explained = query(database, &format!("EXPLAIN {sql}"));
+        let access = match &explained.rows[0][0] {
+            Value::Text(access) => access.clone(),
+            other => panic!("access cell {other:?}"),
+        };
+        assert_eq!(access, strategy, "{shape} users={users} orders={orders}");
+        let returned_expect = if shape.contains("order_limit") {
+            unique.min(5)
+        } else if distinct {
+            unique
+        } else {
+            usize::try_from(matches).unwrap_or(usize::MAX)
+        };
+        let bytes = if distinct {
+            distinct_output_bytes(unique, width, text_bytes)
+        } else {
+            projected_output_bytes(returned_expect, width, text_bytes)
+        };
+        let pair_bytes = if strategy == "HashJoin" && orders > users {
+            usize::try_from(matches)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(std::mem::size_of::<usize>().saturating_mul(2))
+        } else {
+            0
+        };
+        let mut samples = Vec::with_capacity(6);
+        let mut checksum = 0_i64;
+        let mut returned = 0_usize;
+        for _ in 0..6 {
+            let started = std::time::Instant::now();
+            let result = query(database, sql);
+            samples.push(started.elapsed().as_micros());
+            assert_eq!(result.rows.len(), returned_expect, "{shape}");
+            checksum = profile_checksum(&result);
+            returned = result.rows.len();
+        }
+        let cold = samples[0];
+        let mut warm = samples[1..].to_vec();
+        warm.sort_unstable();
+        let warm = warm[warm.len() / 2];
+        println!(
+            "milestone16 strategy={strategy} shape={shape} users={users} orders={orders} matches={matches} returned={returned} unique={unique} width={width} text_bytes={text_bytes} distinct_bytes={bytes} pair_bytes={pair_bytes} checksum={checksum} cold_us={cold} warm_us={warm}"
+        );
+    }
+
+    fn profile_name_count(users: i64) -> usize {
+        usize::try_from(users.min(8)).unwrap_or(8)
+    }
+
+    fn profile_amount_count(orders: i64) -> usize {
+        let mut seen = Vec::new();
+        for id in 0..orders {
+            let amount = if id % 2 == 0 { None } else { Some(id % 5) };
+            if !seen.contains(&amount) {
+                seen.push(amount);
+            }
+        }
+        seen.len()
+    }
+
+    fn profile_name_amount_count(users: i64, orders: i64, user_mod: i64) -> usize {
+        let mut seen = Vec::new();
+        for id in 0..orders {
+            let user = id % user_mod;
+            if user >= users {
+                continue;
+            }
+            let name = (b'a' + u8::try_from(user % 8).unwrap_or(0)) as char;
+            let amount = if id % 2 == 0 { None } else { Some(id % 5) };
+            let key = (name, amount);
+            if !seen.contains(&key) {
+                seen.push(key);
+            }
+        }
+        seen.len()
     }
 
     fn profile_checksum(result: &QueryResult) -> i64 {

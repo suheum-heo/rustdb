@@ -175,6 +175,11 @@ pub(crate) enum Projection {
         /// Table name or alias that owns the columns.
         qualifier: String,
     },
+    /// `SELECT a.*, b.*`. Each qualifier is expanded in list order.
+    QualifiedStars {
+        /// Table names or aliases, in select-list order.
+        qualifiers: Vec<String>,
+    },
     /// Explicit columns and aggregates, in output order.
     Columns(Vec<SelectItem>),
 }
