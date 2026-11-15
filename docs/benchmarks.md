@@ -644,3 +644,56 @@ Equal sizes build the inner table, so the hash position buffer is empty. The pla
 
 At 10,000 by 10,000, warm hash plain `name` is 1,299 µs and warm `DISTINCT name` over 8 values is 1,435 µs. The distinct set is 776 bytes. Warm hash plain ids is 1,195 µs and warm `DISTINCT` ids over 10,000 pairs is 2,598 µs, with a 1,280,000-byte estimate. Warm `DISTINCT tag` over 10,000 strings, 640,000 text bytes, is 2,681 µs and the estimate is 1,600,000 bytes. Warm `DISTINCT amount` over 6 values, half of them NULL, is 1,402 µs. Warm `ORDER BY name, amount LIMIT 5` is 1,555 µs and still stores 24 pairs. The duplicate-key hash, ten distinct `user_id` values, is 852 µs warm for the plain name list and 1,088 µs warm for `DISTINCT name`. Forced nested loop of the 4,000 by 4,000 name query is 101,808 µs warm against 718 µs for the hash join of the same statement. Forced index nested loop of the 10,000 by 10,000 id query is 9,535 µs warm against 2,598 µs for hash. The planner still uses hash for that equal input. On the skewed 100 by 10,000 input the hash join is 918 µs warm and holds a 160,000-byte position buffer. The index probe the planner selects there is 1,063 µs warm and does not hold that buffer.
 
+## Milestone 18 LEFT JOIN
+
+Release profile `profile_milestone18`, re-run 15 Nov 2026. Apple M5, 17179869184 bytes of memory, `rustc 1.100.0 (0ef1bc386 2026-11-09)`. `Value` is 32 bytes and a row vector header is 24 bytes. The warm time is the median of the next five samples. The cold time is the first sample. A wrong row count fails the run. Checksums are the printed wrapping sums of the returned cells.
+
+Every plan is `LeftNestedLoopJoin`. The loop compares each left row with each right row, so the examined count is `users * orders`. It is not an O(N) or O(N log N) join. `LIMIT` does not stop the comparisons. `matched` counts `ON` results that are TRUE. `null-extended` counts left rows with no TRUE `ON` result, before `WHERE`. A 10,000 by 10,000 run was not taken.
+
+`matched` gives every order `user_id = id`, so a user matches only when an order has that same id. `none` sets every `user_id` to -1. `few` points every order at user 0. `duplicates` uses `user_id = id % 10`. `where` is the matched input with `amount > orders / 2`. `order_limit` is the matched input with `ORDER BY amount ASC LIMIT 5`. Bytes estimate the rows held before the result is returned: projected pairs for the unsorted shapes, and the full four-column joined rows for the sort. That estimate is not process RSS.
+
+| Shape | Users | Orders | Examined | Matched | Null-extended | Returned | Bytes | Cold | Warm |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| matched | 100 | 100 | 10,000 | 100 | 0 | 100 | 8,800 | 162 µs | 114 µs |
+| none | 100 | 100 | 10,000 | 0 | 100 | 100 | 8,800 | 111 µs | 110 µs |
+| few | 100 | 100 | 10,000 | 100 | 99 | 199 | 17,512 | 114 µs | 112 µs |
+| duplicates | 100 | 100 | 10,000 | 100 | 90 | 190 | 16,720 | 111 µs | 111 µs |
+| where | 100 | 100 | 10,000 | 100 | 0 | 49 | 4,312 | 125 µs | 111 µs |
+| order limit | 100 | 100 | 10,000 | 100 | 0 | 5 | 15,200 | 139 µs | 112 µs |
+| matched | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 1,000 | 88,000 | 8,537 µs | 6,817 µs |
+| none | 1,000 | 1,000 | 1,000,000 | 0 | 1,000 | 1,000 | 88,000 | 6,389 µs | 6,490 µs |
+| few | 1,000 | 1,000 | 1,000,000 | 1,000 | 999 | 1,999 | 175,912 | 6,525 µs | 6,513 µs |
+| duplicates | 1,000 | 1,000 | 1,000,000 | 1,000 | 990 | 1,990 | 175,120 | 6,437 µs | 6,517 µs |
+| where | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 499 | 43,912 | 6,417 µs | 6,516 µs |
+| order limit | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 5 | 152,000 | 6,406 µs | 6,449 µs |
+| matched | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 4,000 | 352,000 | 101,294 µs | 100,684 µs |
+| none | 4,000 | 4,000 | 16,000,000 | 0 | 4,000 | 4,000 | 352,000 | 100,705 µs | 100,338 µs |
+| few | 4,000 | 4,000 | 16,000,000 | 4,000 | 3,999 | 7,999 | 703,912 | 99,428 µs | 99,781 µs |
+| duplicates | 4,000 | 4,000 | 16,000,000 | 4,000 | 3,990 | 7,990 | 703,120 | 101,003 µs | 100,507 µs |
+| where | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 1,999 | 175,912 | 100,776 µs | 100,624 µs |
+| order limit | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 5 | 608,000 | 101,710 µs | 101,379 µs |
+| matched | 100 | 4,000 | 400,000 | 100 | 0 | 100 | 8,800 | 2,623 µs | 2,562 µs |
+| none | 100 | 4,000 | 400,000 | 0 | 100 | 100 | 8,800 | 2,568 µs | 2,525 µs |
+| duplicates | 100 | 4,000 | 400,000 | 4,000 | 90 | 4,090 | 359,920 | 2,580 µs | 2,679 µs |
+| where | 100 | 4,000 | 400,000 | 100 | 0 | 0 | 0 | 2,539 µs | 2,533 µs |
+| order limit | 100 | 4,000 | 400,000 | 100 | 0 | 5 | 15,200 | 2,496 µs | 2,518 µs |
+| matched | 4,000 | 100 | 400,000 | 100 | 3,900 | 4,000 | 352,000 | 2,606 µs | 2,693 µs |
+| none | 4,000 | 100 | 400,000 | 0 | 4,000 | 4,000 | 352,000 | 2,662 µs | 2,622 µs |
+| duplicates | 4,000 | 100 | 400,000 | 100 | 3,990 | 4,090 | 359,920 | 2,669 µs | 2,669 µs |
+| where | 4,000 | 100 | 400,000 | 100 | 3,900 | 49 | 4,312 | 2,681 µs | 2,627 µs |
+| order limit | 4,000 | 100 | 400,000 | 100 | 3,900 | 5 | 608,000 | 2,684 µs | 2,720 µs |
+| matched | 1,000 | 4,000 | 4,000,000 | 1,000 | 0 | 1,000 | 88,000 | 25,560 µs | 25,146 µs |
+| none | 1,000 | 4,000 | 4,000,000 | 0 | 1,000 | 1,000 | 88,000 | 25,077 µs | 25,278 µs |
+| duplicates | 1,000 | 4,000 | 4,000,000 | 4,000 | 990 | 4,990 | 439,120 | 25,783 µs | 25,525 µs |
+| where | 1,000 | 4,000 | 4,000,000 | 1,000 | 0 | 0 | 0 | 25,483 µs | 25,530 µs |
+| order limit | 1,000 | 4,000 | 4,000,000 | 1,000 | 0 | 5 | 152,000 | 25,275 µs | 25,349 µs |
+| matched | 4,000 | 1,000 | 4,000,000 | 1,000 | 3,000 | 4,000 | 352,000 | 25,218 µs | 25,663 µs |
+| none | 4,000 | 1,000 | 4,000,000 | 0 | 4,000 | 4,000 | 352,000 | 25,700 µs | 25,561 µs |
+| duplicates | 4,000 | 1,000 | 4,000,000 | 1,000 | 3,990 | 4,990 | 439,120 | 25,772 µs | 25,333 µs |
+| where | 4,000 | 1,000 | 4,000,000 | 1,000 | 3,000 | 499 | 43,912 | 25,234 µs | 25,411 µs |
+| order limit | 4,000 | 1,000 | 4,000,000 | 1,000 | 3,000 | 5 | 608,000 | 25,410 µs | 25,507 µs |
+
+At 4,000 by 4,000 the six shapes take about 101 ms warm and still examine all 16,000,000 pairs. The 4,000,000-pair runs take about 25 ms warm, about four times the 1,000 by 1,000 matched run and about a quarter of the square 4,000 run. The 100 by 4,000 and 4,000 by 100 runs examine the same 400,000 pairs and take about 2.6 ms warm in either orientation. Copying the smaller input does not change that cost.
+
+`where` on 100 by 4,000 returns 0 rows. Every user matched an order, those amounts are 0 through 99, and `amount > 2000` removes them. It does not add a null-extended row. `where` on 4,000 by 100 keeps 49 matches and drops the 3,900 null-extended rows. The 4,000 by 100 sort still holds all 4,000 joined rows, 608,000 bytes, and returns 5. The nested loop is the bottleneck. Neither a hash table nor an index is used.
+

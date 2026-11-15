@@ -99,15 +99,27 @@ pub(crate) struct SelectQuery {
 pub(crate) enum QueryFrom {
     /// One table.
     Table(TableRef),
-    /// `INNER JOIN` of two tables. `JOIN` without `OUTER` is this form.
+    /// One join of two tables. `JOIN` without `OUTER` is an inner join.
     Join {
+        /// Inner or left outer.
+        kind: JoinKind,
         /// Left input. Nested-loop order walks this table first.
         outer: TableRef,
         /// Right input.
         inner: TableRef,
-        /// Join condition. A pair is kept only when this is TRUE.
+        /// Join condition. A pair matches only when this is TRUE.
         on: Expr,
     },
+}
+
+/// Which two-table join the query wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinKind {
+    /// Keep a left row only when some right row makes `ON` TRUE.
+    Inner,
+    /// Keep every left row. A left row with no TRUE `ON` match is extended
+    /// with NULL for each right column.
+    Left,
 }
 
 /// One table in `FROM`, with the name queries use for it.

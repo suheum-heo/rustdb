@@ -4,7 +4,8 @@
 //! for case-insensitive names. Quoted identifiers keep their case and are
 //! matched exactly. Unsupported clauses are rejected here so execution cannot
 //! silently ignore `ORDER BY`, constraints, or a join this engine does not
-//! run. A `SELECT` may name one table or one `INNER JOIN` of two tables.
+//! run. A `SELECT` may name one table, one `INNER JOIN`, or one `LEFT JOIN`
+//! of two tables.
 
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CreateTable, CreateTableOptions, DataType as SqlDataType,
@@ -19,8 +20,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::ast::{
-    AggregateArg, AggregateCall, AggregateFunction, Assignment, BinOp, Expr, OrderKey, OrderTarget,
-    Projection, QueryFrom, SelectColumn, SelectItem, SelectQuery, Statement, TableRef,
+    AggregateArg, AggregateCall, AggregateFunction, Assignment, BinOp, Expr, JoinKind, OrderKey,
+    OrderTarget, Projection, QueryFrom, SelectColumn, SelectItem, SelectQuery, Statement, TableRef,
 };
 use crate::error::DbError;
 use crate::schema::Column;
@@ -547,6 +548,13 @@ fn convert_select(
         .transpose()?;
     let group_by = convert_group_by(&select.group_by)?;
     let having = select.having.as_ref().map(convert_having).transpose()?;
+    if let QueryFrom::Join {
+        kind: JoinKind::Left,
+        ..
+    } = &table
+    {
+        reject_left_join(distinct, &projection, &group_by, having.as_ref(), &order_by)?;
+    }
     if distinct {
         reject_distinct_query(&table, &projection, &group_by, having.as_ref(), &order_by)?;
     }
@@ -571,6 +579,48 @@ fn select_distinct(select: &Select) -> Result<bool, DbError> {
         Some(Distinct::All) => Err(DbError::unsupported("ALL is not supported")),
         Some(Distinct::On(_)) => Err(DbError::unsupported("DISTINCT ON is not supported")),
     }
+}
+
+/// `LEFT JOIN` is a non-aggregate query. `DISTINCT`, `GROUP BY`, `HAVING`,
+/// and aggregates stay rejected so a left join cannot be planned as an inner join.
+fn reject_left_join(
+    distinct: bool,
+    projection: &Projection,
+    group_by: &[SelectColumn],
+    having: Option<&Expr>,
+    order_by: &[OrderKey],
+) -> Result<(), DbError> {
+    if distinct {
+        return Err(DbError::unsupported(
+            "LEFT JOIN is not supported with DISTINCT",
+        ));
+    }
+    if !group_by.is_empty() {
+        return Err(DbError::unsupported(
+            "LEFT JOIN is not supported with GROUP BY",
+        ));
+    }
+    if having.is_some() {
+        return Err(DbError::unsupported(
+            "LEFT JOIN is not supported with HAVING",
+        ));
+    }
+    let aggregate = match projection {
+        Projection::All | Projection::QualifiedAll { .. } | Projection::QualifiedStars { .. } => {
+            false
+        }
+        Projection::Columns(items) => items
+            .iter()
+            .any(|item| matches!(item, SelectItem::Aggregate { .. })),
+    } || order_by
+        .iter()
+        .any(|key| matches!(key.target, OrderTarget::Aggregate(_)));
+    if aggregate {
+        return Err(DbError::unsupported(
+            "LEFT JOIN is not supported with aggregate functions",
+        ));
+    }
+    Ok(())
 }
 
 /// `SELECT DISTINCT` covers one table or one non-aggregate `INNER JOIN`.
@@ -665,27 +715,34 @@ fn convert_from(select: &Select) -> Result<QueryFrom, DbError> {
         return Err(DbError::unsupported("GLOBAL JOIN is not supported"));
     }
     let inner = table_ref(&join.relation)?;
-    let on = inner_join_condition(&join.join_operator)?;
-    Ok(QueryFrom::Join { outer, inner, on })
+    let (kind, constraint) = join_kind(&join.join_operator)?;
+    let on = join_condition(constraint)?;
+    Ok(QueryFrom::Join {
+        kind,
+        outer,
+        inner,
+        on,
+    })
 }
 
-fn inner_join_condition(operator: &JoinOperator) -> Result<Expr, DbError> {
-    let constraint = match operator {
-        JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => constraint,
-        JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => {
-            return Err(DbError::unsupported("LEFT JOIN is not supported"));
+fn join_kind(operator: &JoinOperator) -> Result<(JoinKind, &JoinConstraint), DbError> {
+    match operator {
+        JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
+            Ok((JoinKind::Inner, constraint))
+        }
+        JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
+            Ok((JoinKind::Left, constraint))
         }
         JoinOperator::Right(_) | JoinOperator::RightOuter(_) => {
-            return Err(DbError::unsupported("RIGHT JOIN is not supported"));
+            Err(DbError::unsupported("RIGHT JOIN is not supported"))
         }
-        JoinOperator::FullOuter(_) => {
-            return Err(DbError::unsupported("FULL JOIN is not supported"));
-        }
-        JoinOperator::CrossJoin(_) => {
-            return Err(DbError::unsupported("CROSS JOIN is not supported"));
-        }
-        _ => return Err(DbError::unsupported("this JOIN is not supported")),
-    };
+        JoinOperator::FullOuter(_) => Err(DbError::unsupported("FULL JOIN is not supported")),
+        JoinOperator::CrossJoin(_) => Err(DbError::unsupported("CROSS JOIN is not supported")),
+        _ => Err(DbError::unsupported("this JOIN is not supported")),
+    }
+}
+
+fn join_condition(constraint: &JoinConstraint) -> Result<Expr, DbError> {
     match constraint {
         JoinConstraint::On(expr) => convert_expr_in(expr, Some("ON")),
         JoinConstraint::Using(_) | JoinConstraint::UsingAlias(_, _) => {
@@ -1559,9 +1616,16 @@ mod tests {
                 .unwrap();
         match &statements[0] {
             Statement::Select(query) => {
-                let QueryFrom::Join { outer, inner, on } = &query.from else {
+                let QueryFrom::Join {
+                    kind,
+                    outer,
+                    inner,
+                    on,
+                } = &query.from
+                else {
                     panic!("expected a join");
                 };
+                assert_eq!(*kind, JoinKind::Inner);
                 assert_eq!(outer.name, "users");
                 assert_eq!(outer.alias, "u");
                 assert_eq!(inner.name, "orders");
@@ -1590,9 +1654,28 @@ mod tests {
             other => panic!("expected a join, got {other:?}"),
         }
 
-        let error = parse("SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id;")
+        let left =
+            parse("SELECT u.*, o.* FROM users u LEFT OUTER JOIN orders o ON u.id = o.user_id;")
+                .unwrap();
+        match &left[0] {
+            Statement::Select(query) => {
+                let QueryFrom::Join { kind, .. } = &query.from else {
+                    panic!("expected a left join");
+                };
+                assert_eq!(*kind, JoinKind::Left);
+            }
+            other => panic!("expected a select, got {other:?}"),
+        }
+        let error =
+            parse("SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id;")
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "LEFT JOIN is not supported with DISTINCT"
+        );
+        let error = parse("SELECT * FROM users RIGHT JOIN orders ON users.id = orders.user_id;")
             .unwrap_err();
-        assert_eq!(error.to_string(), "LEFT JOIN is not supported");
+        assert_eq!(error.to_string(), "RIGHT JOIN is not supported");
         let error = parse(
             "SELECT * FROM users JOIN orders ON users.id = orders.user_id JOIN notes ON notes.id = users.id;",
         )
