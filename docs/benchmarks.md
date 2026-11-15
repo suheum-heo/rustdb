@@ -759,3 +759,140 @@ Hash bytes are `8 * positions + 64 * groups` on this machine: one word per build
 | order limit | 10,000 | 1,000 | 1,000 | 10,000,000 | 1,000 | 9,000 | 5 | 72,000 | 88,000 | 683 µs | 628 µs | 63,281 µs | 65,892 µs | 104.9× |
 
 At 10,000 by 10,000 the matched hash join is 1,222 µs warm and examines 10,000 key hits. The nested loop of the same statement is 656,625 µs warm and examines 100,000,000 pairs, 537.3× slower. The unmatched shape is 888.8× because the hash probe finds no key and still emits one null-extended row per left row. The residual shape is 1,042.5×: the hash still examines 10,000 candidates, and the nested loop evaluates the extra comparison on every pair. A duplicate key that matches every left row still walks that whole bucket, so this is not a linear worst case under a forced collision or extreme multiplicity. Hashing the larger right side is the cost of keeping left order without a pair buffer. On 100 by 4,000 matched, the hash table is 288,000 bytes for 4,000 right keys while the copied input is only the 100 left rows, 8,800 bytes, and the speedup is 7.8×. On 4,000 by 100 the same 400,000 nested pairs become a 7,200-byte hash of 100 right keys and the speedup is 13.4×. `where` on 100 by 4,000 and 1,000 by 10,000 returns 0 rows: every left row had an `ON` match, and `WHERE` removed those pairs without adding a null-extended row. Checksums for the square matched runs are 5,050; 500,500; 8,002,000; and 50,005,000. The 100 by 4,000 `where` checksum is 0. The 4,000 by 100 `where` checksum is 3,724.
+
+## Milestone 20 aggregation over LEFT JOIN
+
+Release profile `profile_milestone20`, 15 Nov 2026. Apple M5, 17179869184 bytes of memory, `rustc 1.100.0 (0ef1bc386 2026-11-09)`. `Value` is 32 bytes, one aggregate accumulator is 48 bytes, and a row vector header is 24 bytes. The warm time is the median of the next five samples. The cold time is the first sample. A checksum mismatch between `HashLeftJoin` and the same statement forced through `LeftNestedLoopJoin` fails the run. Both paths produced the printed checksum.
+
+`plain` is the join without an aggregate. `count_star` is `COUNT(*)`. `count_amount` is `COUNT(o.amount)`. `group` is `GROUP BY u.name` with `COUNT(*)`. User names are eight repeating letters, so that query has at most eight groups. `multi` is `SUM`, `AVG`, `MIN`, and `MAX` of `amount` with no `GROUP BY`. `matched` sets `user_id = id` and `amount = id`. `none` sets every `user_id` to -1. `duplicates` uses `user_id = id % 10`. `nulls` is the matched key with a NULL amount. `where` puts `amount > orders / 2` in `WHERE`. `residual` puts that comparison in `ON`. The 10,000 by 10,000 `plain` join is not in this run. The four aggregate forms are.
+
+`examined` is the hash path's exact-key hits, including hits a residual `ON` later rejects. It is not `users * orders`. The nested column examines every pair. `matched` counts `ON` results that are TRUE. `null-extended` counts left rows with no TRUE `ON` result, before `WHERE`. `inputs` is the logical rows that reach the aggregate, or the returned rows for `plain`. `groups` is the result row count. A scalar aggregate with no surviving input still has one group. `GROUP BY` over no surviving input has zero. Aggregate-state bytes are `groups * (24 + 32 + aggregates * 48)`: one vector header, one key cell, and one 48-byte accumulator per aggregate. A scalar query has no group key, so that 32-byte term is an upper bound. The figure excludes the hash table, the copied input, allocator slack, and process RSS. The joined pairs are not stored. Speedup is nested warm divided by hash warm.
+
+| Kind | Shape | Users | Orders | Hash examined | Nested examined | Matched | Null-extended | Inputs | Groups | Acc bytes | Hash cold | Hash warm | Nested cold | Nested warm | Speedup | Checksum |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| plain | matched | 100 | 100 | 100 | 10,000 | 100 | 0 | 100 | 100 | 0 | 51 µs | 32 µs | 111 µs | 109 µs | 3.4× | 5,050 |
+| count_star | matched | 100 | 100 | 100 | 10,000 | 100 | 0 | 100 | 1 | 104 | 46 µs | 28 µs | 107 µs | 106 µs | 3.8× | 100 |
+| count_amount | matched | 100 | 100 | 100 | 10,000 | 100 | 0 | 100 | 1 | 104 | 30 µs | 29 µs | 109 µs | 107 µs | 3.7× | 100 |
+| group | matched | 100 | 100 | 100 | 10,000 | 100 | 0 | 100 | 8 | 832 | 49 µs | 34 µs | 106 µs | 107 µs | 3.1× | 108 |
+| multi | matched | 100 | 100 | 100 | 10,000 | 100 | 0 | 100 | 1 | 248 | 46 µs | 37 µs | 113 µs | 113 µs | 3.1× | 5,150 |
+| plain | none | 100 | 100 | 0 | 10,000 | 0 | 100 | 100 | 100 | 0 | 23 µs | 20 µs | 100 µs | 99 µs | 5.0× | 100 |
+| count_star | none | 100 | 100 | 0 | 10,000 | 0 | 100 | 100 | 1 | 104 | 21 µs | 20 µs | 99 µs | 99 µs | 5.0× | 100 |
+| count_amount | none | 100 | 100 | 0 | 10,000 | 0 | 100 | 100 | 1 | 104 | 19 µs | 18 µs | 96 µs | 96 µs | 5.3× | 0 |
+| group | none | 100 | 100 | 0 | 10,000 | 0 | 100 | 100 | 8 | 832 | 30 µs | 26 µs | 102 µs | 101 µs | 3.9× | 108 |
+| multi | none | 100 | 100 | 0 | 10,000 | 0 | 100 | 100 | 1 | 248 | 28 µs | 25 µs | 100 µs | 98 µs | 3.9× | 0 |
+| plain | duplicates | 100 | 100 | 100 | 10,000 | 100 | 90 | 190 | 190 | 0 | 25 µs | 23 µs | 94 µs | 94 µs | 4.1× | 5,140 |
+| count_star | duplicates | 100 | 100 | 100 | 10,000 | 100 | 90 | 190 | 1 | 104 | 24 µs | 23 µs | 95 µs | 96 µs | 4.2× | 190 |
+| count_amount | duplicates | 100 | 100 | 100 | 10,000 | 100 | 90 | 190 | 1 | 104 | 23 µs | 22 µs | 93 µs | 93 µs | 4.2× | 100 |
+| group | duplicates | 100 | 100 | 100 | 10,000 | 100 | 90 | 190 | 8 | 832 | 34 µs | 33 µs | 106 µs | 105 µs | 3.2× | 198 |
+| multi | duplicates | 100 | 100 | 100 | 10,000 | 100 | 90 | 190 | 1 | 248 | 33 µs | 32 µs | 103 µs | 103 µs | 3.2× | 5,150 |
+| plain | nulls | 100 | 100 | 100 | 10,000 | 100 | 0 | 100 | 100 | 0 | 25 µs | 24 µs | 93 µs | 93 µs | 3.9× | 100 |
+| count_star | nulls | 100 | 100 | 100 | 10,000 | 100 | 0 | 100 | 1 | 104 | 25 µs | 22 µs | 87 µs | 87 µs | 4.0× | 100 |
+| count_amount | nulls | 100 | 100 | 100 | 10,000 | 100 | 0 | 100 | 1 | 104 | 22 µs | 21 µs | 84 µs | 84 µs | 4.0× | 0 |
+| group | nulls | 100 | 100 | 100 | 10,000 | 100 | 0 | 100 | 8 | 832 | 30 µs | 30 µs | 95 µs | 95 µs | 3.2× | 108 |
+| multi | nulls | 100 | 100 | 100 | 10,000 | 100 | 0 | 100 | 1 | 248 | 30 µs | 29 µs | 91 µs | 91 µs | 3.1× | 0 |
+| plain | where | 100 | 100 | 100 | 10,000 | 100 | 0 | 49 | 49 | 0 | 26 µs | 24 µs | 89 µs | 89 µs | 3.7× | 3,724 |
+| count_star | where | 100 | 100 | 100 | 10,000 | 100 | 0 | 49 | 1 | 104 | 25 µs | 24 µs | 88 µs | 88 µs | 3.7× | 49 |
+| count_amount | where | 100 | 100 | 100 | 10,000 | 100 | 0 | 49 | 1 | 104 | 25 µs | 24 µs | 87 µs | 85 µs | 3.5× | 49 |
+| group | where | 100 | 100 | 100 | 10,000 | 100 | 0 | 49 | 8 | 832 | 29 µs | 28 µs | 89 µs | 89 µs | 3.2× | 57 |
+| multi | where | 100 | 100 | 100 | 10,000 | 100 | 0 | 49 | 1 | 248 | 33 µs | 31 µs | 92 µs | 91 µs | 2.9× | 3,901 |
+| plain | residual | 100 | 100 | 100 | 10,000 | 49 | 51 | 100 | 100 | 0 | 27 µs | 24 µs | 166 µs | 167 µs | 7.0× | 3,775 |
+| count_star | residual | 100 | 100 | 100 | 10,000 | 49 | 51 | 100 | 1 | 104 | 25 µs | 24 µs | 165 µs | 166 µs | 6.9× | 100 |
+| count_amount | residual | 100 | 100 | 100 | 10,000 | 49 | 51 | 100 | 1 | 104 | 25 µs | 24 µs | 166 µs | 165 µs | 6.9× | 49 |
+| group | residual | 100 | 100 | 100 | 10,000 | 49 | 51 | 100 | 8 | 832 | 43 µs | 31 µs | 173 µs | 173 µs | 5.6× | 108 |
+| multi | residual | 100 | 100 | 100 | 10,000 | 49 | 51 | 100 | 1 | 248 | 33 µs | 32 µs | 172 µs | 169 µs | 5.3× | 3,901 |
+| plain | matched | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 1,000 | 1,000 | 0 | 148 µs | 135 µs | 6,702 µs | 6,355 µs | 47.1× | 500,500 |
+| count_star | matched | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 1,000 | 1 | 104 | 142 µs | 135 µs | 6,348 µs | 6,286 µs | 46.6× | 1,000 |
+| count_amount | matched | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 1,000 | 1 | 104 | 141 µs | 135 µs | 6,405 µs | 6,436 µs | 47.7× | 1,000 |
+| group | matched | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 1,000 | 8 | 832 | 173 µs | 163 µs | 6,345 µs | 6,334 µs | 38.9× | 1,008 |
+| multi | matched | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 1,000 | 1 | 248 | 160 µs | 152 µs | 6,262 µs | 6,313 µs | 41.5× | 501,500 |
+| plain | none | 1,000 | 1,000 | 0 | 1,000,000 | 0 | 1,000 | 1,000 | 1,000 | 0 | 84 µs | 78 µs | 6,213 µs | 6,278 µs | 80.5× | 1,000 |
+| count_star | none | 1,000 | 1,000 | 0 | 1,000,000 | 0 | 1,000 | 1,000 | 1 | 104 | 85 µs | 82 µs | 6,198 µs | 6,248 µs | 76.2× | 1,000 |
+| count_amount | none | 1,000 | 1,000 | 0 | 1,000,000 | 0 | 1,000 | 1,000 | 1 | 104 | 65 µs | 64 µs | 6,202 µs | 6,231 µs | 97.4× | 0 |
+| group | none | 1,000 | 1,000 | 0 | 1,000,000 | 0 | 1,000 | 1,000 | 8 | 832 | 115 µs | 108 µs | 6,454 µs | 6,357 µs | 58.9× | 1,008 |
+| multi | none | 1,000 | 1,000 | 0 | 1,000,000 | 0 | 1,000 | 1,000 | 1 | 248 | 87 µs | 80 µs | 6,206 µs | 6,210 µs | 77.6× | 0 |
+| plain | duplicates | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 990 | 1,990 | 1,990 | 0 | 123 µs | 110 µs | 6,271 µs | 6,343 µs | 57.7× | 501,490 |
+| count_star | duplicates | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 990 | 1,990 | 1 | 104 | 118 µs | 114 µs | 6,237 µs | 6,358 µs | 55.8× | 1,990 |
+| count_amount | duplicates | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 990 | 1,990 | 1 | 104 | 103 µs | 99 µs | 6,396 µs | 6,275 µs | 63.4× | 1,000 |
+| group | duplicates | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 990 | 1,990 | 8 | 832 | 169 µs | 166 µs | 6,394 µs | 6,334 µs | 38.2× | 1,998 |
+| multi | duplicates | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 990 | 1,990 | 1 | 248 | 127 µs | 123 µs | 6,466 µs | 6,304 µs | 51.3× | 501,500 |
+| plain | nulls | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 1,000 | 1,000 | 0 | 133 µs | 126 µs | 6,457 µs | 6,386 µs | 50.7× | 1,000 |
+| count_star | nulls | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 1,000 | 1 | 104 | 138 µs | 134 µs | 6,461 µs | 6,355 µs | 47.4× | 1,000 |
+| count_amount | nulls | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 1,000 | 1 | 104 | 119 µs | 116 µs | 6,248 µs | 6,350 µs | 54.7× | 0 |
+| group | nulls | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 1,000 | 8 | 832 | 171 µs | 165 µs | 6,430 µs | 6,473 µs | 39.2× | 1,008 |
+| multi | nulls | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 1,000 | 1 | 248 | 133 µs | 129 µs | 6,386 µs | 6,362 µs | 49.3× | 0 |
+| plain | where | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 499 | 499 | 0 | 132 µs | 127 µs | 6,395 µs | 6,409 µs | 50.5× | 374,749 |
+| count_star | where | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 499 | 1 | 104 | 136 µs | 129 µs | 6,311 µs | 6,421 µs | 49.8× | 499 |
+| count_amount | where | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 499 | 1 | 104 | 133 µs | 133 µs | 6,264 µs | 6,404 µs | 48.2× | 499 |
+| group | where | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 499 | 8 | 832 | 151 µs | 148 µs | 6,263 µs | 6,298 µs | 42.6× | 507 |
+| multi | where | 1,000 | 1,000 | 1,000 | 1,000,000 | 1,000 | 0 | 499 | 1 | 248 | 145 µs | 143 µs | 6,285 µs | 6,454 µs | 45.1× | 376,501 |
+| plain | residual | 1,000 | 1,000 | 1,000 | 1,000,000 | 499 | 501 | 1,000 | 1,000 | 0 | 141 µs | 135 µs | 14,778 µs | 14,542 µs | 107.7× | 375,250 |
+| count_star | residual | 1,000 | 1,000 | 1,000 | 1,000,000 | 499 | 501 | 1,000 | 1 | 104 | 149 µs | 143 µs | 15,016 µs | 14,473 µs | 101.2× | 1,000 |
+| count_amount | residual | 1,000 | 1,000 | 1,000 | 1,000,000 | 499 | 501 | 1,000 | 1 | 104 | 143 µs | 136 µs | 14,440 µs | 14,675 µs | 107.9× | 499 |
+| group | residual | 1,000 | 1,000 | 1,000 | 1,000,000 | 499 | 501 | 1,000 | 8 | 832 | 181 µs | 176 µs | 14,418 µs | 14,690 µs | 83.5× | 1,008 |
+| multi | residual | 1,000 | 1,000 | 1,000 | 1,000,000 | 499 | 501 | 1,000 | 1 | 248 | 160 µs | 151 µs | 15,079 µs | 14,823 µs | 98.2× | 376,501 |
+| plain | matched | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 4,000 | 4,000 | 0 | 583 µs | 488 µs | 102,126 µs | 102,074 µs | 209.2× | 8,002,000 |
+| count_star | matched | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 4,000 | 1 | 104 | 530 µs | 519 µs | 101,132 µs | 105,378 µs | 203.0× | 4,000 |
+| count_amount | matched | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 4,000 | 1 | 104 | 535 µs | 529 µs | 105,534 µs | 110,331 µs | 208.6× | 4,000 |
+| group | matched | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 4,000 | 8 | 832 | 644 µs | 634 µs | 104,717 µs | 109,448 µs | 172.6× | 4,008 |
+| multi | matched | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 4,000 | 1 | 248 | 581 µs | 587 µs | 109,894 µs | 109,460 µs | 186.5× | 8,006,000 |
+| plain | none | 4,000 | 4,000 | 0 | 16,000,000 | 0 | 4,000 | 4,000 | 4,000 | 0 | 515 µs | 332 µs | 141,173 µs | 112,498 µs | 338.8× | 4,000 |
+| count_star | none | 4,000 | 4,000 | 0 | 16,000,000 | 0 | 4,000 | 4,000 | 1 | 104 | 329 µs | 376 µs | 107,863 µs | 109,187 µs | 290.4× | 4,000 |
+| count_amount | none | 4,000 | 4,000 | 0 | 16,000,000 | 0 | 4,000 | 4,000 | 1 | 104 | 243 µs | 226 µs | 104,434 µs | 103,794 µs | 459.3× | 0 |
+| group | none | 4,000 | 4,000 | 0 | 16,000,000 | 0 | 4,000 | 4,000 | 8 | 832 | 435 µs | 397 µs | 101,505 µs | 101,427 µs | 255.5× | 4,008 |
+| multi | none | 4,000 | 4,000 | 0 | 16,000,000 | 0 | 4,000 | 4,000 | 1 | 248 | 268 µs | 258 µs | 102,031 µs | 110,488 µs | 428.2× | 0 |
+| plain | duplicates | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 3,990 | 7,990 | 7,990 | 0 | 974 µs | 421 µs | 109,381 µs | 109,853 µs | 260.9× | 8,005,990 |
+| count_star | duplicates | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 3,990 | 7,990 | 1 | 104 | 493 µs | 435 µs | 104,053 µs | 109,156 µs | 250.9× | 7,990 |
+| count_amount | duplicates | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 3,990 | 7,990 | 1 | 104 | 408 µs | 416 µs | 105,879 µs | 109,330 µs | 262.8× | 4,000 |
+| group | duplicates | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 3,990 | 7,990 | 8 | 832 | 772 µs | 654 µs | 112,128 µs | 111,976 µs | 171.2× | 7,998 |
+| multi | duplicates | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 3,990 | 7,990 | 1 | 248 | 545 µs | 575 µs | 120,298 µs | 110,316 µs | 191.9× | 8,006,000 |
+| plain | nulls | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 4,000 | 4,000 | 0 | 557 µs | 502 µs | 103,585 µs | 105,023 µs | 209.2× | 4,000 |
+| count_star | nulls | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 4,000 | 1 | 104 | 526 µs | 516 µs | 102,359 µs | 105,137 µs | 203.8× | 4,000 |
+| count_amount | nulls | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 4,000 | 1 | 104 | 459 µs | 447 µs | 103,619 µs | 104,354 µs | 233.5× | 0 |
+| group | nulls | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 4,000 | 8 | 832 | 647 µs | 619 µs | 106,583 µs | 112,148 µs | 181.2× | 4,008 |
+| multi | nulls | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 4,000 | 1 | 248 | 586 µs | 493 µs | 113,084 µs | 106,260 µs | 215.5× | 0 |
+| plain | where | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 1,999 | 1,999 | 0 | 559 µs | 510 µs | 108,150 µs | 104,061 µs | 204.0× | 5,998,999 |
+| count_star | where | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 1,999 | 1 | 104 | 525 µs | 525 µs | 104,766 µs | 105,523 µs | 201.0× | 1,999 |
+| count_amount | where | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 1,999 | 1 | 104 | 781 µs | 526 µs | 106,256 µs | 106,128 µs | 201.8× | 1,999 |
+| group | where | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 1,999 | 8 | 832 | 648 µs | 580 µs | 109,973 µs | 112,408 µs | 193.8× | 2,007 |
+| multi | where | 4,000 | 4,000 | 4,000 | 16,000,000 | 4,000 | 0 | 1,999 | 1 | 248 | 569 µs | 569 µs | 126,939 µs | 111,726 µs | 196.4× | 6,006,001 |
+| plain | residual | 4,000 | 4,000 | 4,000 | 16,000,000 | 1,999 | 2,001 | 4,000 | 4,000 | 0 | 615 µs | 607 µs | 672,123 µs | 308,305 µs | 507.9× | 6,001,000 |
+| count_star | residual | 4,000 | 4,000 | 4,000 | 16,000,000 | 1,999 | 2,001 | 4,000 | 1 | 104 | 604 µs | 562 µs | 246,692 µs | 234,098 µs | 416.5× | 4,000 |
+| count_amount | residual | 4,000 | 4,000 | 4,000 | 16,000,000 | 1,999 | 2,001 | 4,000 | 1 | 104 | 591 µs | 544 µs | 243,313 µs | 239,512 µs | 440.3× | 1,999 |
+| group | residual | 4,000 | 4,000 | 4,000 | 16,000,000 | 1,999 | 2,001 | 4,000 | 8 | 832 | 692 µs | 649 µs | 233,063 µs | 229,442 µs | 353.5× | 4,008 |
+| multi | residual | 4,000 | 4,000 | 4,000 | 16,000,000 | 1,999 | 2,001 | 4,000 | 1 | 248 | 606 µs | 565 µs | 229,568 µs | 231,596 µs | 409.9× | 6,006,001 |
+| count_star | matched | 10,000 | 10,000 | 10,000 | 100,000,000 | 10,000 | 0 | 10,000 | 1 | 104 | 1,462 µs | 1,308 µs | 640,773 µs | 653,345 µs | 499.5× | 10,000 |
+| count_amount | matched | 10,000 | 10,000 | 10,000 | 100,000,000 | 10,000 | 0 | 10,000 | 1 | 104 | 1,758 µs | 1,393 µs | 704,503 µs | 667,798 µs | 479.4× | 10,000 |
+| group | matched | 10,000 | 10,000 | 10,000 | 100,000,000 | 10,000 | 0 | 10,000 | 8 | 832 | 1,719 µs | 1,667 µs | 701,759 µs | 673,588 µs | 404.1× | 10,008 |
+| multi | matched | 10,000 | 10,000 | 10,000 | 100,000,000 | 10,000 | 0 | 10,000 | 1 | 248 | 1,714 µs | 1,444 µs | 658,048 µs | 669,125 µs | 463.4× | 50,015,000 |
+| count_star | none | 10,000 | 10,000 | 0 | 100,000,000 | 0 | 10,000 | 10,000 | 1 | 104 | 755 µs | 721 µs | 652,647 µs | 663,952 µs | 920.9× | 10,000 |
+| count_amount | none | 10,000 | 10,000 | 0 | 100,000,000 | 0 | 10,000 | 10,000 | 1 | 104 | 563 µs | 548 µs | 678,312 µs | 663,659 µs | 1211.1× | 0 |
+| group | none | 10,000 | 10,000 | 0 | 100,000,000 | 0 | 10,000 | 10,000 | 8 | 832 | 1,010 µs | 995 µs | 648,193 µs | 675,839 µs | 679.2× | 10,008 |
+| multi | none | 10,000 | 10,000 | 0 | 100,000,000 | 0 | 10,000 | 10,000 | 1 | 248 | 890 µs | 620 µs | 650,953 µs | 671,627 µs | 1083.3× | 0 |
+| count_star | matched | 100 | 4,000 | 100 | 400,000 | 100 | 0 | 100 | 1 | 104 | 261 µs | 226 µs | 2,634 µs | 2,588 µs | 11.5× | 100 |
+| group | matched | 100 | 4,000 | 100 | 400,000 | 100 | 0 | 100 | 8 | 832 | 235 µs | 238 µs | 2,544 µs | 2,531 µs | 10.6× | 108 |
+| multi | matched | 100 | 4,000 | 100 | 400,000 | 100 | 0 | 100 | 1 | 248 | 239 µs | 229 µs | 2,460 µs | 2,499 µs | 10.9× | 5,150 |
+| count_star | none | 100 | 4,000 | 0 | 400,000 | 0 | 100 | 100 | 1 | 104 | 96 µs | 87 µs | 2,545 µs | 2,533 µs | 29.1× | 100 |
+| group | none | 100 | 4,000 | 0 | 400,000 | 0 | 100 | 100 | 8 | 832 | 99 µs | 93 µs | 2,543 µs | 2,575 µs | 27.7× | 108 |
+| multi | none | 100 | 4,000 | 0 | 400,000 | 0 | 100 | 100 | 1 | 248 | 100 µs | 90 µs | 2,508 µs | 2,539 µs | 28.2× | 0 |
+| count_star | duplicates | 100 | 4,000 | 4,000 | 400,000 | 4,000 | 90 | 4,090 | 1 | 104 | 253 µs | 224 µs | 2,669 µs | 2,635 µs | 11.8× | 4,090 |
+| group | duplicates | 100 | 4,000 | 4,000 | 400,000 | 4,000 | 90 | 4,090 | 8 | 832 | 318 µs | 313 µs | 2,772 µs | 2,710 µs | 8.7× | 4,098 |
+| multi | duplicates | 100 | 4,000 | 4,000 | 400,000 | 4,000 | 90 | 4,090 | 1 | 248 | 277 µs | 272 µs | 2,688 µs | 2,690 µs | 9.9× | 8,006,000 |
+| count_star | where | 100 | 4,000 | 100 | 400,000 | 100 | 0 | 0 | 1 | 104 | 225 µs | 219 µs | 2,540 µs | 2,529 µs | 11.5× | 0 |
+| group | where | 100 | 4,000 | 100 | 400,000 | 100 | 0 | 0 | 0 | 0 | 239 µs | 221 µs | 2,490 µs | 2,623 µs | 11.9× | 0 |
+| multi | where | 100 | 4,000 | 100 | 400,000 | 100 | 0 | 0 | 1 | 248 | 263 µs | 238 µs | 2,701 µs | 2,574 µs | 10.8× | 0 |
+| count_star | matched | 4,000 | 100 | 100 | 400,000 | 100 | 3,900 | 4,000 | 1 | 104 | 201 µs | 193 µs | 2,614 µs | 2,884 µs | 14.9× | 4,000 |
+| group | matched | 4,000 | 100 | 100 | 400,000 | 100 | 3,900 | 4,000 | 8 | 832 | 303 µs | 315 µs | 3,257 µs | 2,852 µs | 9.1× | 4,008 |
+| multi | matched | 4,000 | 100 | 100 | 400,000 | 100 | 3,900 | 4,000 | 1 | 248 | 156 µs | 160 µs | 2,968 µs | 2,696 µs | 16.9× | 5,150 |
+| count_star | none | 4,000 | 100 | 0 | 400,000 | 0 | 4,000 | 4,000 | 1 | 104 | 170 µs | 155 µs | 2,637 µs | 2,911 µs | 18.8× | 4,000 |
+| group | none | 4,000 | 100 | 0 | 400,000 | 0 | 4,000 | 4,000 | 8 | 832 | 271 µs | 281 µs | 2,832 µs | 2,900 µs | 10.3× | 4,008 |
+| multi | none | 4,000 | 100 | 0 | 400,000 | 0 | 4,000 | 4,000 | 1 | 248 | 127 µs | 122 µs | 2,965 µs | 2,685 µs | 22.0× | 0 |
+| count_star | duplicates | 4,000 | 100 | 100 | 400,000 | 100 | 3,990 | 4,090 | 1 | 104 | 169 µs | 163 µs | 2,732 µs | 2,729 µs | 16.7× | 4,090 |
+| group | duplicates | 4,000 | 100 | 100 | 400,000 | 100 | 3,990 | 4,090 | 8 | 832 | 274 µs | 269 µs | 2,992 µs | 2,945 µs | 10.9× | 4,098 |
+| multi | duplicates | 4,000 | 100 | 100 | 400,000 | 100 | 3,990 | 4,090 | 1 | 248 | 134 µs | 130 µs | 2,806 µs | 2,848 µs | 21.9× | 5,150 |
+| count_star | where | 4,000 | 100 | 100 | 400,000 | 100 | 3,900 | 49 | 1 | 104 | 146 µs | 175 µs | 2,895 µs | 2,606 µs | 14.9× | 49 |
+| group | where | 4,000 | 100 | 100 | 400,000 | 100 | 3,900 | 49 | 8 | 832 | 139 µs | 152 µs | 2,608 µs | 2,600 µs | 17.1× | 57 |
+| multi | where | 4,000 | 100 | 100 | 400,000 | 100 | 3,900 | 49 | 1 | 248 | 160 µs | 160 µs | 2,805 µs | 3,015 µs | 18.8× | 3,901 |
+
+At 10,000 by 10,000, matched `COUNT(*)` is 1,308 µs warm on the hash path and 653,345 µs warm on the nested loop, 499.5×. It examines 10,000 key hits against 100,000,000 pairs and the checksum is 10,000. `COUNT(o.amount)` is 479.4×, `GROUP BY` name is 404.1×, and the four-aggregate query is 463.4×. The unmatched `COUNT(*)` is 920.9×: the hash probe finds no key, and each of the 10,000 null-extended rows still increments `COUNT(*)`. `COUNT(o.amount)` on that input checksums to 0. Square matched `COUNT(*)` speedups are 3.8×, 46.6×, 203.0×, and 499.5× at 100, 1,000, 4,000, and 10,000. The nested loop still examines every pair. A duplicate key that matches every left row still walks that bucket, so this is not a linear worst case.
+
+`where` on 100 by 4,000 feeds 0 logical rows. `COUNT(*)` returns one row whose checksum is 0, and `GROUP BY` returns no groups. Every user had an `ON` match, and `WHERE` removed those pairs without adding a null-extended row. `residual` on 4,000 by 4,000 keeps 1,999 matches and 2,001 null-extended rows, 4,000 aggregate inputs, and `COUNT(*)` is 416.5×. The hash table is unchanged from Milestone 19: the right table is the build side, and aggregation does not add a pair buffer. Checksums for square matched `COUNT(*)` are 100, 1,000, 4,000, and 10,000. Square matched `SUM`/`AVG`/`MIN`/`MAX` checksums are 5,150; 501,500; 8,006,000; and 50,015,000.
