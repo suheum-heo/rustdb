@@ -79,6 +79,11 @@ pub(crate) fn decode_record(bytes: &[u8]) -> Result<StoredRecord, DbError> {
     let next = read_link(bytes, 14)?;
     let count = u16::from_le_bytes(copy_array(bytes, 20)?) as usize;
     let mut cursor = RECORD_PREFIX;
+    // A value is at least one tag byte. Refuse the count before reserving so a
+    // short buffer cannot ask for 65535 slots.
+    if count > bytes.len() - cursor {
+        return Err(corrupt_file());
+    }
     let mut values = Vec::with_capacity(count);
     for _ in 0..count {
         let (value, next_cursor) = decode_value(bytes, cursor)?;
@@ -165,6 +170,11 @@ pub(crate) fn decode_catalog(bytes: &[u8]) -> Result<CatalogEntry, DbError> {
     };
     let name = read_string(bytes, &mut cursor)?;
     let count = read_u16(bytes, &mut cursor)? as usize;
+    // A column is a name length, a name, and a type byte: at least 3 bytes.
+    let remaining = bytes.len().saturating_sub(cursor);
+    if count > remaining / 3 {
+        return Err(corrupt_file());
+    }
     let mut columns = Vec::with_capacity(count);
     for _ in 0..count {
         let column_name = read_string(bytes, &mut cursor)?;
@@ -486,6 +496,23 @@ mod tests {
             decode_record(&boolean).unwrap_err().to_string(),
             "database file is corrupt"
         );
+
+        let mut claimed = vec![0u8; RECORD_PREFIX];
+        claimed[20] = 0xff;
+        claimed[21] = 0xff;
+        assert_eq!(
+            decode_record(&claimed).unwrap_err().to_string(),
+            "database file is corrupt"
+        );
+        let mut catalog = vec![0u8; 23];
+        catalog[18] = 1;
+        catalog[20] = b'a';
+        catalog[21] = 0xff;
+        catalog[22] = 0xff;
+        match decode_catalog(&catalog) {
+            Ok(_) => panic!("a huge column count must be rejected"),
+            Err(error) => assert_eq!(error.to_string(), "database file is corrupt"),
+        }
     }
 
     #[test]

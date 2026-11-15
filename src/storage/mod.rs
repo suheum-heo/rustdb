@@ -18,8 +18,14 @@ mod wal;
 
 pub use page::{MAX_RECORD_LEN, PAGE_SIZE};
 pub(crate) use page::{Page, cell, live_slots, page_id_of, verify};
+#[cfg(test)]
+pub(crate) use page::{TYPE_HEAP, init_slotted, insert_cell, seal};
+#[cfg(test)]
+pub(crate) use record::{NULL_LINK, StoredRecord, encode_record};
 pub(crate) use record::{decode_catalog, decode_index, decode_record, ensure_record_fits};
 pub(crate) use store::{IndexImage, Store, TableImage};
 #[cfg(test)]
 pub(crate) use wal::Inject;
 pub(crate) use wal::{LogClass, StepError, classify_log};
+#[cfg(test)]
+pub(crate) use wal::{Plan, encode_committed};

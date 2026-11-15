@@ -47,24 +47,41 @@ The generated distributions are narrow on purpose:
 - WAL inputs are 0 to 128 arbitrary bytes. Anything shorter than a header plus a trailer must not classify as committed. A full frame is 4100 bytes, so this distribution does not build a realistic frame. Fixed cases cover a partial frame, a frame count that does not match the body, a count of `u32::MAX`, a bad checksum, and an unknown version.
 - Index edits use a leaf capacity of 4 and an internal capacity of 4, keys in `i16`, and row ids from 1 to 39. That is not the on-disk fanout of 254 leaf entries. A fixed sequence on that small tree inserts duplicate keys, forces an internal-node split (height at least 3), deletes every even key, and then rejects a zeroed leaf. The store test that inserts 255 keys is the one that crosses a production leaf split.
 
-The manual workflow `.github/workflows/reliability.yml` sets `PROPTEST_CASES=256` and refuses to pass if `records_round_trip_or_reject_overflow` is not in the test list. It is not required for pull requests, and it has not been run on GitHub.
+The manual workflow `.github/workflows/reliability.yml` sets `PROPTEST_CASES=256` and refuses to pass if `records_round_trip_or_reject_overflow` is not in the test list. It is not required for pull requests. It ran successfully on GitHub after Milestone 15 merged (`actions/runs/43754018755`). Milestone 17 did not start that workflow again.
 
 ## Fuzz targets
 
-`src/fuzzing.rs` is the stable entry point. Inputs longer than 64 KiB are cut before decoding, and SQL text is cut at 8 KiB. The normal test `fuzzing::tests::smoke_inputs_do_not_panic` feeds a handful of small buffers, including invalid UTF-8. That is a smoke test of the entry points, not a fuzzing campaign.
+`src/fuzzing.rs` is the stable entry point. Inputs longer than 64 KiB are cut before decoding, and SQL text is cut at 8 KiB of that prefix. The functions return decoder and parser errors. They do not catch panics, open a database, or write a file.
 
-`fuzz/` is a separate package so `cargo test` does not need nightly or libFuzzer. From that directory, with nightly and `cargo-fuzz`:
+| Target | Production code | Bound |
+| --- | --- | --- |
+| `record_decode` | `decode_record`, `decode_catalog`, `decode_index` | 64 KiB |
+| `page_decode` | `verify`, then `live_slots` and `cell` only after `verify` succeeds | 4 KiB copied into a fresh page |
+| `wal_decode` | `classify_log` | 64 KiB. A frame vector is reserved only after the body length matches the claimed frame count |
+| `sql_parse` | `parser::parse` on lossy UTF-8 | 8 KiB |
+
+`fuzz/fuzz_targets/` calls those four functions. `fuzz/` is a separate package so `cargo test` does not need nightly or libFuzzer. A libFuzzer crash would be written under `fuzz/artifacts/`. That directory is gitignored. This machine has `stable-aarch64-apple-darwin` only. `cargo-fuzz` is not on `PATH`. Nightly is not installed, and it was not installed for this campaign.
+
+The replacement is a deterministic mutator in `fuzzing::tests`, not libFuzzer. It does not build a corpus and it does not report LLVM coverage. Fourteen seed inputs include an empty buffer, a record whose value count is `u16::MAX`, a sealed heap page, a one-frame committed log, that log cut to 120 bytes, and short SQL fragments. Each step flips a bit, writes `0xff` into a length field, truncates, deletes, inserts, or repeats a prefix, and never keeps more than 64 KiB. The same LCG seed is the reproducer. A panic fails the test and prints those bytes. There is no per-input timeout, so a hang would not be reported as a libFuzzer timeout.
+
+`fuzzing::tests::mutation_prefix_does_not_panic` runs 4096 iterations of each target in the normal suite. The long run is ignored unless `RUSTDB_MUTATION_SECS` is set, so `cargo test --release --locked -- --ignored` does not start a campaign:
 
 ```sh
-cargo install cargo-fuzz
-cd fuzz
-cargo +nightly fuzz run record_decode -- -max_total_time=30
-cargo +nightly fuzz run page_decode -- -max_total_time=30
-cargo +nightly fuzz run wal_decode -- -max_total_time=30
-cargo +nightly fuzz run sql_parse -- -max_total_time=30
+RUSTDB_MUTATION_SECS=120 cargo test --release --locked --lib mutation_campaign -- --ignored --nocapture
 ```
 
-A failing input is written under `fuzz/artifacts/`. The harness does not open a database file, a socket, or a directory of its own. A short run does not establish that those decoders are free of bugs.
+On 15 Nov 2026, release profile, `rustc 1.100.0 (0ef1bc386 2026-11-09)`, Apple M5, that command ran each target for 120000 ms. Crashes were 0. Timeouts were 0. Seed inputs were 14. The largest mutated input was 65536 bytes. Executions per second are integer division of `execs * 1000 / elapsed_ms`.
+
+| Target | Seed | Executions | Per second |
+| --- | --- | --- | --- |
+| `record_decode` | `0x170100000017` | 704654699 | 5872122 |
+| `page_decode` | `0x9e376eb87f4a7c02` | 5252021 | 43766 |
+| `wal_decode` | `0x3c6ee473fe94f83d` | 80022406 | 666853 |
+| `sql_parse` | `0xdaa67a2d7ddf7428` | 8468322 | 70569 |
+
+The seed for target `n` is `0x170100000017 xor (n * 0x9E3779B97F4A7C15)` wrapping at 64 bits. No crash input was saved because none failed. A rejected malformed buffer is a normal `Err`, not a bug.
+
+Before that run, `decode_record` and `decode_catalog` reserved a `u16` count before checking that the buffer could hold that many items. A 22-byte record with count 65535, and a catalog with the same count, now return `database file is corrupt` without that reservation. `rejects_an_oversized_text_value_and_invalid_bytes` covers both. `valid_pages_and_logs_reach_the_success_path` checks that a sealed page passes `verify` and that the committed log classifies as committed while a short copy classifies as incomplete.
 
 ## Crash fault-injection points
 
@@ -74,9 +91,22 @@ A failing input is written under `fuzz/artifacts/`. The harness does not open a 
 
 `a_recovered_heap_insert_keeps_the_matching_index_entry` does the same for a migrated file that already has an integer index. `CommitSyncFailed`, `AfterLogSync`, and checkpoint stops at page 0 and page 1 each reopen twice with the new heap row and both index keys. `BeforeLogSync` keeps the old row and does not add the new key. Older store tests also replay an index leaf split, a merge, and a dropped index after `AfterLogSync` and `DuringCheckpoint(1)`.
 
+`recovery_stress_repeats_checkpoints_and_keeps_duplicate_keys` starts from one indexed row with key 7 and then:
+
+- interrupts four publishes at `DuringCheckpoint(0)` and `DuringCheckpoint(1)`, alternating, each adding another row with key 7
+- reopens three times after every interrupt and checks heap order plus `read_index_equal` for every distinct key
+- updates the first row's text through `AfterLogSync`
+- deletes the last duplicate through `CommitSyncFailed`, and requires the error to say durability is unknown and that this is not a confirmed rollback
+- publishes one new key after recovery
+- keeps a second `Store::open` failed with `is locked` while the recovered store is still open
+- truncates a synced log to 120 bytes and checks that the next open discards it, restores the previous rows, and leaves the database bytes unchanged
+- flips a trailer checksum and checks that open fails, the database bytes stay unchanged, and the log stays
+
+`sql_recovery_stress_replays_dml_and_holds_the_lock` does the SQL form of that sequence: four interrupted `INSERT`s, an uncertain `UPDATE`, an interrupted `DELETE`, a duplicate indexed key, one more insert after recovery, three opens, and `EXPLAIN` showing `IndexScan`. A second `Database::open` fails while the recovered connection is open, and an insert on that connection is visible after the next open. These injections are not a power loss.
+
 ## Test reproducibility and seeds
 
-Property failures print the proptest seed. The SQL reference tests in `tests/milestone13.rs` and `tests/milestone14.rs` use the seeds named in those files. Temporary databases use a process id and a counter, so parallel tests do not share a path. The lock tests in `tests/milestone4.rs` use a subprocess and `flock`, not a sleep.
+Property failures print the proptest seed. The SQL reference tests in `tests/milestone13.rs` and `tests/milestone14.rs` use the seeds named in those files. The mutation campaign uses the four seeds in the table above. Temporary databases use a process id and a counter, so parallel tests do not share a path. The lock tests in `tests/milestone4.rs` use a subprocess and `flock`, not a sleep.
 
 Run the groups separately:
 
@@ -87,7 +117,7 @@ cargo test --locked --lib storage::store::tests::recovery_is_idempotent_and_a_da
 cargo test --release --locked -- --ignored
 ```
 
-The ignored tests are release profiles. CI does not run them and does not fail a pull request on a timing threshold.
+The ignored tests are release profiles, plus the mutation campaign when `RUSTDB_MUTATION_SECS` is set. CI does not run them and does not fail a pull request on a timing threshold. Pull requests do not run a fuzz job.
 
 ## What was tested, and what was not
 
@@ -97,9 +127,10 @@ The ignored tests are release profiles. CI does not run them and does not fail a
 - The property module at 64 cases, and the same command the manual workflow runs, with `PROPTEST_CASES=256`.
 - Each `Inject` variant listed above, including two opens and, for the index case, a heap row plus its index key.
 - A damaged trailer left in place.
-- The fuzz entry points on a handful of small buffers, including invalid UTF-8. `cargo clippy --all-targets --features fuzz --locked -- -D warnings`.
+- The fuzz entry points on the smoke inputs, the 4096-iteration mutation prefix, and the 120-second release campaign recorded above. `cargo clippy --all-targets --features fuzz --locked -- -D warnings`.
+- `recovery_stress_repeats_checkpoints_and_keeps_duplicate_keys` and `sql_recovery_stress_replays_dml_and_holds_the_lock`.
 
-`actionlint` is not installed here. The workflow files were checked by reading them and by confirming the pinned commits exist: `actions/checkout` `11d5960a326750d5838078e36cf38b85af677262` is tag `v4.4.0`, `dtolnay/rust-toolchain` `683b588c487a69d01f6c6ddf40f036ff682cc2c8` is tag `v1`, and `Swatinem/rust-cache` `2656b87321093db1cb55fbd73183d195214fdfd1` is the commit for tag `v2.5.0`. GitHub Actions has not run these workflows.
+`actionlint` is not installed here. The workflow files were checked by reading them and by confirming the pinned commits exist: `actions/checkout` `11d5960a326750d5838078e36cf38b85af677262` is tag `v4.4.0`, `dtolnay/rust-toolchain` `683b588c487a69d01f6c6ddf40f036ff682cc2c8` is tag `v1`, and `Swatinem/rust-cache` `2656b87321093db1cb55fbd73183d195214fdfd1` is the commit for tag `v2.5.0`. GitHub Actions has run the main CI workflow and, after Milestone 15, the manual reliability workflow. Milestone 17's campaign numbers are from this machine, not from a GitHub job.
 
 ### B. Implemented, not shown under power loss
 
@@ -113,9 +144,9 @@ The code calls `File::sync_all` on the log before it modifies the database, and 
 - Network filesystems, and a process that never calls `flock`, are outside the lock tests.
 - A checksum that still matches after a bit flip is not repaired. A mismatch is reported.
 - A damaged trailer is not rebuilt. Open fails and the log stays.
-- The four fuzz targets have had only the smoke inputs run here. Nightly and `cargo-fuzz` are not installed.
+- The mutation campaign is not libFuzzer. It has no coverage report and no per-input timeout. Nightly and `cargo-fuzz` are not installed, so the `fuzz/` binaries were not run.
 - The property tree uses a leaf capacity of 4. Production leaves hold 254 entries. The property test does not measure that occupancy.
 
 ## Suggested next reliability work
 
-A longer libFuzzer run of the four harnesses, with the artifacts checked in only when a crash is real. A subprocess that is killed after the log sync and before the database sync would sit closer to a process crash than an injected `Err`, and it would still not be a power-loss test. Checksums on individual WAL frames, rather than one trailer over every frame, would make a torn last frame distinguishable from a damaged commit record.
+A libFuzzer campaign, once nightly and `cargo-fuzz` are available, with an artifact kept only when a crash is real. A subprocess that is killed after the log sync and before the database sync would sit closer to a process crash than an injected `Err`, and it would still not be a power-loss test. Checksums on individual WAL frames, rather than one trailer over every frame, would make a torn last frame distinguishable from a damaged commit record.

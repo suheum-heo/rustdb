@@ -427,6 +427,171 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn sql_recovery_stress_replays_dml_and_holds_the_lock() {
+        fn column(database: &mut Database, sql: &str) -> Vec<String> {
+            let results = database.execute(sql).unwrap();
+            let StatementResult::Query(query) = &results[0] else {
+                panic!("expected a query");
+            };
+            query
+                .rows
+                .iter()
+                .map(|row| match &row[0] {
+                    Value::Text(text) => text.clone(),
+                    other => panic!("unexpected cell {other:?}"),
+                })
+                .collect()
+        }
+        fn expect_rows(path: &std::path::Path, names: &[&str], indexed_id: i64, indexed: &[&str]) {
+            for _ in 0..3 {
+                let mut database = Database::open(path).unwrap();
+                let got = column(&mut database, "SELECT name FROM users;");
+                assert_eq!(got, names);
+                let sql = format!("SELECT name FROM users WHERE id = {indexed_id};");
+                assert_eq!(column(&mut database, &sql), indexed);
+                let explained = database
+                    .execute("EXPLAIN SELECT name FROM users WHERE id = 1;")
+                    .unwrap();
+                let StatementResult::Query(plan) = &explained[0] else {
+                    panic!("expected EXPLAIN");
+                };
+                let text = plan
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.iter())
+                    .any(|cell| matches!(cell, Value::Text(text) if text == "IndexScan"));
+                assert!(text, "index scan missing from {plan:?}");
+                drop(database);
+            }
+            let mut wal = path.as_os_str().to_owned();
+            wal.push(".wal");
+            assert_eq!(std::fs::metadata(wal).unwrap().len(), 0);
+        }
+
+        let (dir, path) = scratch("m17-stress");
+        {
+            let mut database = Database::open(&path).unwrap();
+            database
+                .execute("CREATE TABLE users (id INT, name TEXT);")
+                .unwrap();
+            database
+                .execute("INSERT INTO users VALUES (1, 'Ada');")
+                .unwrap();
+        }
+        Database::migrate(&path).unwrap();
+        {
+            let mut database = Database::open(&path).unwrap();
+            database
+                .execute("CREATE INDEX idx_users_id ON users(id);")
+                .unwrap();
+        }
+
+        let additions = ["Bea", "Cy", "Dee", "Eve"];
+        let mut names = vec!["Ada"];
+        for (step, name) in additions.iter().enumerate() {
+            {
+                let mut database = Database::open(&path).unwrap();
+                database
+                    .store
+                    .as_mut()
+                    .expect("disk database")
+                    .set_inject(Inject::DuringCheckpoint((step as u32) % 2));
+                let error = database
+                    .execute(&format!(
+                        "INSERT INTO users VALUES ({}, '{name}');",
+                        step + 2
+                    ))
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("checkpoint did not finish"),
+                    "{error}"
+                );
+                let blocked = database.execute("SELECT name FROM users;").unwrap_err();
+                assert!(
+                    blocked.to_string().contains("checkpoint did not finish"),
+                    "{blocked}"
+                );
+            }
+            names.push(name);
+            expect_rows(&path, &names, 1, &["Ada"]);
+        }
+
+        {
+            let mut database = Database::open(&path).unwrap();
+            database
+                .store
+                .as_mut()
+                .expect("disk database")
+                .set_inject(Inject::CommitSyncFailed);
+            let error = database
+                .execute("UPDATE users SET name = 'Ann' WHERE id = 1;")
+                .unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("durability is unknown"), "{message}");
+            assert!(message.contains("not a confirmed rollback"), "{message}");
+            assert!(!message.contains("rolled back"), "{message}");
+        }
+        names[0] = "Ann";
+        expect_rows(&path, &names, 1, &["Ann"]);
+
+        {
+            let mut database = Database::open(&path).unwrap();
+            database
+                .store
+                .as_mut()
+                .expect("disk database")
+                .set_inject(Inject::AfterLogSync);
+            let error = database
+                .execute("DELETE FROM users WHERE id = 5;")
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("checkpoint did not finish"),
+                "{error}"
+            );
+        }
+        names.pop();
+        expect_rows(&path, &names, 2, &["Bea"]);
+
+        {
+            let mut database = Database::open(&path).unwrap();
+            database
+                .execute("INSERT INTO users VALUES (1, 'Twin');")
+                .unwrap();
+            database
+                .store
+                .as_mut()
+                .expect("disk database")
+                .set_inject(Inject::DuringCheckpoint(1));
+            let error = database
+                .execute("INSERT INTO users VALUES (6, 'Fay');")
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("checkpoint did not finish"),
+                "{error}"
+            );
+        }
+        names.push("Twin");
+        names.push("Fay");
+        expect_rows(&path, &names, 1, &["Ann", "Twin"]);
+
+        {
+            let mut database = Database::open(&path).unwrap();
+            let error = match Database::open(&path) {
+                Ok(_) => panic!("second open should fail while recovery holds the lock"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("is locked"), "{error}");
+            database
+                .execute("INSERT INTO users VALUES (7, 'Gus');")
+                .unwrap();
+            drop(database);
+        }
+        names.push("Gus");
+        expect_rows(&path, &names, 7, &["Gus"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn aged_index(label: &str) -> (crate::test_dir::TestDir, Database) {
         let (dir, path) = scratch(label);
         let mut database = Database::open(&path).unwrap();

@@ -86,7 +86,7 @@ cargo build --all-targets --locked
 cargo test --locked
 ```
 
-GitHub Actions runs those four checks on pull requests and pushes to `main`, and when the workflow is started by hand. It uses the stable toolchain and `Cargo.lock`. Ignored release profiles are not part of that job. The workflow file is in the tree; a green run on GitHub is separate from a local `cargo test`. How to run property tests, fuzz targets, and recovery checks is in [docs/reliability.md](docs/reliability.md).
+GitHub Actions runs those four checks on pull requests and pushes to `main`, and when the workflow is started by hand. It uses the stable toolchain and `Cargo.lock`. Ignored release profiles are not part of that job, and pull requests do not run a fuzzing campaign. The workflow file is in the tree; a green run on GitHub is separate from a local `cargo test`. How to run property tests, the mutation campaign, and recovery checks is in [docs/reliability.md](docs/reliability.md).
 
 With no arguments the REPL uses an empty in-memory database, and exiting drops every table. `--database PATH` creates a version 2 file when it does not exist and reloads it on the next run. `--migrate PATH` rewrites a version 1 file as version 2, or a version 2 file as version 3, and then exits. It does not start the REPL. A version 3 file is left unchanged and the command fails. The REPL prompts with `rustdb> `. End each statement with `;`. A statement can span lines. `exit` and `quit` close the session. SQL errors are printed and the session continues.
 
@@ -305,4 +305,4 @@ rustdb> exit
 
 ## Next milestone
 
-Milestone 17 should add `LEFT JOIN` for two tables. `DISTINCT` on that outer join, `DISTINCT` with `GROUP BY` or an aggregate, a third table, window functions, arithmetic, and subqueries stay out of scope.
+Milestone 18 should add `LEFT JOIN` for two tables. `DISTINCT` on that outer join, `DISTINCT` with `GROUP BY` or an aggregate, a third table, window functions, arithmetic, and subqueries stay out of scope.
