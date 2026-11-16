@@ -22973,6 +22973,10 @@ mod tests {
         path_us: u128,
         reused_paths: u64,
         path_invalidations: u64,
+        ancestor_reads: u64,
+        ancestor_writes: u64,
+        separator_updates: u64,
+        index_pages: u32,
         grouped_postings: u64,
         id_height: u32,
         id_pages: usize,
@@ -22986,6 +22990,7 @@ mod tests {
         Chain,
         Descent,
         Prior,
+        Seal,
     }
 
     fn profile_bulk_delete(
@@ -23037,6 +23042,10 @@ mod tests {
             }
             VerifyMode::Prior => {
                 let _guard = crate::storage::ForcePriorPlan::new();
+                change_count(&mut bulk, &sql)
+            }
+            VerifyMode::Seal => {
+                let _guard = crate::storage::ForceAncestorRewrite::new();
                 change_count(&mut bulk, &sql)
             }
         };
@@ -23147,6 +23156,10 @@ mod tests {
             path_us: bulk_phases.path_record.as_micros(),
             reused_paths: bulk_phases.reused_paths,
             path_invalidations: bulk_phases.path_invalidations,
+            ancestor_reads: bulk_phases.ancestor_reads,
+            ancestor_writes: bulk_phases.ancestor_writes,
+            separator_updates: bulk_phases.separator_updates,
+            index_pages: bulk_phases.index_pages,
             grouped_postings: bulk_phases.leaf_batches,
             id_height,
             id_pages,
@@ -24282,6 +24295,239 @@ mod tests {
                     sample.grouped_postings,
                     sample.allocated,
                     sample.freed,
+                    sample.scratch,
+                    sample.presence_verified
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selective_ancestor_delete_matches_full_rewrite_and_recovers() {
+        let _phases = crate::storage::enable_phases();
+        let (_dir, base) = seed_delete_db("m36-agree", 2_000, 0x3600);
+        let wide = format!("DELETE FROM users WHERE name = '{}';", "w".repeat(80));
+        let statements = [
+            ("one", "DELETE FROM users WHERE id = 1;".to_string()),
+            (
+                "ten",
+                "DELETE FROM users WHERE id >= 1 AND id <= 10;".to_string(),
+            ),
+            (
+                "buckets",
+                "DELETE FROM users WHERE bucket = 0 OR bucket = 1;".to_string(),
+            ),
+            ("half", "DELETE FROM users WHERE id < 1000;".to_string()),
+            (
+                "alternating",
+                "DELETE FROM users WHERE active = TRUE;".to_string(),
+            ),
+            (
+                "consecutive",
+                "DELETE FROM users WHERE id >= 1 AND id < 500;".to_string(),
+            ),
+            (
+                "sparse",
+                "DELETE FROM users WHERE bucket IS NULL;".to_string(),
+            ),
+            ("all", "DELETE FROM users WHERE TRUE OR id = 0;".to_string()),
+            ("wide", wide),
+        ];
+        for (label, sql) in &statements {
+            let (_selective_dir, selective_path, mut selective) =
+                open_copy(&base, &format!("m36-{label}-s"));
+            let (_sealed_dir, _, mut sealed) = open_copy(&base, &format!("m36-{label}-f"));
+            crate::storage::reset_phases();
+            let selective_count = change_count(&mut selective, sql);
+            let selective_phases = crate::storage::take_phases();
+            crate::storage::reset_phases();
+            let sealed_count = {
+                let _guard = crate::storage::ForceAncestorRewrite::new();
+                change_count(&mut sealed, sql)
+            };
+            let sealed_phases = crate::storage::take_phases();
+            assert_eq!(selective_count, sealed_count, "{label}");
+            assert_eq!(
+                mutation_checksum(&mut selective),
+                mutation_checksum(&mut sealed),
+                "{label}"
+            );
+            assert_eq!(
+                selective.table("users").unwrap().row_ids(),
+                sealed.table("users").unwrap().row_ids(),
+                "{label}"
+            );
+            assert_eq!(
+                selective.table("users").unwrap().next_row_id(),
+                sealed.table("users").unwrap().next_row_id(),
+                "{label}"
+            );
+            for index in ["idx_users_id", "idx_users_bucket"] {
+                assert_eq!(
+                    index_postings(&mut selective, index),
+                    index_postings(&mut sealed, index),
+                    "{label} {index}"
+                );
+            }
+            assert_eq!(
+                selective_phases.separator_updates, sealed_phases.separator_updates,
+                "{label}"
+            );
+            assert!(
+                selective_phases.ancestor_writes <= sealed_phases.ancestor_writes,
+                "{label} selective {} sealed {}",
+                selective_phases.ancestor_writes,
+                sealed_phases.ancestor_writes
+            );
+            assert!(
+                selective_phases.wal_bytes <= sealed_phases.wal_bytes,
+                "{label} selective {} sealed {}",
+                selective_phases.wal_bytes,
+                sealed_phases.wal_bytes
+            );
+            let checksum = mutation_checksum(&mut selective);
+            drop(selective);
+            let mut reopened = Database::open(&selective_path).unwrap();
+            assert_eq!(mutation_checksum(&mut reopened), checksum, "{label}");
+            drop(reopened);
+            let mut again = Database::open(&selective_path).unwrap();
+            assert_eq!(mutation_checksum(&mut again), checksum, "{label}");
+        }
+        for (label, sql) in [
+            ("ten", "DELETE FROM users WHERE id >= 1 AND id <= 10;"),
+            (
+                "buckets",
+                "DELETE FROM users WHERE bucket = 0 OR bucket = 1;",
+            ),
+            ("all", "DELETE FROM users WHERE TRUE OR id = 0;"),
+        ] {
+            assert_precommit(
+                &base,
+                &format!("m36-pre-{label}"),
+                sql,
+                crate::storage::Inject::BeforeLogSync,
+            );
+            for inject in [
+                crate::storage::Inject::AfterLogSync,
+                crate::storage::Inject::CommitSyncFailed,
+                crate::storage::Inject::DuringCheckpoint(1),
+            ] {
+                assert_postcommit(&base, &format!("m36-post-{label}-{inject:?}"), sql, inject);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release profile of selective ancestor maintenance"]
+    fn profile_milestone36() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!("milestone36 cpu={cpu} mem_bytes={mem} rustc={rustc}");
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            let (_base_dir, base) = seed_delete_db("m36-base", rows, 0x3100);
+            let samples = if rows == 100_000 { 3 } else { 1 };
+            for workload in [
+                "one",
+                "ten",
+                "buckets",
+                "half",
+                "sparse",
+                "alternating",
+                "consecutive",
+                "all",
+                "wide",
+            ] {
+                let mut current = Vec::with_capacity(samples);
+                let mut sealed = Vec::with_capacity(samples);
+                for sample in 0..samples {
+                    current.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Presence,
+                    ));
+                    sealed.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Seal,
+                    ));
+                }
+                for (index, sample) in current.iter().enumerate() {
+                    let previous = &sealed[index];
+                    assert_eq!(sample.checksum, previous.checksum, "{workload} {rows}");
+                    assert_eq!(
+                        sample.separator_updates, previous.separator_updates,
+                        "{workload} {rows}"
+                    );
+                    assert_eq!(sample.spans, previous.spans, "{workload} {rows}");
+                    assert_eq!(sample.singles, previous.singles, "{workload} {rows}");
+                    assert!(
+                        sample.ancestor_writes <= previous.ancestor_writes,
+                        "{workload} {rows} selective {} sealed {}",
+                        sample.ancestor_writes,
+                        previous.ancestor_writes
+                    );
+                    assert!(
+                        sample.bulk_wal <= previous.bulk_wal,
+                        "{workload} {rows} selective {} sealed {}",
+                        sample.bulk_wal,
+                        previous.bulk_wal
+                    );
+                }
+                if rows == 100_000 && matches!(workload, "buckets" | "all" | "wide") {
+                    assert!(
+                        current[0].ancestor_writes < sealed[0].ancestor_writes,
+                        "{workload} selective {} sealed {}",
+                        current[0].ancestor_writes,
+                        sealed[0].ancestor_writes
+                    );
+                }
+                let current_us = median(
+                    &current
+                        .iter()
+                        .map(|sample| sample.bulk_us)
+                        .collect::<Vec<_>>(),
+                );
+                let sealed_us = median(
+                    &sealed
+                        .iter()
+                        .map(|sample| sample.bulk_us)
+                        .collect::<Vec<_>>(),
+                );
+                let current_index = median(
+                    &current
+                        .iter()
+                        .map(|sample| sample.bulk_index_us)
+                        .collect::<Vec<_>>(),
+                );
+                let sealed_index = median(
+                    &sealed
+                        .iter()
+                        .map(|sample| sample.bulk_index_us)
+                        .collect::<Vec<_>>(),
+                );
+                let sample = &current[0];
+                let previous = &sealed[0];
+                println!(
+                    "milestone36 median workload={workload} rows={rows} samples={samples} current_us={current_us} sealed_us={sealed_us} current_index_us={current_index} sealed_index_us={sealed_index} wal={} sealed_wal={} checksum={} descents={} reused={} reads={} writes={} sealed_writes={} separators={} index_pages={} sealed_index_pages={} builds={} build_us={} scratch={} verified={}",
+                    sample.bulk_wal,
+                    previous.bulk_wal,
+                    sample.checksum,
+                    sample.descents,
+                    sample.reused_paths,
+                    sample.ancestor_reads,
+                    sample.ancestor_writes,
+                    previous.ancestor_writes,
+                    sample.separator_updates,
+                    sample.index_pages,
+                    previous.index_pages,
+                    sample.presence_builds,
+                    sample.presence_build_us,
                     sample.scratch,
                     sample.presence_verified
                 );

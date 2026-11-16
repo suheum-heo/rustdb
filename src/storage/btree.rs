@@ -453,6 +453,8 @@ thread_local! {
     static FORCE_PRESENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FORCE_LATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FORCE_PRIOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_SEAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static COUNT_SPINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Keep Milestone 32's leaf-chain check and skip the presence map.
@@ -490,6 +492,26 @@ impl ForceLatePresence {
 impl Drop for ForceLatePresence {
     fn drop(&mut self) {
         FORCE_LATE.with(|flag| flag.set(false));
+    }
+}
+
+/// Rewrite every ancestor after a non-underflow leaf edit, including ancestors
+/// whose separator and child pointers are unchanged. This is Milestone 35.
+#[cfg(test)]
+pub(crate) struct ForceAncestorRewrite;
+
+#[cfg(test)]
+impl ForceAncestorRewrite {
+    pub(crate) fn new() -> Self {
+        FORCE_SEAL.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceAncestorRewrite {
+    fn drop(&mut self) {
+        FORCE_SEAL.with(|flag| flag.set(false));
     }
 }
 
@@ -2970,15 +2992,18 @@ fn remove_leaf_entries(leaf: &mut Leaf, entries: &[Entry]) -> Result<(), DbError
     Ok(())
 }
 
-/// Write the leaf and re-encode every ancestor on `path`.
+/// Write the leaf, then write only ancestors whose persisted bytes change.
 ///
-/// Only the separator that covers this leaf changes, and only when its minimum
-/// entry changed. Higher separators stay put. Rewriting the unchanged
-/// ancestors matches the pages a series of single deletes would seal.
+/// The separator that covers this leaf changes only when the leaf's minimum
+/// entry changes and this leaf is not the leftmost child. The new minimum
+/// walks up through leftmost children and is stored in the first ancestor that
+/// keeps a separator for that subtree. Ancestors above that separator do not
+/// change. A root leaf has an empty path.
 ///
-/// Each ancestor reads its leftmost child, which is the read a single delete
-/// uses to recompute that node's minimum. A corrupt page on that walk fails
-/// the batch before the leaf is written.
+/// Every ancestor is still decoded, and its leftmost child is still walked,
+/// before the leaf is written. A corrupt page on that walk fails the batch
+/// with no page written. A test can force every ancestor to be sealed again,
+/// which is Milestone 35.
 fn rewrite_leaf_path(
     store: &mut dyn Nodes,
     path: &[(u32, usize)],
@@ -2991,27 +3016,73 @@ fn rewrite_leaf_path(
         .first()
         .copied()
         .ok_or_else(|| corrupt(leaf_id))?;
-    for &(id, _) in path.iter().rev() {
-        let node = decode_internal(&store.read_node(id)?)?;
-        let child = node.children.first().copied().ok_or_else(|| corrupt(id))?;
-        let _ = subtree_min(store, child)?;
+    let mut updates = Vec::new();
+    let mut branched = false;
+    {
+        let _spine = CountSpine::new();
+        for &(id, child_index) in path.iter().rev() {
+            super::profile::note_ancestor_read();
+            let node = decode_internal(&store.read_node(id)?)?;
+            if child_index >= node.children.len() {
+                return Err(corrupt(id));
+            }
+            let child = node.children.first().copied().ok_or_else(|| corrupt(id))?;
+            let _ = subtree_min(store, child)?;
+            let mut changed = false;
+            if !branched && child_index > 0 {
+                if minimum_changed && node.keys[child_index - 1] != minimum {
+                    changed = true;
+                    super::profile::note_separator_update();
+                }
+                branched = true;
+            }
+            if changed || seal_ancestors() {
+                updates.push((id, child_index, changed));
+            }
+        }
     }
     store.write_node(leaf_id, encode_leaf(leaf_id, leaf)?)?;
-    let mut branched = false;
-    for &(id, child_index) in path.iter().rev() {
+    for (id, child_index, changed) in updates {
         let mut node = decode_internal(&store.read_node(id)?)?;
         if child_index >= node.children.len() {
             return Err(corrupt(id));
         }
-        if !branched && child_index > 0 {
-            if minimum_changed {
-                node.keys[child_index - 1] = minimum;
-            }
-            branched = true;
+        if changed {
+            node.keys[child_index - 1] = minimum;
         }
         store.write_node(id, encode_internal(id, &node)?)?;
+        super::profile::note_ancestor_write();
     }
     Ok(())
+}
+
+/// Count leftmost-spine reads while a non-underflow rewrite validates ancestors.
+struct CountSpine;
+
+impl CountSpine {
+    fn new() -> Self {
+        #[cfg(test)]
+        COUNT_SPINE.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+impl Drop for CountSpine {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        COUNT_SPINE.with(|flag| flag.set(false));
+    }
+}
+
+fn seal_ancestors() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_SEAL.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3044,6 +3115,10 @@ fn rightmost_leaf(store: &mut dyn Nodes, root: u32) -> Result<u32, DbError> {
 fn leftmost_leaf(store: &mut dyn Nodes, root: u32) -> Result<u32, DbError> {
     let mut id = root;
     for _ in 0..64 {
+        #[cfg(test)]
+        if COUNT_SPINE.with(|flag| flag.get()) {
+            super::profile::note_ancestor_read();
+        }
         let page = store.read_node(id)?;
         if page_type(&page)? == TYPE_INDEX_LEAF {
             return Ok(id);
@@ -6407,6 +6482,194 @@ mod tests {
         });
         almost.pop();
         same_tree(limits, &order, &almost);
+    }
+
+    #[test]
+    fn selective_ancestor_rewrite_seals_only_a_changed_separator() {
+        let _profile = crate::storage::profile::enable();
+        let limits = small();
+        let mut order = sequential(40);
+        order.extend((-8..0).map(|key| (key, u64::try_from(300 - key).unwrap())));
+        order.push((i64::MIN, 1));
+        order.push((i64::MIN, 2));
+        order.push((i64::MAX, 1));
+        order.push((i64::MAX, 2));
+        let (mut probe, root) = fill(limits, &order);
+        assert!(height(&mut probe, root).unwrap() >= 3);
+        let runs = leaf_runs(&mut probe, root);
+        let roomy: Vec<_> = runs
+            .iter()
+            .filter(|run| {
+                let keep = if run.id == root {
+                    1
+                } else {
+                    limits.leaf_min.max(1)
+                };
+                run.entries.len() > keep && run.entries.len() >= 2
+            })
+            .collect();
+        assert!(!roomy.is_empty(), "no leaf can lose one posting");
+        let interior = roomy
+            .iter()
+            .find(|run| run.entries.last().copied() != Some(run.entries[0]))
+            .expect("leaf with an interior posting");
+        let unchanged = *interior.entries.last().unwrap();
+        assert_ne!(unchanged, interior.entries[0]);
+
+        let images = |remove: Entry| {
+            let (mut selective, selective_root) = fill(limits, &order);
+            let (mut sealed, sealed_root) = fill(limits, &order);
+            let (mut single, single_root) = fill(limits, &order);
+            let selective_root =
+                delete_many(&mut selective, selective_root, &[remove], limits).unwrap();
+            let sealed_root = {
+                let _guard = ForceAncestorRewrite::new();
+                delete_many(&mut sealed, sealed_root, &[remove], limits).unwrap()
+            };
+            let single_root = delete(&mut single, single_root, remove.0, remove.1, limits).unwrap();
+            assert_eq!(
+                validate(&mut selective, selective_root, limits).unwrap(),
+                validate(&mut single, single_root, limits).unwrap()
+            );
+            assert_eq!(
+                validate(&mut sealed, sealed_root, limits).unwrap(),
+                validate(&mut single, single_root, limits).unwrap()
+            );
+            assert_eq!(page_image(&selective), page_image(&single));
+            assert_eq!(page_image(&sealed), page_image(&single));
+            assert_eq!(selective.free, single.free);
+        };
+
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(limits, &order);
+            delete_many(&mut store, root, &[unchanged], limits).unwrap();
+        }
+        let skipped = crate::storage::profile::take();
+        assert_eq!(skipped.separator_updates, 0, "{skipped:?}");
+        assert_eq!(skipped.ancestor_writes, 0, "{skipped:?}");
+        assert!(skipped.ancestor_reads > 0, "{skipped:?}");
+        images(unchanged);
+
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(limits, &order);
+            let _guard = ForceAncestorRewrite::new();
+            delete_many(&mut store, root, &[unchanged], limits).unwrap();
+        }
+        let sealed = crate::storage::profile::take();
+        assert!(
+            sealed.ancestor_writes > skipped.ancestor_writes,
+            "sealed {} selective {}",
+            sealed.ancestor_writes,
+            skipped.ancestor_writes
+        );
+
+        let separator = roomy.iter().find(|run| {
+            let (path, id) = path_to_leaf(&mut probe, root, run.entries[0]).unwrap();
+            id == run.id && path.last().is_some_and(|(_, index)| *index > 0)
+        });
+        if let Some(run) = separator {
+            let minimum = run.entries[0];
+            crate::storage::profile::reset();
+            {
+                let (mut store, root) = fill(limits, &order);
+                delete_many(&mut store, root, &[minimum], limits).unwrap();
+            }
+            let updated = crate::storage::profile::take();
+            images(minimum);
+            assert_eq!(updated.separator_updates, 1, "{updated:?}");
+            assert_eq!(updated.ancestor_writes, 1, "{updated:?}");
+            assert!(
+                updated.ancestor_reads > updated.ancestor_writes,
+                "{updated:?}"
+            );
+        }
+
+        let leftmost = runs.iter().find(|run| {
+            let (path, id) = path_to_leaf(&mut probe, root, run.entries[0]).unwrap();
+            id == run.id
+                && path.iter().all(|(_, index)| *index == 0)
+                && run.entries.len() > limits.leaf_min
+        });
+        if let Some(run) = leftmost {
+            crate::storage::profile::reset();
+            {
+                let (mut store, root) = fill(limits, &order);
+                delete_many(&mut store, root, &[run.entries[0]], limits).unwrap();
+            }
+            let edge = crate::storage::profile::take();
+            images(run.entries[0]);
+            assert_eq!(edge.ancestor_writes, 0, "{edge:?}");
+            assert_eq!(edge.separator_updates, 0, "{edge:?}");
+        }
+
+        let (mut root_leaf, root_id) = fill(limits, &sequential(limits.leaf_max as i64));
+        assert_eq!(height(&mut root_leaf, root_id).unwrap(), 1);
+        crate::storage::profile::reset();
+        delete_many(&mut root_leaf, root_id, &[(2, 2)], limits).unwrap();
+        let rooted = crate::storage::profile::take();
+        assert_eq!(rooted.ancestor_reads, 0, "{rooted:?}");
+        assert_eq!(rooted.ancestor_writes, 0, "{rooted:?}");
+
+        let wide = sequential(300);
+        let (mut wide_probe, wide_root) = fill(production(), &wide);
+        assert_eq!(height(&mut wide_probe, wide_root).unwrap(), 2);
+        let wide_runs = leaf_runs(&mut wide_probe, wide_root);
+        let right = wide_runs.last().unwrap();
+        assert!(right.entries.len() > production().leaf_min);
+        let right_max = *right.entries.last().unwrap();
+        let right_min = right.entries[0];
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(production(), &wide);
+            delete_many(&mut store, root, &[right_max], production()).unwrap();
+        }
+        let boundary = crate::storage::profile::take();
+        assert_eq!(boundary.ancestor_writes, 0, "{boundary:?}");
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(production(), &wide);
+            delete_many(&mut store, root, &[right_min], production()).unwrap();
+        }
+        let propagated = crate::storage::profile::take();
+        assert_eq!(propagated.separator_updates, 1, "{propagated:?}");
+        assert_eq!(propagated.ancestor_writes, 1, "{propagated:?}");
+        same_tree(production(), &wide, &[right_max]);
+        same_tree(production(), &wide, &[right_min]);
+
+        let spine = leftmost_leaf(&mut probe, root).unwrap();
+        let other = roomy.iter().find(|run| run.id != spine).unwrap_or(interior);
+        let other_key = if other.entries[0] != unchanged {
+            other.entries[0]
+        } else {
+            *other.entries.last().unwrap()
+        };
+        let mut damaged = probe.clone();
+        let mut page = damaged.read_node(spine).unwrap();
+        page.as_mut_slice()[0] = 0;
+        damaged.write_node(spine, page).unwrap();
+        let before = page_image(&damaged);
+        let selective_error = delete_many(&mut damaged.clone(), root, &[other_key], limits)
+            .unwrap_err()
+            .to_string();
+        let sealed_error = {
+            let _guard = ForceAncestorRewrite::new();
+            delete_many(&mut damaged.clone(), root, &[other_key], limits)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(selective_error.contains("corrupt"), "{selective_error}");
+        assert_eq!(selective_error, sealed_error);
+        assert_eq!(page_image(&damaged), before);
+
+        same_tree(limits, &order, &[unchanged, (99, 99)]);
+        same_tree(limits, &order, &[unchanged, unchanged]);
+        let (mut cycled, mut cycled_root) = fill(limits, &order);
+        cycled_root = delete_many(&mut cycled, cycled_root, &[unchanged], limits).unwrap();
+        cycled_root = insert(&mut cycled, cycled_root, unchanged.0, unchanged.1, limits).unwrap();
+        cycled_root = delete(&mut cycled, cycled_root, unchanged.0, unchanged.1, limits).unwrap();
+        assert!(validate(&mut cycled, cycled_root, limits).is_ok());
     }
 
     #[test]

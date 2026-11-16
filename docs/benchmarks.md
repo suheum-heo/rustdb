@@ -1548,3 +1548,31 @@ Buckets and alternating are the mixed grouped and single deletes. Each reuses 61
 Delete-all reuses 246 paths. Descents fall from 248 to 2. The index timer rises from 32,377 µs to 33,799 µs. The statement stays 312,501 µs against 312,774 µs. The log stays 12,168,896 bytes. Each reused single still reads the ancestors before it writes the leaf, including ancestors whose separator did not change. That probe is the remaining index cost. Wide reuses 69 paths and descends twice, against 71 prior descents and 7,274 late descents. Its index time is 11,513 µs against 11,197 µs prior. The statement is 262,996 µs against 261,099 µs prior and 267,243 µs late. The log stays 12,181,196 bytes and the checksum stays 4546235365. The map payload stays 1,600,000 bytes wherever a plan is built.
 
 One row never enters the multi-posting path, so `reused` stays 0 and the log stays 36,996 bytes. At 100 rows every tree is one leaf and no path is reused. At 1,000 rows the bucket, half, alternating, consecutive, delete-all, and wide statements do plan: half reuses 1 path, buckets 73, alternating 9, consecutive 6, delete-all 37, and wide 29. Their logs match the prior path.
+
+## Milestone 36 selective ancestor maintenance
+
+16 Nov 2026, 5:32 PM CST, Apple M5, 17179869184 bytes of memory, rustc 1.100.0. The ignored test is `profile_milestone36`. It uses seed `0x3100`. `current` rewrites a non-underflow leaf and seals an ancestor only when that ancestor's separator changes. `sealed` restores Milestone 35 and rewrites every ancestor on that path. At 100,000 rows each workload is the median of three fresh copies. Smaller sizes are one sample. Counters and the log are from the first copy and agreed on a second run. Statement time includes the log sync. These are process-local timings. Peak RSS was not measured.
+
+`reads` counts ancestor pages decoded by that rewrite, plus the leftmost spine walked from each ancestor. It does not count a second read of the leaf after that walk, and it is not WAL I/O. `writes` counts ancestors sealed by the rewrite. `sealed writes` is the Milestone 35 count. `index pages` is the commit's dirty index-page set, counted once per page. A separator change and the leaf write are one commit.
+
+| workload | current | sealed | index | sealed index | reads | writes | sealed writes | separators | index pages | WAL | checksum |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| one | 20,615 | 20,653 | 19 | 16 | 0 | 0 | 0 | 0 | 4 | 36,996 | 5001482560 |
+| ten | 65,009 | 64,262 | 4,243 | 4,192 | 0 | 0 | 0 | 0 | 249 | 2,045,996 | 5001482470 |
+| buckets | 257,643 | 256,130 | 17,672 | 17,896 | 460 | 0 | 184 | 0 | 246 | 10,906,096 | 3000897535 |
+| half | 200,432 | 202,886 | 18,845 | 19,093 | 0 | 0 | 0 | 0 | 127 | 7,101,296 | 3750796338 |
+| sparse | 214,742 | 213,409 | 6,258 | 6,316 | 5 | 0 | 2 | 0 | 320 | 9,581,796 | 4001250051 |
+| alternating | 273,511 | 272,842 | 18,053 | 18,524 | 465 | 0 | 186 | 0 | 282 | 11,537,496 | 2500711280 |
+| consecutive | 133,730 | 132,602 | 11,557 | 11,326 | 0 | 0 | 0 | 0 | 189 | 4,555,196 | 4688644540 |
+| all | 314,659 | 314,867 | 31,981 | 33,001 | 1,235 | 0 | 494 | 0 | 1 | 12,168,896 | 0 |
+| wide | 263,162 | 263,074 | 11,129 | 11,322 | 350 | 0 | 140 | 0 | 653 | 12,181,196 | 4546235365 |
+
+Times are microseconds. Checksums and log lengths match Milestone 35 on every 100,000-row workload. Dirty index pages match the sealed path on every size that was measured.
+
+Buckets, alternating, delete-all, and wide are the cases with reused non-underflow paths. At 100,000 rows they seal 0 ancestors against 184, 186, 494, and 140. None of those deletions changed a separator. The reads remain: 460, 465, 1,235, and 350. Delete-all's index timer falls from 33,001 µs to 31,981 µs. The statement stays 314,659 µs against 314,867 µs. Bucket index time is 17,672 µs against 17,896 µs, and the statement is 257,643 µs against 256,130 µs. Wide index time is 11,129 µs against 11,322 µs. Alternating index time is 18,053 µs against 18,524 µs. Those statement gaps are smaller than the run-to-run spread. A second run of alternating was 342,152 µs against 285,758 µs with the same log and the same 282 dirty index pages.
+
+The log does not shrink. The commit records each dirty page once. The ancestors this rewrite skips are written later in the same statement by a span rebuild or by a single-entry delete, so they stay in the dirty set. Delete-all still dirties 1 index page. Buckets still dirties 246. Wide still dirties 653. Sparse reads 5 ancestor pages and seals 0 against 2, and both paths dirty 320 index pages. Half and consecutive have no reused path at this size, so both arms seal nothing and the logs stay 7,101,296 and 4,555,196 bytes.
+
+At 100 rows every tree is one leaf. Ancestor reads and writes are 0, and both logs match. At 1,000 rows buckets reuses 73 paths, reads 220 ancestors, and seals 0 against 110. Wide reuses 29, reads 60, seals 1 separator against 30 ancestor writes, and both paths dirty 10 index pages. The logs match: buckets 131,296 bytes, wide 135,396 bytes. At 10,000 rows buckets seals 1 separator and 1 ancestor against 144 sealed writes, and both paths dirty 30 index pages. Delete-all seals 0 against 128 and dirties 1 index page. The log is 1,213,696 bytes either way.
+
+Fewer ancestor seals do not reduce the log on these statements, and they do not move statement time outside timer noise. The remaining index cost on a reused path is the ancestor read and the leftmost-spine walk, which still run when no separator changes.
