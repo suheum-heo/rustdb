@@ -225,13 +225,21 @@ impl Database {
     }
 
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult, DbError> {
+        self.clear_selective();
         if !self.stores_on_disk() {
             return self.apply(statement);
         }
         let change = durable_change(&statement);
         let undo = self.prepare_durable(&change);
-        let result = self.apply(statement)?;
+        let result = match self.apply(statement) {
+            Ok(result) => result,
+            Err(error) => {
+                self.clear_selective();
+                return Err(error);
+            }
+        };
         if matches!(change, DurableChange::None) {
+            self.clear_selective();
             return Ok(result);
         }
         if let Err(error) = self.publish() {
@@ -2333,31 +2341,31 @@ impl Database {
         let matched = self.matched_ids(table_name, name, &positions, Some(filter))?;
         let filter_us = filter_started.elapsed().as_micros();
         let stage_started = std::time::Instant::now();
-        let (new_rows, count, width) = self.assigned_rows(table_name, &matched, assignments)?;
+        let proposals = self.proposed_rows(table_name, &matched, assignments)?;
         let stage_us = stage_started.elapsed().as_micros();
-        let heap_rows = new_rows.len();
-        let apply_started = std::time::Instant::now();
-        self.table_mut(table_name)?.rewrite_all(new_rows)?;
-        let apply_us = apply_started.elapsed().as_micros();
+        let heap_rows = self.table(table_name)?.rows().len();
+        let installed = self.install_update(table_name, proposals)?;
         note_mutation(MutationNote::index(
             planned,
             MutationCounts {
                 candidates: positions.len(),
                 examined: positions.len(),
                 heap_rows,
-                staged_rows: heap_rows,
-                modified: count,
-                width,
+                staged_rows: installed.staged_rows,
+                modified: installed.count,
+                width: installed.width,
             },
             MutationTiming {
                 probe_us,
                 validate_us,
                 filter_us,
                 stage_us,
-                apply_us,
+                apply_us: installed.apply_us,
             },
         ));
-        Ok(StatementResult::Update { count })
+        Ok(StatementResult::Update {
+            count: installed.count,
+        })
     }
 
     fn update_scanned(
@@ -2368,41 +2376,42 @@ impl Database {
         assignments: &[BoundAssignment],
     ) -> Result<StatementResult, DbError> {
         let discover_started = std::time::Instant::now();
-        let (new_rows, count) = {
+        let proposals = {
             let table = self.table(table_name)?;
-            let mut new_rows = Vec::with_capacity(table.rows().len());
-            let mut count = 0usize;
-            for row in table.rows() {
+            let mut proposals = Vec::new();
+            for (position, row) in table.rows().iter().enumerate() {
                 if !expr::row_matches(filter, row)? {
-                    new_rows.push(row.clone());
                     continue;
                 }
-                new_rows.push(assign_row(row, assignments)?);
-                count += 1;
+                let Some(row_id) = table.row_id_at(position) else {
+                    return Err(DbError::Internal(format!(
+                        "table '{table_name}' is missing a row id at {position}"
+                    )));
+                };
+                proposals.push((row_id, assign_row(row, assignments)?));
             }
-            (new_rows, count)
+            proposals
         };
         let discover_us = discover_started.elapsed().as_micros();
-        let apply_started = std::time::Instant::now();
-        let heap_rows = new_rows.len();
-        let width = new_rows.first().map(Vec::len).unwrap_or(0);
-        self.table_mut(table_name)?.rewrite_all(new_rows)?;
-        let apply_us = apply_started.elapsed().as_micros();
+        let heap_rows = self.table(table_name)?.rows().len();
+        let installed = self.install_update(table_name, proposals)?;
         note_mutation(MutationNote::scan(
             planned,
-            count,
+            installed.count,
             heap_rows,
-            heap_rows,
-            width,
+            installed.staged_rows,
+            installed.width,
             MutationTiming {
                 probe_us: 0,
                 validate_us: 0,
                 filter_us: discover_us,
                 stage_us: 0,
-                apply_us,
+                apply_us: installed.apply_us,
             },
         ));
-        Ok(StatementResult::Update { count })
+        Ok(StatementResult::Update {
+            count: installed.count,
+        })
     }
 
     fn delete_indexed(
@@ -2622,42 +2631,85 @@ impl Database {
         Ok(matched)
     }
 
-    /// Build the full replacement. Only `matched` row ids are assigned.
+    /// New images for `matched` row ids, in that order.
     ///
-    /// The walk is heap order, so a row changes once and the vector positions
-    /// stay aligned with the existing row ids. `rewrite_all` sees that vector
-    /// only after every assignment has succeeded.
-    fn assigned_rows(
+    /// Unmatched rows are not cloned. A failure while assigning a later row
+    /// returns before any row is installed, so the statement's target set
+    /// cannot change because an earlier key was updated.
+    fn proposed_rows(
         &self,
         table_name: &str,
         matched: &[u64],
         assignments: &[BoundAssignment],
-    ) -> Result<(Vec<Vec<Value>>, usize, usize), DbError> {
+    ) -> Result<Vec<(u64, Vec<Value>)>, DbError> {
         let table = self.table(table_name)?;
-        let width = table.schema().len();
-        let targets: HashSet<u64> = matched.iter().copied().collect();
-        let mut new_rows = Vec::with_capacity(table.rows().len());
-        let mut count = 0usize;
-        for (position, row) in table.rows().iter().enumerate() {
-            let Some(row_id) = table.row_id_at(position) else {
+        let mut updates = Vec::with_capacity(matched.len());
+        for row_id in matched {
+            let Some(position) = table.position(*row_id) else {
                 return Err(DbError::Internal(format!(
-                    "table '{table_name}' is missing a row id at {position}"
+                    "table '{table_name}' is missing row {row_id}"
                 )));
             };
-            if !targets.contains(&row_id) {
-                new_rows.push(row.clone());
-                continue;
-            }
-            new_rows.push(assign_row(row, assignments)?);
-            count += 1;
+            let Some(row) = table.rows().get(position) else {
+                return Err(DbError::Internal(format!(
+                    "table '{table_name}' is missing row {row_id}"
+                )));
+            };
+            updates.push((*row_id, assign_row(row, assignments)?));
         }
-        if count != matched.len() {
-            return Err(DbError::Internal(format!(
-                "table '{table_name}' matched {} rows and updated {count}",
-                matched.len()
-            )));
+        Ok(updates)
+    }
+
+    /// Install prepared rows. The full-table guard keeps the old replacement
+    /// so a test can compare it with the selective path.
+    fn install_update(
+        &mut self,
+        table_name: &str,
+        proposals: Vec<(u64, Vec<Value>)>,
+    ) -> Result<UpdateInstall, DbError> {
+        let count = proposals.len();
+        let width = if let Some((_, values)) = proposals.first() {
+            values.len()
+        } else {
+            self.table(table_name)?.schema().len()
+        };
+        if full_table_update() {
+            let rows = {
+                let table = self.table(table_name)?;
+                let mut rows = table.rows().to_vec();
+                for (row_id, values) in &proposals {
+                    let Some(position) = table.position(*row_id) else {
+                        return Err(DbError::Internal(format!(
+                            "table '{table_name}' is missing row {row_id}"
+                        )));
+                    };
+                    rows[position] = values.clone();
+                }
+                rows
+            };
+            let apply_started = std::time::Instant::now();
+            self.table_mut(table_name)?.rewrite_all(rows)?;
+            let apply_us = apply_started.elapsed().as_micros();
+            let staged_rows = self.table(table_name)?.rows().len();
+            return Ok(UpdateInstall {
+                count,
+                width,
+                staged_rows,
+                apply_us,
+            });
         }
-        Ok((new_rows, count, width))
+        let row_ids: Vec<u64> = proposals.iter().map(|(row_id, _)| *row_id).collect();
+        let staged_rows = row_ids.len();
+        let apply_started = std::time::Instant::now();
+        self.table_mut(table_name)?.rewrite_matched(proposals)?;
+        self.stage_selective_update(table_name, row_ids);
+        let apply_us = apply_started.elapsed().as_micros();
+        Ok(UpdateInstall {
+            count,
+            width,
+            staged_rows,
+            apply_us,
+        })
     }
 
     /// Heap slots that survive `DELETE`, in increasing order.
@@ -2695,6 +2747,13 @@ impl Database {
 }
 
 /// Counts for one indexed `UPDATE` or `DELETE`.
+struct UpdateInstall {
+    count: usize,
+    width: usize,
+    staged_rows: usize,
+    apply_us: u128,
+}
+
 struct MutationCounts {
     candidates: usize,
     examined: usize,
@@ -2720,10 +2779,12 @@ struct MutationTiming {
 /// One `UPDATE` or `DELETE`, recorded for tests and the release profile.
 ///
 /// `staged_bytes` is the target-id list plus the replacement cells. It is not
-/// process RSS. `discover_us` is the probe, the heap equality check, and
-/// `WHERE`. `apply_us` is the in-memory install. A heap scan folds its filter
-/// into `filter_us` and leaves the probe and the equality check at zero. The
-/// WAL and the heap compare happen later, in publish.
+/// process RSS, and it does not include the pre-statement undo clone. On the
+/// selective path the replacement is only the matched rows. The full-rewrite
+/// guard stages every row. `discover_us` is the probe, the heap equality
+/// check, and `WHERE`. `apply_us` is the in-memory install. A heap scan folds
+/// its filter into `filter_us` and leaves the probe and the equality check at
+/// zero. The WAL and the heap compare happen later, in publish.
 #[cfg_attr(test, derive(Clone))]
 #[cfg_attr(not(test), allow(dead_code))]
 struct MutationNote {
@@ -4925,6 +4986,28 @@ impl Drop for ForceHeapMutation {
     }
 }
 
+/// Keeps the full-table `UPDATE` replacement for the life of the guard.
+///
+/// Candidate discovery is unchanged. Publish compares every stored row, which
+/// is the baseline for the selective path.
+#[cfg(test)]
+pub(crate) struct ForceFullUpdate;
+
+#[cfg(test)]
+impl ForceFullUpdate {
+    pub(crate) fn new() -> Self {
+        FORCE_FULL_UPDATE.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceFullUpdate {
+    fn drop(&mut self) {
+        FORCE_FULL_UPDATE.with(|flag| flag.set(false));
+    }
+}
+
 /// Skips the `WHERE` cell-type check so a test can show the missed row.
 #[cfg(test)]
 struct SkipWhereSchemaCheck;
@@ -5876,6 +5959,7 @@ thread_local! {
     static DISTINCT_RESERVE_BUDGET: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
     static FORCE_HEAP_MUTATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_FULL_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// When set, an indexed `UPDATE` or `DELETE` does not precheck `WHERE` cells.
     static SKIP_WHERE_SCHEMA_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LAST_MUTATION: std::cell::RefCell<Option<MutationNote>> =
@@ -5895,6 +5979,22 @@ fn force_left_index() -> bool {
 #[cfg(test)]
 fn force_heap_mutation() -> bool {
     FORCE_HEAP_MUTATION.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn force_full_update() -> bool {
+    FORCE_FULL_UPDATE.with(std::cell::Cell::get)
+}
+
+fn full_table_update() -> bool {
+    #[cfg(test)]
+    {
+        force_full_update()
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -14671,6 +14771,319 @@ mod tests {
         (dir, db)
     }
 
+    fn open_spanning(label: &str) -> (crate::test_dir::TestDir, Database) {
+        let (dir, mut db) = open_mutation(label);
+        let name = "n".repeat(180);
+        let mut sql = String::from("INSERT INTO users VALUES ");
+        for index in 0..30 {
+            if index > 0 {
+                sql.push(',');
+            }
+            let id = 100 + index;
+            sql.push_str(&format!("({id}, '{name}', TRUE, 1)"));
+        }
+        sql.push(';');
+        db.execute(&sql).unwrap();
+        (dir, db)
+    }
+
+    fn open_joined(label: &str) -> (crate::test_dir::TestDir, Database) {
+        let dir = crate::test_dir::TestDir::new(label);
+        let path = dir.join("db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INT, name TEXT);")
+                .unwrap();
+            db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+                .unwrap();
+            db.execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Bea'), (3, 'Cy');")
+                .unwrap();
+            db.execute("INSERT INTO orders VALUES (1, 10), (1, 11), (2, 20), (NULL, 5);")
+                .unwrap();
+        }
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_users_id ON users(id);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_orders_user ON orders(user_id);")
+            .unwrap();
+        (dir, db)
+    }
+
+    fn text_z() -> Value {
+        Value::Text("Z".to_string())
+    }
+
+    fn assert_checksums(path: &std::path::Path) {
+        let bytes = std::fs::read(path).unwrap();
+        let page_size = crate::storage::PAGE_SIZE;
+        assert_eq!(bytes.len() % page_size, 0, "{}", path.display());
+        for (index, chunk) in bytes.chunks(page_size).enumerate() {
+            let mut page = crate::storage::Page::new();
+            page.as_mut_slice().copy_from_slice(chunk);
+            crate::storage::verify(&page, u32::try_from(index).unwrap())
+                .unwrap_or_else(|error| panic!("page {index}: {error}"));
+        }
+    }
+
+    fn open_notes(label: &str) -> (crate::test_dir::TestDir, Database) {
+        let dir = crate::test_dir::TestDir::new(label);
+        let path = dir.join("db");
+        let long = "n".repeat(2_100);
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE notes (id INT, name TEXT, extra TEXT);")
+                .unwrap();
+            db.execute(&format!(
+                "INSERT INTO notes VALUES (1, 'short', NULL), (2, '{long}', NULL);"
+            ))
+            .unwrap();
+        }
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_notes_id ON notes(id);")
+            .unwrap();
+        (dir, db)
+    }
+
+    fn notes_rows(db: &mut Database) -> Vec<Vec<Value>> {
+        query(
+            db,
+            "SELECT id, name, extra FROM notes WHERE TRUE OR id = 1;",
+        )
+        .rows
+    }
+
+    fn open_packed(label: &str) -> (crate::test_dir::TestDir, Database) {
+        let dir = crate::test_dir::TestDir::new(label);
+        let path = dir.join("db");
+        let wide = "w".repeat(1_800);
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INT, name TEXT, bucket INT);")
+                .unwrap();
+            db.execute(&format!(
+                "INSERT INTO users VALUES (1, '{wide}', 1), (1, '{wide}', 3), (2, 'Bea', 2);"
+            ))
+            .unwrap();
+        }
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_users_id ON users(id);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_bucket ON users(bucket);")
+            .unwrap();
+        (dir, db)
+    }
+
+    fn packed_rows(db: &mut Database) -> Vec<Vec<Value>> {
+        query(
+            db,
+            "SELECT id, name, bucket FROM users WHERE TRUE OR id = 1;",
+        )
+        .rows
+    }
+
+    fn assert_packed(db: &mut Database, rows: &[Vec<Value>], ids: &[u64]) {
+        assert_eq!(packed_rows(db), rows);
+        assert_eq!(db.table("users").unwrap().row_ids(), ids);
+        assert_eq!(
+            index_postings(db, "idx_users_id"),
+            reference_postings(rows, ids, 0)
+        );
+        assert_eq!(
+            index_postings(db, "idx_users_bucket"),
+            reference_postings(rows, ids, 2)
+        );
+    }
+
+    fn model_delete(
+        rows: &mut Vec<Vec<Value>>,
+        ids: &mut Vec<u64>,
+        pred: impl Fn(&[Value]) -> bool,
+    ) -> usize {
+        let before = rows.len();
+        let mut kept_rows = Vec::new();
+        let mut kept_ids = Vec::new();
+        for (row, id) in std::mem::take(rows).into_iter().zip(std::mem::take(ids)) {
+            if pred(&row) {
+                continue;
+            }
+            kept_rows.push(row);
+            kept_ids.push(id);
+        }
+        *rows = kept_rows;
+        *ids = kept_ids;
+        before - rows.len()
+    }
+
+    struct PackedPair {
+        _dir: crate::test_dir::TestDir,
+        selective: Database,
+        full: Database,
+        selective_path: std::path::PathBuf,
+        full_path: std::path::PathBuf,
+    }
+
+    impl PackedPair {
+        fn open(label: &str) -> Self {
+            let (dir, selective) = open_packed(label);
+            let selective_path = dir.join("db");
+            let full_path = dir.join("full");
+            drop(selective);
+            std::fs::copy(&selective_path, &full_path).unwrap();
+            Self {
+                selective: Database::open(&selective_path).unwrap(),
+                full: Database::open(&full_path).unwrap(),
+                selective_path,
+                full_path,
+                _dir: dir,
+            }
+        }
+
+        fn commit(&mut self, rows: &[Vec<Value>], ids: &[u64], sql: &str, expected: usize) {
+            let count = change_count(&mut self.selective, sql);
+            let full_count = {
+                let _guard = ForceFullUpdate::new();
+                change_count(&mut self.full, sql)
+            };
+            assert_eq!(count, expected, "{sql}");
+            assert_eq!(full_count, expected, "{sql}");
+            self.agree(rows, ids, sql);
+        }
+
+        fn measure(
+            &mut self,
+            rows: &[Vec<Value>],
+            ids: &[u64],
+            sql: &str,
+            expected: usize,
+        ) -> (u32, u32, u64) {
+            let (count, heap, index, wal) = measure_update(&mut self.selective, sql);
+            assert_eq!(count, expected, "{sql}");
+            let full_count = {
+                let _guard = ForceFullUpdate::new();
+                change_count(&mut self.full, sql)
+            };
+            assert_eq!(full_count, expected, "{sql}");
+            self.agree(rows, ids, sql);
+            (heap, index, wal)
+        }
+
+        fn agree(&mut self, rows: &[Vec<Value>], ids: &[u64], sql: &str) {
+            assert_packed(&mut self.selective, rows, ids);
+            assert_packed(&mut self.full, rows, ids);
+            assert_eq!(
+                std::fs::read(&self.selective_path).unwrap(),
+                std::fs::read(&self.full_path).unwrap(),
+                "{sql}"
+            );
+        }
+
+        fn reopen(&mut self, rows: &[Vec<Value>], ids: &[u64]) {
+            drop(std::mem::take(&mut self.selective));
+            drop(std::mem::take(&mut self.full));
+            self.selective = Database::open(&self.selective_path).unwrap();
+            self.full = Database::open(&self.full_path).unwrap();
+            assert_checksums(&self.selective_path);
+            assert_checksums(&self.full_path);
+            self.agree(rows, ids, "reopen");
+        }
+    }
+
+    fn measure_update(db: &mut Database, sql: &str) -> (usize, u32, u32, u64) {
+        let _phases = crate::storage::enable_phases();
+        crate::storage::reset_phases();
+        let count = change_count(db, sql);
+        let phases = crate::storage::take_phases();
+        (
+            count,
+            phases.heap_pages,
+            phases.index_pages,
+            phases.wal_bytes,
+        )
+    }
+
+    struct Step {
+        sql: &'static str,
+        assign: fn(&mut Vec<Value>),
+    }
+
+    fn predicate_for(sql: &str) -> fn(&[Value]) -> bool {
+        if sql.contains("WHERE id = 2") {
+            return |row| row[0] == Value::Integer(2);
+        }
+        if sql.contains("WHERE bucket = 1") {
+            return |row| row[3] == Value::Integer(1);
+        }
+        if sql.contains("WHERE name = 'Dee'") {
+            return |row| row[1] == Value::Text("Dee".to_string());
+        }
+        if sql.contains("WHERE name = 'Q'") {
+            return |row| row[1] == Value::Text("Q".to_string());
+        }
+        |row| row[0] == Value::Integer(i64::MIN)
+    }
+
+    fn reference_update(
+        rows: &mut [Vec<Value>],
+        pred: &fn(&[Value]) -> bool,
+        assign: fn(&mut Vec<Value>),
+    ) -> usize {
+        let mut count = 0;
+        for row in rows.iter_mut() {
+            if pred(row) {
+                assign(row);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn reference_postings(rows: &[Vec<Value>], row_ids: &[u64], column: usize) -> Vec<(i64, u64)> {
+        let mut entries = Vec::new();
+        for (row, row_id) in rows.iter().zip(row_ids) {
+            if let Value::Integer(key) = row[column] {
+                entries.push((key, *row_id));
+            }
+        }
+        entries.sort_unstable();
+        entries
+    }
+
+    fn index_postings(db: &mut Database, index: &str) -> Vec<(i64, u64)> {
+        db.read_indexed_keys(index, None, None, None).unwrap().1
+    }
+
+    fn assert_spanning_update(db: &mut Database) {
+        let rows = table_rows(db);
+        let renamed = rows.iter().filter(|row| row[1] == text_z()).count();
+        assert!(renamed > 30, "{renamed}");
+        assert!(
+            rows.iter()
+                .any(|row| row[3] == Value::Integer(2) && row[1] != text_z())
+        );
+        let by_index = query(db, "SELECT name FROM users WHERE bucket = 1;").rows;
+        assert_eq!(by_index.len(), renamed);
+        assert!(by_index.iter().all(|row| row[0] == text_z()));
+        let posted = index_postings(db, "idx_users_bucket")
+            .into_iter()
+            .filter(|(key, _)| *key == 1)
+            .count();
+        assert_eq!(posted, renamed);
+    }
+
+    fn joined_names(db: &mut Database, left: bool) -> Vec<Vec<Value>> {
+        let kind = if left { "LEFT JOIN" } else { "JOIN" };
+        query(
+            db,
+            &format!(
+                "SELECT users.name, orders.amount FROM users {kind} orders ON users.id = orders.user_id ORDER BY users.name, orders.amount;"
+            ),
+        )
+        .rows
+    }
+
     fn change_count(db: &mut Database, sql: &str) -> usize {
         match db
             .execute(sql)
@@ -15204,6 +15617,1483 @@ mod tests {
     }
 
     #[test]
+    fn selective_update_matches_the_full_rewrite_and_a_reference() {
+        let (_dir, mut selective) = open_mutation("m26-selective");
+        let (_full_dir, mut full) = open_mutation("m26-full");
+        let mut rows = table_rows(&mut selective);
+        let row_ids = selective.table("users").unwrap().row_ids().to_vec();
+        let statements = [
+            Step {
+                sql: "UPDATE users SET name = 'Z' WHERE id = 2;",
+                assign: |row| {
+                    row[1] = Value::Text("Z".to_string());
+                },
+            },
+            Step {
+                sql: "UPDATE users SET name = 'Q', active = FALSE WHERE bucket = 1;",
+                assign: |row| {
+                    row[1] = Value::Text("Q".to_string());
+                    row[2] = Value::Boolean(false);
+                },
+            },
+            Step {
+                sql: "UPDATE users SET id = NULL WHERE id = 2;",
+                assign: |row| row[0] = Value::Null,
+            },
+            Step {
+                sql: "UPDATE users SET id = 8 WHERE name = 'Dee';",
+                assign: |row| row[0] = Value::Integer(8),
+            },
+            Step {
+                sql: "UPDATE users SET name = 'Q' WHERE name = 'Q';",
+                assign: |_| {},
+            },
+            Step {
+                sql: "UPDATE users SET name = 'wide-wide-wide-name' WHERE bucket = 1;",
+                assign: |row| {
+                    row[1] = Value::Text("wide-wide-wide-name".to_string());
+                },
+            },
+            Step {
+                sql: "UPDATE users SET name = 's' WHERE bucket = 1;",
+                assign: |row| row[1] = Value::Text("s".to_string()),
+            },
+        ];
+        for step in statements {
+            let sql = step.sql;
+            let pred = predicate_for(sql);
+            let expected = reference_update(&mut rows, &pred, step.assign);
+            let selective_count = change_count(&mut selective, sql);
+            let full_count = {
+                let _guard = ForceFullUpdate::new();
+                change_count(&mut full, sql)
+            };
+            assert_eq!(selective_count, expected, "{sql}");
+            assert_eq!(full_count, expected, "{sql}");
+            assert_eq!(table_rows(&mut selective), rows, "{sql}");
+            assert_eq!(table_rows(&mut full), rows, "{sql}");
+            assert_eq!(
+                selective.table("users").unwrap().row_ids(),
+                row_ids.as_slice(),
+                "{sql}"
+            );
+            assert_eq!(
+                full.table("users").unwrap().row_ids(),
+                row_ids.as_slice(),
+                "{sql}"
+            );
+            assert_eq!(
+                index_postings(&mut selective, "idx_users_id"),
+                reference_postings(&rows, &row_ids, 0),
+                "{sql}"
+            );
+            assert_eq!(
+                index_postings(&mut selective, "idx_users_bucket"),
+                reference_postings(&rows, &row_ids, 3),
+                "{sql}"
+            );
+            assert_eq!(
+                index_postings(&mut full, "idx_users_id"),
+                index_postings(&mut selective, "idx_users_id"),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selective_update_prepares_only_matched_rows() {
+        let (_dir, mut db) = open_mutation("m26-staged");
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Z' WHERE id = 2;"),
+            1
+        );
+        assert_eq!(mutation_note().staged_bytes, staged_mutation_bytes(1, 1, 4));
+        assert_eq!(mutation_note().executed, "IndexLookup");
+        let (_scan_dir, mut scanned) = open_mutation("m26-staged-scan");
+        assert_eq!(
+            change_count(
+                &mut scanned,
+                "UPDATE users SET name = 'Z' WHERE name = 'Bea';"
+            ),
+            1
+        );
+        let note = mutation_note();
+        assert_eq!(note.executed, "HeapScan");
+        assert_eq!(note.staged_bytes, staged_mutation_bytes(1, 1, 4));
+        let (_full_dir, mut full) = open_mutation("m26-staged-full");
+        let count = {
+            let _guard = ForceFullUpdate::new();
+            change_count(&mut full, "UPDATE users SET name = 'Z' WHERE id = 2;")
+        };
+        assert_eq!(count, 1);
+        assert_eq!(mutation_note().staged_bytes, staged_mutation_bytes(1, 5, 4));
+        assert_eq!(table_rows(&mut db), table_rows(&mut full));
+    }
+
+    #[test]
+    fn a_selective_update_compares_only_matched_rows() {
+        let _phases = crate::storage::enable_phases();
+        let (_dir, mut db) = open_mutation("m26-compares");
+        crate::storage::reset_phases();
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Z' WHERE id = -1;"),
+            0
+        );
+        let miss = crate::storage::take_phases();
+        assert_eq!(miss.row_compares, 0);
+        assert_eq!(miss.wal_bytes, 0);
+        crate::storage::reset_phases();
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Z' WHERE id = 2;"),
+            1
+        );
+        let hit = crate::storage::take_phases();
+        assert_eq!(hit.row_compares, 1);
+        assert!(hit.wal_bytes > 0, "wal {}", hit.wal_bytes);
+        assert!(hit.heap_pages >= 1, "heap {}", hit.heap_pages);
+        assert_eq!(
+            hit.index_pages, 0,
+            "a name change does not rewrite the index"
+        );
+        crate::storage::reset_phases();
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET id = 9 WHERE id = 2;"),
+            1
+        );
+        let key = crate::storage::take_phases();
+        assert!(key.index_pages >= 1, "index {}", key.index_pages);
+        assert_eq!(key.row_compares, 1);
+        let (_full_dir, mut full) = open_mutation("m26-compares-full");
+        crate::storage::reset_phases();
+        let count = {
+            let _guard = ForceFullUpdate::new();
+            change_count(&mut full, "UPDATE users SET name = 'Z' WHERE id = 2;")
+        };
+        assert_eq!(count, 1);
+        assert_eq!(crate::storage::take_phases().row_compares, 5);
+    }
+
+    #[test]
+    fn an_unchanged_assignment_does_not_rewrite_the_file() {
+        let (dir, mut db) = open_mutation("m26-noop");
+        let path = dir.join("db");
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Z' WHERE id = 2;"),
+            1
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Z' WHERE id = 2;"),
+            1
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(table_rows(&mut db)[2][1], Value::Text("Z".to_string()));
+    }
+
+    #[test]
+    fn variable_length_updates_keep_the_row_id_and_the_index() {
+        let (dir, mut db) = open_mutation("m26-width");
+        let path = dir.join("db");
+        let before = db.table("users").unwrap().row_ids().to_vec();
+        let wide = "w".repeat(1_800);
+        let wider = "w".repeat(3_200);
+        assert_eq!(
+            change_count(
+                &mut db,
+                &format!("UPDATE users SET name = '{wide}' WHERE id = 2;")
+            ),
+            1
+        );
+        assert_eq!(
+            change_count(
+                &mut db,
+                &format!("UPDATE users SET name = '{wider}' WHERE name = '{wide}';")
+            ),
+            1
+        );
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 's' WHERE id = 2;"),
+            1
+        );
+        assert_eq!(db.table("users").unwrap().row_ids(), before.as_slice());
+        assert_eq!(table_rows(&mut db)[2][1], Value::Text("s".to_string()));
+        assert!(
+            index_postings(&mut db, "idx_users_id")
+                .iter()
+                .any(|(key, row_id)| *key == 2 && *row_id == before[2])
+        );
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut db)[2][1], Value::Text("s".to_string()));
+        assert_eq!(db.table("users").unwrap().row_ids(), before.as_slice());
+        assert_eq!(
+            query(&mut db, "SELECT name FROM users WHERE id = 2;").rows,
+            vec![vec![Value::Text("s".to_string())]]
+        );
+    }
+
+    #[test]
+    fn a_later_target_failure_publishes_nothing() {
+        let (dir, mut db) = open_mutation("m26-later");
+        let path = dir.join("db");
+        let bytes = std::fs::read(&path).unwrap();
+        let rows = table_rows(&mut db);
+        replace_cell(&mut db, "users", 1, 1, Value::Integer(7));
+        let error = db
+            .execute("UPDATE users SET name = name WHERE bucket = 1;")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("does not match its column"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(table_rows(&mut db)[0][1], rows[0][1].clone());
+        assert_eq!(table_rows(&mut db)[4][1], rows[4][1].clone());
+        let huge = "h".repeat(crate::MAX_RECORD_LEN);
+        let error = db
+            .execute(&format!(
+                "UPDATE users SET name = '{huge}' WHERE bucket = 1;"
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("maximum record size"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn an_index_delta_failure_publishes_nothing() {
+        let (dir, mut db) = open_mutation("m26-index-delta");
+        let path = dir.join("db");
+        let bytes = std::fs::read(&path).unwrap();
+        db.corrupt_index_root_type("idx_users_id").unwrap();
+        let error = db
+            .execute("UPDATE users SET id = 9 WHERE bucket = 2;")
+            .unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(table_rows(&mut db)[2][0], Value::Integer(2));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET id = 9 WHERE bucket = 2;"),
+            1
+        );
+        assert_eq!(table_rows(&mut db)[2][0], Value::Integer(9));
+    }
+
+    #[test]
+    fn a_later_row_that_does_not_fit_publishes_nothing() {
+        let (dir, mut db) = open_notes("m26-capacity");
+        let (full_dir, mut full) = open_notes("m26-capacity-full");
+        let path = dir.join("db");
+        let bytes = std::fs::read(&path).unwrap();
+        let full_bytes = std::fs::read(full_dir.join("db")).unwrap();
+        let rows = notes_rows(&mut db);
+        let ids = db.table("notes").unwrap().row_ids().to_vec();
+        let posted = index_postings(&mut db, "idx_notes_id");
+        let sql = "UPDATE notes SET extra = name WHERE id = 1 OR id = 2;";
+        let selective_error = db.execute(sql).unwrap_err().to_string();
+        let full_error = {
+            let _guard = ForceFullUpdate::new();
+            full.execute(sql).unwrap_err().to_string()
+        };
+        assert!(
+            selective_error.contains("maximum record size"),
+            "{selective_error}"
+        );
+        assert_eq!(selective_error, full_error);
+        assert!(
+            !selective_error.contains("rows updated"),
+            "{selective_error}"
+        );
+        assert_eq!(notes_rows(&mut db), rows);
+        assert_eq!(notes_rows(&mut full), rows);
+        assert_eq!(db.table("notes").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(full.table("notes").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(index_postings(&mut db, "idx_notes_id"), posted);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read(full_dir.join("db")).unwrap(), full_bytes);
+        assert_eq!(wal_len(&path), 0);
+        assert_eq!(
+            change_count(&mut db, "UPDATE notes SET extra = 'ok' WHERE id = 1;"),
+            1
+        );
+        let updated = notes_rows(&mut db);
+        assert_eq!(updated[0][2], Value::Text("ok".to_string()));
+        assert!(updated[1][2].is_null());
+        assert_eq!(updated[0][1], Value::Text("short".to_string()));
+        assert_eq!(db.table("notes").unwrap().row_ids(), ids.as_slice());
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_checksums(&path);
+        assert_eq!(notes_rows(&mut db)[0][2], Value::Text("ok".to_string()));
+        assert!(notes_rows(&mut db)[1][2].is_null());
+        assert_eq!(index_postings(&mut db, "idx_notes_id"), posted);
+    }
+
+    #[test]
+    fn a_later_stored_type_is_rejected_before_any_row_changes() {
+        let (dir, mut db) = open_notes("m26-later-type");
+        let path = dir.join("db");
+        let bytes = std::fs::read(&path).unwrap();
+        let mut rows = notes_rows(&mut db);
+        let ids = db.table("notes").unwrap().row_ids().to_vec();
+        replace_cell(&mut db, "notes", 1, 1, Value::Integer(7));
+        rows[1][1] = Value::Integer(7);
+        let error = db
+            .execute("UPDATE notes SET name = name WHERE id = 1 OR id = 2;")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not match its column"), "{error}");
+        assert!(!error.contains("rows updated"), "{error}");
+        assert_eq!(notes_rows(&mut db), rows);
+        assert_eq!(notes_rows(&mut db)[0][1], Value::Text("short".to_string()));
+        assert_eq!(db.table("notes").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(wal_len(&path), 0);
+        let retry = db
+            .execute("UPDATE notes SET extra = 'ok' WHERE id = 1;")
+            .unwrap_err()
+            .to_string();
+        assert!(retry.contains("does not match its column"), "{retry}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_checksums(&path);
+        assert_eq!(notes_rows(&mut db)[0][1], Value::Text("short".to_string()));
+        assert_eq!(
+            change_count(&mut db, "UPDATE notes SET extra = 'ok' WHERE id = 1;"),
+            1
+        );
+        assert_eq!(notes_rows(&mut db)[0][2], Value::Text("ok".to_string()));
+        assert!(notes_rows(&mut db)[1][2].is_null());
+    }
+
+    #[test]
+    fn a_noop_and_a_miss_do_not_write() {
+        let (dir, mut db) = open_mutation("m26-noop");
+        let path = dir.join("db");
+        let bytes = std::fs::read(&path).unwrap();
+        let rows = table_rows(&mut db);
+        let ids = db.table("users").unwrap().row_ids().to_vec();
+        let id_index = index_postings(&mut db, "idx_users_id");
+        let bucket_index = index_postings(&mut db, "idx_users_bucket");
+        let (count, heap, index, wal) =
+            measure_update(&mut db, "UPDATE users SET id = 1 WHERE id = 1;");
+        assert_eq!(count, 2);
+        assert_eq!((heap, index, wal), (0, 0, 0));
+        let (count, heap, index, wal) =
+            measure_update(&mut db, "UPDATE users SET id = 2 WHERE id = 2;");
+        assert_eq!(count, 1);
+        assert_eq!((heap, index, wal), (0, 0, 0));
+        let (count, heap, index, wal) =
+            measure_update(&mut db, "UPDATE users SET name = 'Bea' WHERE name = 'Bea';");
+        assert_eq!(count, 1);
+        assert_eq!((heap, index, wal), (0, 0, 0));
+        assert_eq!(mutation_note().executed, "HeapScan");
+        let (count, heap, index, wal) = measure_update(
+            &mut db,
+            "UPDATE users SET name = 'gone' WHERE name = 'nobody';",
+        );
+        assert_eq!(count, 0);
+        assert_eq!((heap, index, wal), (0, 0, 0));
+        let (count, heap, index, wal) =
+            measure_update(&mut db, "UPDATE users SET name = 'gone' WHERE id = -1;");
+        assert_eq!(count, 0);
+        assert_eq!((heap, index, wal), (0, 0, 0));
+        assert_eq!(mutation_note().executed, "IndexLookup");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(wal_len(&path), 0);
+        assert!(Database::open(&path).is_err());
+        assert_eq!(table_rows(&mut db), rows);
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(index_postings(&mut db, "idx_users_id"), id_index);
+        assert_eq!(index_postings(&mut db, "idx_users_bucket"), bucket_index);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_checksums(&path);
+        assert_eq!(table_rows(&mut db), rows);
+        let (count, heap, index, wal) = measure_update(
+            &mut db,
+            "UPDATE users SET id = 2, name = 'Zed' WHERE id = 2;",
+        );
+        assert_eq!(count, 1);
+        assert!(heap >= 1, "{heap}");
+        assert_eq!(index, 0);
+        assert!(wal > 0);
+        assert_eq!(index_postings(&mut db, "idx_users_id"), id_index);
+        assert_eq!(index_postings(&mut db, "idx_users_bucket"), bucket_index);
+        assert_eq!(table_rows(&mut db)[2][1], Value::Text("Zed".to_string()));
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Zoe' WHERE id = 2;"),
+            1
+        );
+        assert_eq!(table_rows(&mut db)[2][1], Value::Text("Zoe".to_string()));
+    }
+
+    #[test]
+    fn a_malformed_untouched_row_rejects_selective_publish() {
+        let (dir, mut db) = open_mutation("m26-untouched");
+        let (full_dir, mut full) = open_mutation("m26-untouched-full");
+        let path = dir.join("db");
+        let full_path = full_dir.join("db");
+        let bytes = std::fs::read(&path).unwrap();
+        let full_bytes = std::fs::read(&full_path).unwrap();
+        let wal = wal_len(&path);
+        replace_cell(&mut db, "users", 3, 1, Value::Integer(9));
+        replace_cell(&mut full, "users", 3, 1, Value::Integer(9));
+        let rows = table_rows(&mut db);
+        let ids = db.table("users").unwrap().row_ids().to_vec();
+        let sql = "UPDATE users SET name = 'Z' WHERE bucket = 1;";
+        let selective_error = db.execute(sql).unwrap_err().to_string();
+        let full_error = {
+            let _guard = ForceFullUpdate::new();
+            full.execute(sql).unwrap_err().to_string()
+        };
+        assert!(
+            selective_error.contains("does not match its column"),
+            "{selective_error}"
+        );
+        assert!(
+            full_error.contains("does not match its column"),
+            "{full_error}"
+        );
+        assert!(
+            !selective_error.contains("rows updated"),
+            "{selective_error}"
+        );
+        assert_eq!(table_rows(&mut db)[0][1], Value::Text("Ada".to_string()));
+        assert_eq!(table_rows(&mut db)[1][1], Value::Text("Ann".to_string()));
+        assert_eq!(table_rows(&mut db)[4][1], Value::Text("Cy".to_string()));
+        assert_eq!(table_rows(&mut db), rows);
+        assert_eq!(table_rows(&mut full), rows);
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&full_path).unwrap(), full_bytes);
+        assert_eq!(wal_len(&path), wal);
+        let miss = db
+            .execute("UPDATE users SET name = 'Z' WHERE id = -1;")
+            .unwrap_err()
+            .to_string();
+        assert!(miss.contains("does not match its column"), "{miss}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(wal_len(&path), wal);
+        let compared = db
+            .execute("UPDATE users SET active = FALSE WHERE name = 'Dee';")
+            .unwrap_err()
+            .to_string();
+        assert!(compared.contains("different types"), "{compared}");
+        assert!(
+            !compared.contains("does not match its column"),
+            "{compared}"
+        );
+        assert_eq!(table_rows(&mut db)[3][2], Value::Boolean(true));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_checksums(&path);
+        assert_eq!(table_rows(&mut db)[3][1], Value::Text("Dee".to_string()));
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Z' WHERE bucket = 1;"),
+            3
+        );
+        assert_eq!(table_rows(&mut db)[0][1], text_z());
+        assert_eq!(table_rows(&mut db)[3][1], Value::Text("Dee".to_string()));
+    }
+
+    #[test]
+    fn a_multi_row_index_failure_restores_every_target() {
+        let (dir, mut db) = open_mutation("m26-multi-index");
+        let path = dir.join("db");
+        let bytes = std::fs::read(&path).unwrap();
+        let rows = table_rows(&mut db);
+        let ids = db.table("users").unwrap().row_ids().to_vec();
+        let posted = index_postings(&mut db, "idx_users_id");
+        let buckets = index_postings(&mut db, "idx_users_bucket");
+        db.corrupt_index_root_type("idx_users_id").unwrap();
+        let error = db
+            .execute("UPDATE users SET id = 40 WHERE bucket = 1;")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("corrupt"), "{error}");
+        assert!(!error.contains("rows updated"), "{error}");
+        assert_eq!(table_rows(&mut db), rows);
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(wal_len(&path), 0);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_checksums(&path);
+        assert_eq!(table_rows(&mut db), rows);
+        assert_eq!(index_postings(&mut db, "idx_users_id"), posted);
+        assert_eq!(index_postings(&mut db, "idx_users_bucket"), buckets);
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET id = 40 WHERE bucket = 1;"),
+            3
+        );
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(table_rows(&mut db)[0][0], Value::Integer(40));
+        assert_eq!(table_rows(&mut db)[1][0], Value::Integer(40));
+        assert_eq!(table_rows(&mut db)[2][0], Value::Integer(2));
+        assert!(table_rows(&mut db)[3][0].is_null());
+        assert_eq!(table_rows(&mut db)[4][0], Value::Integer(40));
+        let mut expected = rows;
+        expected[0][0] = Value::Integer(40);
+        expected[1][0] = Value::Integer(40);
+        expected[4][0] = Value::Integer(40);
+        assert_eq!(
+            index_postings(&mut db, "idx_users_id"),
+            reference_postings(&expected, &ids, 0)
+        );
+        assert_eq!(index_postings(&mut db, "idx_users_bucket"), buckets);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(
+            index_postings(&mut db, "idx_users_id"),
+            reference_postings(&expected, &ids, 0)
+        );
+    }
+
+    #[test]
+    fn an_all_row_update_matches_the_full_rewrite() {
+        let (dir, selective) = open_mutation("m26-all-rows");
+        let path = dir.join("db");
+        let full_path = dir.join("full");
+        drop(selective);
+        std::fs::copy(&path, &full_path).unwrap();
+        let mut selective = Database::open(&path).unwrap();
+        let mut full = Database::open(&full_path).unwrap();
+        let mut rows = table_rows(&mut selective);
+        let ids = selective.table("users").unwrap().row_ids().to_vec();
+        for row in &mut rows {
+            row[2] = Value::Boolean(false);
+        }
+        let sql = "UPDATE users SET active = FALSE WHERE TRUE OR id = 1;";
+        assert_eq!(change_count(&mut selective, sql), rows.len());
+        let full_count = {
+            let _guard = ForceFullUpdate::new();
+            change_count(&mut full, sql)
+        };
+        assert_eq!(full_count, rows.len());
+        assert_eq!(table_rows(&mut selective), rows);
+        assert_eq!(table_rows(&mut full), rows);
+        assert_eq!(selective.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(full.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(
+            index_postings(&mut selective, "idx_users_id"),
+            reference_postings(&rows, &ids, 0)
+        );
+        assert_eq!(
+            index_postings(&mut full, "idx_users_bucket"),
+            reference_postings(&rows, &ids, 3)
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&full_path).unwrap()
+        );
+        drop(selective);
+        drop(full);
+        assert_checksums(&path);
+        let mut selective = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut selective), rows);
+        assert_eq!(selective.table("users").unwrap().row_ids(), ids.as_slice());
+    }
+
+    fn wide_rows(first: &str, second: &str, third_id: i64, third_name: &str) -> Vec<Vec<Value>> {
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Text(first.to_string()),
+                Value::Integer(1),
+            ],
+            vec![
+                Value::Integer(1),
+                Value::Text(second.to_string()),
+                Value::Integer(3),
+            ],
+            vec![
+                Value::Integer(third_id),
+                Value::Text(third_name.to_string()),
+                Value::Integer(2),
+            ],
+        ]
+    }
+
+    fn grown_pair(db: &mut Database) {
+        let huge = "w".repeat(3_200);
+        assert_packed(db, &wide_rows(&huge, &huge, 2, "Bea"), &[1, 2, 3]);
+    }
+
+    fn keyed_pair(db: &mut Database) {
+        let wide = "w".repeat(1_800);
+        let rows = vec![
+            vec![
+                Value::Integer(8),
+                Value::Text(wide.clone()),
+                Value::Integer(1),
+            ],
+            vec![Value::Integer(8), Value::Text(wide), Value::Integer(3)],
+            vec![
+                Value::Integer(2),
+                Value::Text("Bea".to_string()),
+                Value::Integer(2),
+            ],
+        ];
+        assert_packed(db, &rows, &[1, 2, 3]);
+    }
+
+    fn relocated_key(db: &mut Database) {
+        let huge = "w".repeat(3_200);
+        let wide = "w".repeat(1_800);
+        let rows = vec![
+            vec![Value::Integer(11), Value::Text(huge), Value::Integer(1)],
+            vec![Value::Integer(1), Value::Text(wide), Value::Integer(3)],
+            vec![
+                Value::Integer(2),
+                Value::Text("Bea".to_string()),
+                Value::Integer(2),
+            ],
+        ];
+        assert_packed(db, &rows, &[1, 2, 3]);
+    }
+
+    fn boundary(
+        label: &str,
+        inject: crate::storage::Inject,
+        sql: &str,
+        full: bool,
+        check: fn(&mut Database),
+    ) {
+        let precommit = matches!(inject, crate::storage::Inject::BeforeLogSync);
+        let sync_failed = matches!(inject, crate::storage::Inject::CommitSyncFailed);
+        let (dir, mut db) = open_packed(label);
+        let path = dir.join("db");
+        let before = std::fs::read(&path).unwrap();
+        let before_rows = packed_rows(&mut db);
+        let before_ids = db.table("users").unwrap().row_ids().to_vec();
+        let before_index = index_postings(&mut db, "idx_users_id");
+        db.set_inject(inject);
+        let error = if full {
+            let _guard = ForceFullUpdate::new();
+            db.execute(sql).unwrap_err()
+        } else {
+            db.execute(sql).unwrap_err()
+        };
+        let message = error.to_string();
+        assert!(!message.contains("rows updated"), "{label}: {message}");
+        if precommit {
+            assert_eq!(packed_rows(&mut db), before_rows, "{label}");
+            assert_eq!(
+                db.table("users").unwrap().row_ids(),
+                before_ids.as_slice(),
+                "{label}"
+            );
+            assert_eq!(
+                index_postings(&mut db, "idx_users_id"),
+                before_index,
+                "{label}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{label}");
+            change_count(&mut db, sql);
+            check(&mut db);
+            drop(db);
+            let mut db = Database::open(&path).unwrap();
+            assert_checksums(&path);
+            check(&mut db);
+            return;
+        }
+        if sync_failed {
+            assert!(message.contains("outcome is unknown"), "{label}: {message}");
+            assert!(
+                message.contains("not a confirmed rollback"),
+                "{label}: {message}"
+            );
+        }
+        assert!(
+            message.contains("checkpoint did not finish"),
+            "{label}: {message}"
+        );
+        let fenced = db.execute("SELECT id FROM users;").unwrap_err().to_string();
+        assert!(
+            fenced.contains("checkpoint did not finish"),
+            "{label}: {fenced}"
+        );
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_checksums(&path);
+        check(&mut db);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        check(&mut db);
+    }
+
+    #[test]
+    fn relocation_matches_the_full_rewrite_and_a_reference() {
+        let mut pair = PackedPair::open("m26-reloc");
+        let wide = "w".repeat(1_800);
+        let mut rows = wide_rows(&wide, &wide, 2, "Bea");
+        let mut ids = vec![1, 2, 3];
+        pair.agree(&rows, &ids, "load");
+        let original = std::fs::read(&pair.selective_path).unwrap();
+
+        let (count, heap, index, wal) =
+            measure_update(&mut pair.selective, "UPDATE users SET id = 1 WHERE id = 1;");
+        assert_eq!((count, heap, index, wal), (2, 0, 0, 0));
+        let full_count = {
+            let _guard = ForceFullUpdate::new();
+            change_count(&mut pair.full, "UPDATE users SET id = 1 WHERE id = 1;")
+        };
+        assert_eq!(full_count, 2);
+        assert_eq!(std::fs::read(&pair.selective_path).unwrap(), original);
+
+        rows[2][1] = Value::Text("Beatrice".to_string());
+        let (heap, index, wal) = pair.measure(
+            &rows,
+            &ids,
+            "UPDATE users SET name = 'Beatrice' WHERE id = 2;",
+            1,
+        );
+        assert_eq!(heap, 1, "{heap}");
+        assert_eq!(index, 0);
+        assert!(wal > 0);
+
+        rows[2][1] = Value::Text("B".to_string());
+        let (heap, index, _) =
+            pair.measure(&rows, &ids, "UPDATE users SET name = 'B' WHERE id = 2;", 1);
+        assert_eq!(heap, 1, "{heap}");
+        assert_eq!(index, 0);
+
+        rows[2][2] = Value::Integer(4);
+        let (heap, index, _) =
+            pair.measure(&rows, &ids, "UPDATE users SET bucket = 4 WHERE id = 2;", 1);
+        assert_eq!(heap, 1, "{heap}");
+        assert!(index >= 1, "{index}");
+
+        let shared = "w".repeat(1_850);
+        rows[0][1] = Value::Text(shared.clone());
+        rows[1][1] = Value::Text(shared.clone());
+        let (heap, index, _) = pair.measure(
+            &rows,
+            &ids,
+            &format!("UPDATE users SET name = '{shared}' WHERE id = 1;"),
+            2,
+        );
+        assert_eq!(heap, 1, "{heap}");
+        assert_eq!(index, 0);
+
+        let huge = "w".repeat(3_200);
+        rows[0][1] = Value::Text(huge.clone());
+        let (heap, index, _) = pair.measure(
+            &rows,
+            &ids,
+            &format!("UPDATE users SET name = '{huge}' WHERE bucket = 1;"),
+            1,
+        );
+        assert!(heap >= 2, "{heap}");
+        assert_eq!(index, 0);
+        pair.reopen(&rows, &ids);
+
+        rows[0][1] = Value::Text("s".to_string());
+        let (_, index, _) = pair.measure(
+            &rows,
+            &ids,
+            "UPDATE users SET name = 's' WHERE bucket = 1;",
+            1,
+        );
+        assert_eq!(index, 0);
+        pair.reopen(&rows, &ids);
+
+        let again = "w".repeat(3_000);
+        rows[0][1] = Value::Text(again.clone());
+        pair.commit(
+            &rows,
+            &ids,
+            &format!("UPDATE users SET name = '{again}' WHERE bucket = 1;"),
+            1,
+        );
+        rows[0][1] = Value::Text("t".to_string());
+        pair.commit(
+            &rows,
+            &ids,
+            "UPDATE users SET name = 't' WHERE bucket = 1;",
+            1,
+        );
+
+        rows[0][1] = Value::Text("cross".to_string());
+        rows[1][1] = Value::Text("cross".to_string());
+        let (heap, index, _) = pair.measure(
+            &rows,
+            &ids,
+            "UPDATE users SET name = 'cross' WHERE id = 1;",
+            2,
+        );
+        assert!(heap >= 2, "{heap}");
+        assert_eq!(index, 0);
+
+        rows[2][0] = Value::Null;
+        let (_, index, _) = pair.measure(
+            &rows,
+            &ids,
+            "UPDATE users SET id = NULL WHERE bucket = 4;",
+            1,
+        );
+        assert!(index >= 1, "{index}");
+        rows[2][0] = Value::Integer(9);
+        let (_, index, _) =
+            pair.measure(&rows, &ids, "UPDATE users SET id = 9 WHERE name = 'B';", 1);
+        assert!(index >= 1, "{index}");
+
+        assert_eq!(
+            model_delete(&mut rows, &mut ids, |row| row[0] == Value::Integer(9)),
+            1
+        );
+        pair.commit(&rows, &ids, "DELETE FROM users WHERE id = 9;", 1);
+        assert_eq!(
+            model_delete(&mut rows, &mut ids, |row| row[2] == Value::Integer(3)),
+            1
+        );
+        pair.commit(&rows, &ids, "DELETE FROM users WHERE bucket = 3;", 1);
+        assert_eq!(pair.selective.table("users").unwrap().next_row_id(), 4);
+        pair.selective
+            .execute("INSERT INTO users VALUES (5, 'New', 1);")
+            .unwrap();
+        pair.full
+            .execute("INSERT INTO users VALUES (5, 'New', 1);")
+            .unwrap();
+        ids.push(4);
+        rows.push(vec![
+            Value::Integer(5),
+            Value::Text("New".to_string()),
+            Value::Integer(1),
+        ]);
+        assert_eq!(pair.selective.table("users").unwrap().next_row_id(), 5);
+        assert_eq!(pair.full.table("users").unwrap().next_row_id(), 5);
+        pair.agree(&rows, &ids, "insert");
+        pair.reopen(&rows, &ids);
+    }
+
+    #[test]
+    fn relocated_and_keyed_updates_honor_commit_boundaries() {
+        let huge = "w".repeat(3_200);
+        let grow = format!("UPDATE users SET name = '{huge}' WHERE id = 1;");
+        let rekey = "UPDATE users SET id = 8 WHERE id = 1;";
+        let move_key = format!("UPDATE users SET id = 11, name = '{huge}' WHERE bucket = 1;");
+        boundary(
+            "m26-grow-before",
+            crate::storage::Inject::BeforeLogSync,
+            &grow,
+            false,
+            grown_pair,
+        );
+        boundary(
+            "m26-grow-before-full",
+            crate::storage::Inject::BeforeLogSync,
+            &grow,
+            true,
+            grown_pair,
+        );
+        boundary(
+            "m26-grow-after",
+            crate::storage::Inject::AfterLogSync,
+            &grow,
+            false,
+            grown_pair,
+        );
+        boundary(
+            "m26-grow-sync",
+            crate::storage::Inject::CommitSyncFailed,
+            &grow,
+            false,
+            grown_pair,
+        );
+        boundary(
+            "m26-grow-write",
+            crate::storage::Inject::DuringCheckpoint(1),
+            &grow,
+            false,
+            grown_pair,
+        );
+        boundary(
+            "m26-grow-write-full",
+            crate::storage::Inject::DuringCheckpoint(1),
+            &grow,
+            true,
+            grown_pair,
+        );
+        boundary(
+            "m26-key-before",
+            crate::storage::Inject::BeforeLogSync,
+            rekey,
+            false,
+            keyed_pair,
+        );
+        boundary(
+            "m26-key-after",
+            crate::storage::Inject::AfterLogSync,
+            rekey,
+            false,
+            keyed_pair,
+        );
+        boundary(
+            "m26-key-sync",
+            crate::storage::Inject::CommitSyncFailed,
+            rekey,
+            true,
+            keyed_pair,
+        );
+        boundary(
+            "m26-key-write",
+            crate::storage::Inject::DuringCheckpoint(1),
+            rekey,
+            false,
+            keyed_pair,
+        );
+        boundary(
+            "m26-move-before",
+            crate::storage::Inject::BeforeLogSync,
+            &move_key,
+            false,
+            relocated_key,
+        );
+        boundary(
+            "m26-move-after",
+            crate::storage::Inject::AfterLogSync,
+            &move_key,
+            false,
+            relocated_key,
+        );
+        boundary(
+            "m26-move-write",
+            crate::storage::Inject::DuringCheckpoint(1),
+            &move_key,
+            true,
+            relocated_key,
+        );
+
+        let (dir, mut db) = open_packed("m26-reloc-corrupt");
+        let path = dir.join("db");
+        let bytes = std::fs::read(&path).unwrap();
+        let rows = packed_rows(&mut db);
+        let ids = db.table("users").unwrap().row_ids().to_vec();
+        db.corrupt_index_root_type("idx_users_id").unwrap();
+        let error = db
+            .execute(&format!(
+                "UPDATE users SET id = 11, name = '{huge}' WHERE id = 1;"
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("corrupt"), "{error}");
+        assert!(!error.contains("rows updated"), "{error}");
+        assert_eq!(packed_rows(&mut db), rows);
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(wal_len(&path), 0);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_checksums(&path);
+        assert_eq!(packed_rows(&mut db), rows);
+        assert_eq!(
+            change_count(
+                &mut db,
+                &format!("UPDATE users SET id = 11, name = '{huge}' WHERE id = 1;")
+            ),
+            2
+        );
+        let moved = wide_rows(&huge, &huge, 2, "Bea");
+        let mut moved = moved;
+        moved[0][0] = Value::Integer(11);
+        moved[1][0] = Value::Integer(11);
+        assert_packed(&mut db, &moved, &[1, 2, 3]);
+    }
+
+    fn bucket_is(row: &[Value], key: i64) -> bool {
+        row[3] == Value::Integer(key)
+    }
+
+    fn pred_bucket_zero(row: &[Value]) -> bool {
+        bucket_is(row, 0)
+    }
+
+    fn pred_bucket_one(row: &[Value]) -> bool {
+        bucket_is(row, 1)
+    }
+
+    fn pred_bucket_two(row: &[Value]) -> bool {
+        bucket_is(row, 2)
+    }
+
+    fn pred_marked(row: &[Value]) -> bool {
+        row[1] == Value::Text("marked".to_string())
+    }
+
+    fn pred_null_id(row: &[Value]) -> bool {
+        row[0].is_null()
+    }
+
+    fn pred_any(_: &[Value]) -> bool {
+        true
+    }
+
+    fn pred_none(_: &[Value]) -> bool {
+        false
+    }
+
+    fn walk_mark(row: &mut [Value]) {
+        row[1] = Value::Text("marked".to_string());
+    }
+
+    fn walk_clear_id(row: &mut [Value]) {
+        row[0] = Value::Null;
+    }
+
+    fn walk_id_six(row: &mut [Value]) {
+        row[0] = Value::Integer(6);
+    }
+
+    fn walk_wide(row: &mut [Value]) {
+        row[1] = Value::Text("x".repeat(40));
+    }
+
+    fn walk_short(row: &mut [Value]) {
+        row[1] = Value::Text("s".to_string());
+    }
+
+    fn walk_inactive(row: &mut [Value]) {
+        row[2] = Value::Boolean(false);
+    }
+
+    struct Walk {
+        ids: Vec<u64>,
+        rows: Vec<Vec<Value>>,
+    }
+
+    fn review_step(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        *state
+    }
+
+    fn walk_from(seed: u64, count: usize) -> Walk {
+        let mut state = seed;
+        let mut walk = Walk {
+            ids: Vec::with_capacity(count),
+            rows: Vec::with_capacity(count),
+        };
+        for index in 0..count {
+            let draw = review_step(&mut state);
+            let id = if draw.is_multiple_of(11) {
+                Value::Null
+            } else {
+                Value::Integer(i64::try_from(draw % 17).unwrap())
+            };
+            walk.ids.push(u64::try_from(index).unwrap() + 1);
+            walk.rows.push(vec![
+                id,
+                Value::Text(format!("n{}", draw % 5)),
+                Value::Boolean(draw.is_multiple_of(2)),
+                Value::Integer(i64::try_from(index % 3).unwrap()),
+            ]);
+        }
+        walk
+    }
+
+    fn insert_generated(db: &mut Database, rows: &[Vec<Value>]) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut sql = String::from("INSERT INTO users VALUES ");
+        for (index, row) in rows.iter().enumerate() {
+            if index > 0 {
+                sql.push(',');
+            }
+            sql.push('(');
+            for (cell_index, cell) in row.iter().enumerate() {
+                if cell_index > 0 {
+                    sql.push(',');
+                }
+                match cell {
+                    Value::Null => sql.push_str("NULL"),
+                    Value::Integer(value) => sql.push_str(&value.to_string()),
+                    Value::Boolean(true) => sql.push_str("TRUE"),
+                    Value::Boolean(false) => sql.push_str("FALSE"),
+                    Value::Text(value) => {
+                        sql.push('\'');
+                        sql.push_str(value);
+                        sql.push('\'');
+                    }
+                    Value::Ratio { .. } => panic!("ratio"),
+                }
+            }
+            sql.push(')');
+        }
+        sql.push(';');
+        db.execute(&sql).unwrap();
+    }
+
+    fn open_generated(
+        label: &str,
+        rows: &[Vec<Value>],
+        indexed: bool,
+    ) -> (crate::test_dir::TestDir, Database) {
+        let dir = crate::test_dir::TestDir::new(label);
+        let path = dir.join("db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INT, name TEXT, active BOOLEAN, bucket INT);")
+                .unwrap();
+            insert_generated(&mut db, rows);
+        }
+        if !indexed {
+            return (dir, Database::open(&path).unwrap());
+        }
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_users_bucket ON users(bucket);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_id ON users(id);")
+            .unwrap();
+        (dir, db)
+    }
+
+    fn update_walk(walk: &mut Walk, pred: fn(&[Value]) -> bool, assign: fn(&mut [Value])) -> usize {
+        let mut count = 0;
+        for row in &mut walk.rows {
+            if pred(row) {
+                assign(row);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn agree_walk(
+        selective: &mut Database,
+        full: &mut Database,
+        scanned: &mut Database,
+        walk: &Walk,
+        sql: &str,
+        expected: usize,
+    ) {
+        assert_eq!(change_count(selective, sql), expected, "{sql}");
+        let full_count = {
+            let _guard = ForceFullUpdate::new();
+            change_count(full, sql)
+        };
+        assert_eq!(full_count, expected, "{sql}");
+        assert_eq!(change_count(scanned, sql), expected, "{sql}");
+        assert_eq!(table_rows(selective), walk.rows, "{sql}");
+        assert_eq!(table_rows(full), walk.rows, "{sql}");
+        assert_eq!(table_rows(scanned), walk.rows, "{sql}");
+        assert_eq!(
+            selective.table("users").unwrap().row_ids(),
+            walk.ids.as_slice(),
+            "{sql}"
+        );
+        assert_eq!(
+            full.table("users").unwrap().row_ids(),
+            walk.ids.as_slice(),
+            "{sql}"
+        );
+        assert_eq!(
+            scanned.table("users").unwrap().row_ids(),
+            walk.ids.as_slice(),
+            "{sql}"
+        );
+        assert_eq!(
+            index_postings(selective, "idx_users_id"),
+            reference_postings(&walk.rows, &walk.ids, 0),
+            "{sql}"
+        );
+        assert_eq!(
+            index_postings(full, "idx_users_id"),
+            reference_postings(&walk.rows, &walk.ids, 0),
+            "{sql}"
+        );
+        assert_eq!(
+            index_postings(selective, "idx_users_bucket"),
+            reference_postings(&walk.rows, &walk.ids, 3),
+            "{sql}"
+        );
+        assert_eq!(
+            index_postings(full, "idx_users_bucket"),
+            reference_postings(&walk.rows, &walk.ids, 3),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn seeded_updates_match_the_full_rewrite_and_a_walker() {
+        const SEED: u64 = 0x26c3;
+        let mut walk = walk_from(SEED, 12);
+        let (dir, selective) = open_generated("m26-seed", &walk.rows, true);
+        let path = dir.join("db");
+        let full_path = dir.join("full");
+        drop(selective);
+        std::fs::copy(&path, &full_path).unwrap();
+        let mut selective = Database::open(&path).unwrap();
+        let mut full = Database::open(&full_path).unwrap();
+        let (_scan_dir, mut scanned) = open_generated("m26-seed-scan", &walk.rows, false);
+
+        let marked = update_walk(&mut walk, pred_bucket_one, walk_mark);
+        agree_walk(
+            &mut selective,
+            &mut full,
+            &mut scanned,
+            &walk,
+            "UPDATE users SET name = 'marked' WHERE bucket = 1;",
+            marked,
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        let repeated = update_walk(&mut walk, pred_marked, walk_mark);
+        agree_walk(
+            &mut selective,
+            &mut full,
+            &mut scanned,
+            &walk,
+            "UPDATE users SET name = 'marked' WHERE name = 'marked';",
+            repeated,
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(wal_len(&path), 0);
+
+        let cleared = update_walk(&mut walk, pred_bucket_zero, walk_clear_id);
+        agree_walk(
+            &mut selective,
+            &mut full,
+            &mut scanned,
+            &walk,
+            "UPDATE users SET id = NULL WHERE bucket = 0;",
+            cleared,
+        );
+        let sixes = update_walk(&mut walk, pred_null_id, walk_id_six);
+        agree_walk(
+            &mut selective,
+            &mut full,
+            &mut scanned,
+            &walk,
+            "UPDATE users SET id = 6 WHERE id IS NULL;",
+            sixes,
+        );
+        assert!(sixes >= 2, "{sixes}");
+
+        let grown = update_walk(&mut walk, pred_bucket_two, walk_wide);
+        agree_walk(
+            &mut selective,
+            &mut full,
+            &mut scanned,
+            &walk,
+            &format!(
+                "UPDATE users SET name = '{}' WHERE bucket = 2;",
+                "x".repeat(40)
+            ),
+            grown,
+        );
+        let shrunk = update_walk(&mut walk, pred_bucket_two, walk_short);
+        agree_walk(
+            &mut selective,
+            &mut full,
+            &mut scanned,
+            &walk,
+            "UPDATE users SET name = 's' WHERE bucket = 2;",
+            shrunk,
+        );
+        let regrown = update_walk(&mut walk, pred_bucket_two, walk_wide);
+        agree_walk(
+            &mut selective,
+            &mut full,
+            &mut scanned,
+            &walk,
+            &format!(
+                "UPDATE users SET name = '{}' WHERE bucket = 2;",
+                "x".repeat(40)
+            ),
+            regrown,
+        );
+        let inactive = update_walk(&mut walk, pred_any, walk_inactive);
+        agree_walk(
+            &mut selective,
+            &mut full,
+            &mut scanned,
+            &walk,
+            "UPDATE users SET active = FALSE WHERE TRUE OR id = 0;",
+            inactive,
+        );
+
+        let untouched = std::fs::read(&path).unwrap();
+        let missed = update_walk(&mut walk, pred_none, walk_mark);
+        agree_walk(
+            &mut selective,
+            &mut full,
+            &mut scanned,
+            &walk,
+            "UPDATE users SET name = 'z' WHERE id = -1;",
+            missed,
+        );
+        assert_eq!(missed, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), untouched);
+        assert_eq!(wal_len(&path), 0);
+
+        let deleted = model_delete(&mut walk.rows, &mut walk.ids, |row| bucket_is(row, 1));
+        agree_walk(
+            &mut selective,
+            &mut full,
+            &mut scanned,
+            &walk,
+            "DELETE FROM users WHERE bucket = 1;",
+            deleted,
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&full_path).unwrap()
+        );
+        drop(selective);
+        drop(full);
+        drop(scanned);
+        assert_checksums(&path);
+        let mut selective = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut selective), walk.rows);
+        assert_eq!(
+            selective.table("users").unwrap().row_ids(),
+            walk.ids.as_slice()
+        );
+        assert_eq!(
+            index_postings(&mut selective, "idx_users_id"),
+            reference_postings(&walk.rows, &walk.ids, 0)
+        );
+
+        let before = table_rows(&mut selective);
+        let selective_error = selective
+            .execute("UPDATE users SET name = 1 WHERE bucket = 0;")
+            .unwrap_err()
+            .to_string();
+        let mut full = Database::open(&full_path).unwrap();
+        let full_error = {
+            let _guard = ForceFullUpdate::new();
+            full.execute("UPDATE users SET name = 1 WHERE bucket = 0;")
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(selective_error, full_error);
+        assert!(selective_error.contains("expects"), "{selective_error}");
+        assert_eq!(table_rows(&mut selective), before);
+        assert_eq!(table_rows(&mut full), walk.rows);
+    }
+
+    #[test]
+    fn a_multi_row_selective_update_commits_atomically() {
+        let (_dir, mut db) = open_spanning("m26-before");
+        db.set_inject(crate::storage::Inject::BeforeLogSync);
+        let error = db
+            .execute("UPDATE users SET name = 'Z' WHERE bucket = 1;")
+            .unwrap_err();
+        assert!(!error.to_string().contains("rows updated"), "{error}");
+        assert!(table_rows(&mut db).iter().all(|row| row[1] != text_z()));
+
+        let (dir, mut db) = open_spanning("m26-after");
+        let path = dir.join("db");
+        db.set_inject(crate::storage::Inject::AfterLogSync);
+        assert!(
+            db.execute("UPDATE users SET name = 'Z' WHERE bucket = 1;")
+                .unwrap_err()
+                .to_string()
+                .contains("checkpoint did not finish")
+        );
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_spanning_update(&mut db);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_spanning_update(&mut db);
+
+        let (dir, mut db) = open_spanning("m26-sync");
+        let path = dir.join("db");
+        db.set_inject(crate::storage::Inject::CommitSyncFailed);
+        let message = db
+            .execute("UPDATE users SET name = 'Z' WHERE bucket = 1;")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("outcome is unknown"), "{message}");
+        assert!(message.contains("not a confirmed rollback"), "{message}");
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_spanning_update(&mut db);
+
+        let (dir, mut db) = open_spanning("m26-checkpoint");
+        let path = dir.join("db");
+        db.set_inject(crate::storage::Inject::DuringCheckpoint(1));
+        assert!(
+            db.execute("UPDATE users SET name = 'Z' WHERE bucket = 1;")
+                .unwrap_err()
+                .to_string()
+                .contains("checkpoint")
+        );
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_spanning_update(&mut db);
+        let looked = query(&mut db, "SELECT name FROM users WHERE id = 1;").rows;
+        assert!(looked.iter().all(|row| row[0] == text_z()));
+        assert!(
+            query(&mut db, "SELECT name FROM users WHERE bucket = 2;")
+                .rows
+                .iter()
+                .all(|row| row[0] != text_z())
+        );
+    }
+
+    #[test]
+    fn rows_rewritten_selectively_stay_readable_after_reopen() {
+        let (dir, mut db) = open_joined("m26-read");
+        let path = dir.join("db");
+        assert_eq!(
+            change_count(
+                &mut db,
+                "UPDATE users SET name = 'Ada Lovelace' WHERE id = 1;"
+            ),
+            1
+        );
+        let expected = joined_names(&mut db, false);
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            joined_names(&mut db, false)
+        };
+        let indexed = {
+            let _force = ForceIndexJoin::new();
+            joined_names(&mut db, false)
+        };
+        let left = joined_names(&mut db, true);
+        let left_indexed = {
+            let _force = ForceLeftIndexJoin::new();
+            joined_names(&mut db, true)
+        };
+        assert_eq!(nested, expected);
+        assert_eq!(indexed, expected);
+        assert_eq!(left_indexed, left);
+        assert!(
+            left.iter()
+                .any(|row| row[0] == Value::Text("Cy".to_string()) && row[1].is_null())
+        );
+        assert_eq!(
+            query(&mut db, "SELECT DISTINCT name FROM users ORDER BY name;").rows,
+            vec![
+                vec![Value::Text("Ada Lovelace".to_string())],
+                vec![Value::Text("Bea".to_string())],
+                vec![Value::Text("Cy".to_string())],
+            ]
+        );
+        assert_eq!(
+            query(&mut db, "SELECT COUNT(*), COUNT(DISTINCT name) FROM users;").rows,
+            vec![vec![Value::Integer(3), Value::Integer(3)]]
+        );
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(joined_names(&mut db, false), expected);
+        assert_eq!(
+            query(&mut db, "SELECT name FROM users WHERE id = 1;").rows,
+            vec![vec![Value::Text("Ada Lovelace".to_string())]]
+        );
+    }
+
+    #[test]
     #[ignore = "release profile of indexed UPDATE and DELETE"]
     fn profile_milestone25() {
         let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
@@ -15466,5 +17356,292 @@ mod tests {
         db.execute("CREATE INDEX idx_users_id ON users(id);")
             .unwrap();
         (dir, db)
+    }
+
+    #[test]
+    #[ignore = "release profile of selective UPDATE publishing"]
+    fn profile_milestone26() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone26 cpu={cpu} mem_bytes={mem} rustc={rustc} value_bytes={}",
+            std::mem::size_of::<Value>()
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            let (base_dir, base) = open_profile_db("m26-base", rows);
+            let base_path = base_dir.join("db");
+            drop(base);
+            for workload in [
+                "one",
+                "miss",
+                "ten",
+                "many",
+                "key",
+                "fixed",
+                "grow",
+                "shrink",
+                "duplicates",
+            ] {
+                profile_publish(&base_path, rows, workload);
+            }
+        }
+    }
+
+    fn profile_publish(base: &std::path::Path, rows: i64, workload: &str) {
+        let (_selective_dir, mut selective) = copied_profile_db(base, "m26-selective");
+        let (_full_dir, mut full) = copied_profile_db(base, "m26-full");
+        if workload == "shrink" {
+            let wide = wide_name();
+            let setup = format!("UPDATE users SET name = '{wide}' WHERE id = 1;");
+            selective.execute(&setup).unwrap();
+            {
+                let _guard = ForceFullUpdate::new();
+                full.execute(&setup).unwrap();
+            }
+        }
+        let (sql, restore) = publish_work(workload);
+        let selective_count = change_count(&mut selective, &sql);
+        let note = mutation_note();
+        let full_count = {
+            let _guard = ForceFullUpdate::new();
+            change_count(&mut full, &sql)
+        };
+        assert_eq!(selective_count, full_count, "{workload}");
+        let checksum = mutation_checksum(&mut selective);
+        assert_eq!(checksum, mutation_checksum(&mut full), "{workload}");
+        if let Some(restore) = restore.as_deref() {
+            selective.execute(restore).unwrap();
+            {
+                let _guard = ForceFullUpdate::new();
+                full.execute(restore).unwrap();
+            }
+        }
+        let samples = if rows >= 100_000 { 3 } else { 6 };
+        let alternate = matches!(workload, "one" | "ten" | "many" | "duplicates" | "fixed");
+        let selective_time = time_publish(
+            &mut selective,
+            &sql,
+            restore.as_deref(),
+            samples,
+            false,
+            alternate,
+        );
+        let full_time = time_publish(
+            &mut full,
+            &sql,
+            restore.as_deref(),
+            samples,
+            true,
+            alternate,
+        );
+        println!(
+            "milestone26 workload={workload} rows={rows} executed={} candidates={} modified={} heap_rows={} staged_bytes={} discover_us={} probe_us={} validate_us={} filter_us={} stage_us={} apply_us={} selective_cold_us={} selective_warm_us={} full_cold_us={} full_warm_us={} selective_wal_us={} full_wal_us={} selective_sync_us={} full_sync_us={} selective_publish_us={} full_publish_us={} selective_compare_us={} full_compare_us={} selective_compares={} full_compares={} selective_wal_bytes={} full_wal_bytes={} selective_heap_pages={} full_heap_pages={} selective_index_pages={} full_index_pages={} selective_other_pages={} full_other_pages={} selective_frames={} full_frames={} checksum={checksum}",
+            note.executed,
+            note.candidates,
+            note.modified,
+            note.heap_rows,
+            note.staged_bytes,
+            note.discover_us,
+            note.probe_us,
+            note.validate_us,
+            note.filter_us,
+            note.stage_us,
+            note.apply_us,
+            selective_time.cold,
+            selective_time.warm,
+            full_time.cold,
+            full_time.warm,
+            selective_time.wal_warm,
+            full_time.wal_warm,
+            selective_time.sync_warm,
+            full_time.sync_warm,
+            selective_time.publish_warm,
+            full_time.publish_warm,
+            selective_time.compare_warm,
+            full_time.compare_warm,
+            selective_time.compares,
+            full_time.compares,
+            selective_time.wal_bytes,
+            full_time.wal_bytes,
+            selective_time.heap_pages,
+            full_time.heap_pages,
+            selective_time.index_pages,
+            full_time.index_pages,
+            selective_time.other_pages,
+            full_time.other_pages,
+            selective_time.frames,
+            full_time.frames,
+        );
+    }
+
+    fn copied_profile_db(
+        base: &std::path::Path,
+        label: &str,
+    ) -> (crate::test_dir::TestDir, Database) {
+        let dir = crate::test_dir::TestDir::new(label);
+        let path = dir.join("db");
+        std::fs::copy(base, &path).unwrap();
+        (dir, Database::open(&path).unwrap())
+    }
+
+    fn wide_name() -> String {
+        "w".repeat(200)
+    }
+
+    fn publish_work(workload: &str) -> (String, Option<String>) {
+        match workload {
+            "one" => (
+                "UPDATE users SET name = 'n' WHERE id = 1;".to_string(),
+                None,
+            ),
+            "miss" => (
+                "UPDATE users SET name = 'n' WHERE id = -1;".to_string(),
+                None,
+            ),
+            "ten" => (
+                "UPDATE users SET name = 'n' WHERE id < 10;".to_string(),
+                None,
+            ),
+            "many" => (
+                "UPDATE users SET name = 'n' WHERE active = TRUE;".to_string(),
+                None,
+            ),
+            "key" => (
+                "UPDATE users SET id = -1 WHERE id = 1;".to_string(),
+                Some("UPDATE users SET id = 1 WHERE id = -1;".to_string()),
+            ),
+            "fixed" => (
+                "UPDATE users SET active = FALSE WHERE id = 1;".to_string(),
+                None,
+            ),
+            "grow" => (
+                format!("UPDATE users SET name = '{}' WHERE id = 1;", wide_name()),
+                Some("UPDATE users SET name = 'n1' WHERE id = 1;".to_string()),
+            ),
+            "shrink" => (
+                "UPDATE users SET name = 'n' WHERE id = 1;".to_string(),
+                Some(format!(
+                    "UPDATE users SET name = '{}' WHERE id = 1;",
+                    wide_name()
+                )),
+            ),
+            "duplicates" => (
+                "UPDATE users SET name = 'n' WHERE bucket = 1;".to_string(),
+                None,
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    struct TimedPublish {
+        cold: u128,
+        warm: u128,
+        wal_warm: u128,
+        sync_warm: u128,
+        publish_warm: u128,
+        compare_warm: u128,
+        compares: u64,
+        wal_bytes: u64,
+        heap_pages: u32,
+        index_pages: u32,
+        other_pages: u32,
+        frames: u32,
+    }
+
+    fn time_publish(
+        db: &mut Database,
+        sql: &str,
+        restore: Option<&str>,
+        samples: usize,
+        force_full: bool,
+        alternate: bool,
+    ) -> TimedPublish {
+        let mut totals = Vec::with_capacity(samples);
+        let mut wal = Vec::with_capacity(samples);
+        let mut sync = Vec::with_capacity(samples);
+        let mut publish = Vec::with_capacity(samples);
+        let mut compare = Vec::with_capacity(samples);
+        let mut wal_bytes = Vec::with_capacity(samples);
+        let mut heap_pages = Vec::with_capacity(samples);
+        let mut index_pages = Vec::with_capacity(samples);
+        let mut other_pages = Vec::with_capacity(samples);
+        let mut frames = Vec::with_capacity(samples);
+        let mut compares = 0_u64;
+        for sample in 0..samples {
+            let statement = publish_sample(sql, sample, alternate);
+            crate::storage::reset_phases();
+            let started = std::time::Instant::now();
+            if force_full {
+                let _guard = ForceFullUpdate::new();
+                db.execute(&statement).unwrap();
+            } else {
+                db.execute(&statement).unwrap();
+            }
+            totals.push(started.elapsed().as_micros());
+            let taken = crate::storage::take_phases();
+            wal.push(
+                (taken.wal_write
+                    + taken.wal_sync
+                    + taken.db_write
+                    + taken.db_sync
+                    + taken.wal_clear)
+                    .as_micros(),
+            );
+            sync.push(taken.wal_sync.as_micros());
+            publish.push(taken.apply.as_micros());
+            compare.push(taken.compare.as_micros());
+            wal_bytes.push(taken.wal_bytes);
+            heap_pages.push(taken.heap_pages);
+            index_pages.push(taken.index_pages);
+            other_pages.push(taken.other_pages);
+            frames.push(taken.frames);
+            compares = taken.row_compares;
+            if let Some(restore) = restore {
+                if force_full {
+                    let _guard = ForceFullUpdate::new();
+                    db.execute(restore).unwrap();
+                } else {
+                    db.execute(restore).unwrap();
+                }
+            }
+        }
+        TimedPublish {
+            cold: totals[0],
+            warm: median(&totals[1..]),
+            wal_warm: median(&wal[1..]),
+            sync_warm: median(&sync[1..]),
+            publish_warm: median(&publish[1..]),
+            compare_warm: median(&compare[1..]),
+            compares,
+            wal_bytes: median_u64(&wal_bytes[1..]),
+            heap_pages: heap_pages[heap_pages.len() - 1],
+            index_pages: index_pages[index_pages.len() - 1],
+            other_pages: other_pages[other_pages.len() - 1],
+            frames: frames[frames.len() - 1],
+        }
+    }
+
+    fn publish_sample(sql: &str, sample: usize, alternate: bool) -> String {
+        if !alternate {
+            return sql.to_string();
+        }
+        if sql.contains("SET active = FALSE") {
+            let value = if sample.is_multiple_of(2) {
+                "FALSE"
+            } else {
+                "TRUE"
+            };
+            return sql.replacen("SET active = FALSE", &format!("SET active = {value}"), 1);
+        }
+        let name = if sample.is_multiple_of(2) { "m" } else { "n" };
+        sql.replacen("SET name = 'n'", &format!("SET name = '{name}'"), 1)
+    }
+
+    fn median_u64(values: &[u64]) -> u64 {
+        let mut warm = values.to_vec();
+        warm.sort_unstable();
+        warm[warm.len() / 2]
     }
 }

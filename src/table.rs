@@ -3,12 +3,13 @@
 //! Durable databases keep the same row vector while a statement runs. The
 //! store publishes those rows into slotted heap pages after the statement
 //! succeeds. Each row has an id assigned at insert time. `UPDATE` keeps ids
-//! by position, and `DELETE` keeps the ids of the surviving rows.
+//! and can replace only the matched rows. `DELETE` keeps the ids of the
+//! surviving rows.
 //!
 //! `positions` maps those stable ids to the current vector slot. It is rebuilt
 //! when `DELETE` compacts the vector. It is not written to the file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::DbError;
 use crate::schema::{Column, Schema};
@@ -179,6 +180,105 @@ impl Table {
             ensure_record_fits(row)?;
         }
         self.rows = rows;
+        Ok(())
+    }
+
+    /// Replace the listed rows after every new image has been checked.
+    ///
+    /// Row ids stay put. A missing id, a duplicate id, a width error, a type
+    /// error, or a record that does not fit leaves every current row in place.
+    /// Unlisted rows are not cloned and are not compared.
+    pub(crate) fn rewrite_matched(
+        &mut self,
+        updates: Vec<(u64, Vec<Value>)>,
+    ) -> Result<(), DbError> {
+        let mut planned = Vec::with_capacity(updates.len());
+        let mut seen = HashSet::with_capacity(updates.len());
+        for (row_id, values) in updates {
+            if !seen.insert(row_id) {
+                return Err(DbError::Internal(format!(
+                    "update lists row {row_id} twice in '{}'",
+                    self.name
+                )));
+            }
+            let Some(position) = self.position(row_id) else {
+                return Err(DbError::Internal(format!(
+                    "update target {row_id} is not in '{}'",
+                    self.name
+                )));
+            };
+            self.check_row(&values)?;
+            planned.push((position, values));
+        }
+        for (position, values) in planned {
+            self.rows[position] = values;
+        }
+        Ok(())
+    }
+
+    /// Check row ids and cell types the way a full publish does, without cloning
+    /// or encoding rows this statement does not rewrite.
+    pub(crate) fn audit(&self) -> Result<(), DbError> {
+        if self.next_row_id == 0 {
+            return Err(DbError::Internal(
+                "table row-id counter must start at 1".to_string(),
+            ));
+        }
+        if self.row_ids.len() != self.rows.len() {
+            return Err(DbError::Internal(format!(
+                "table '{}' has {} row ids for {} rows",
+                self.name,
+                self.row_ids.len(),
+                self.rows.len()
+            )));
+        }
+        let mut seen = HashSet::with_capacity(self.rows.len());
+        for (row_id, values) in self.row_ids.iter().zip(self.rows.iter()) {
+            if *row_id == 0 || *row_id >= self.next_row_id || !seen.insert(*row_id) {
+                return Err(DbError::Internal(format!(
+                    "row id {row_id} is outside the counter for table '{}'",
+                    self.name
+                )));
+            }
+            self.check_row_shape(values)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn row_ids(&self) -> &[u64] {
+        &self.row_ids
+    }
+
+    pub(crate) fn next_row_id(&self) -> u64 {
+        self.next_row_id
+    }
+
+    fn check_row(&self, values: &[Value]) -> Result<(), DbError> {
+        self.check_row_shape(values)?;
+        ensure_record_fits(values)
+    }
+
+    /// Width and runtime type. This does not encode the row.
+    ///
+    /// Publish uses it for every in-memory row, including rows this statement
+    /// does not rewrite. A stored row that already fits is not encoded again.
+    fn check_row_shape(&self, values: &[Value]) -> Result<(), DbError> {
+        if values.len() != self.schema.len() {
+            return Err(DbError::Internal(format!(
+                "row in '{}' does not match its schema",
+                self.name
+            )));
+        }
+        for (value, column) in values.iter().zip(self.schema.columns()) {
+            if let Some(actual) = value.data_type()
+                && actual != column.data_type()
+            {
+                return Err(DbError::Internal(format!(
+                    "row in '{}' has a value that does not match its column",
+                    self.name
+                )));
+            }
+        }
         Ok(())
     }
 

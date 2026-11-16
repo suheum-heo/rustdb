@@ -7,6 +7,7 @@ use crate::error::DbError;
 use crate::schema::Column;
 use crate::storage::{IndexImage, StepError, Store, TableImage};
 use crate::table::Table;
+use crate::value::Value;
 
 /// A database holding named tables.
 ///
@@ -17,6 +18,11 @@ pub struct Database {
     tables: HashMap<String, Table>,
     indexes: Vec<IndexImage>,
     store: Option<Store>,
+    /// Matched row ids from the current `UPDATE`.
+    ///
+    /// Publish rewrites those rows and leaves the others unread. `None` means
+    /// this statement is not an update, so publish compares the whole image.
+    selective: Option<(String, Vec<u64>)>,
 }
 
 /// What a durable statement changed, used to undo memory if publishing fails.
@@ -71,6 +77,7 @@ impl Database {
             tables: HashMap::new(),
             indexes: Vec::new(),
             store: None,
+            selective: None,
         }
     }
 
@@ -91,6 +98,7 @@ impl Database {
             tables,
             indexes,
             store: Some(store),
+            selective: None,
         })
     }
 
@@ -142,6 +150,7 @@ impl Database {
     }
 
     pub(crate) fn rollback(&mut self, undo: Undo) {
+        self.selective = None;
         match undo {
             Undo::None => {}
             Undo::Remove { table, indexes } => {
@@ -164,12 +173,83 @@ impl Database {
         }
     }
 
+    /// Remember the rows an `UPDATE` changed so publish can skip the others.
+    ///
+    /// The ids are stable and were fixed before any assignment. An empty list
+    /// is a match of nothing: publish still audits memory and writes nothing.
+    pub(crate) fn stage_selective_update(&mut self, table: &str, row_ids: Vec<u64>) {
+        self.selective = Some((table.to_string(), row_ids));
+    }
+
+    pub(crate) fn clear_selective(&mut self) {
+        self.selective = None;
+    }
+
     pub(crate) fn publish(&mut self) -> Result<(), StepError> {
+        let selective = self.selective.take();
+        if self.store.is_none() {
+            return Ok(());
+        }
+        if let Some((name, row_ids)) = selective
+            && self.selective_identity_matches(&name)
+        {
+            for table in self.tables.values() {
+                table.audit().map_err(StepError::BeforeCommit)?;
+            }
+            let changes = self.selective_changes(&name, &row_ids)?;
+            let Some(store) = self.store.as_mut() else {
+                return Err(Self::missing_store());
+            };
+            return store.publish_row_changes(&name, &changes);
+        }
         let images: Vec<TableImage> = self.tables.values().map(Table::image).collect();
         let Some(store) = self.store.as_mut() else {
-            return Ok(());
+            return Err(Self::missing_store());
         };
         store.publish_indexes(&images, &self.indexes)
+    }
+
+    fn missing_store() -> StepError {
+        StepError::BeforeCommit(DbError::Internal(
+            "database file disappeared before publish".to_string(),
+        ))
+    }
+
+    fn selective_identity_matches(&self, name: &str) -> bool {
+        let Some(store) = self.store.as_ref() else {
+            return false;
+        };
+        let Some(table) = self.tables.get(name) else {
+            return false;
+        };
+        store.matches_row_identity(name, table.row_ids(), table.next_row_id())
+    }
+
+    fn selective_changes(
+        &self,
+        name: &str,
+        row_ids: &[u64],
+    ) -> Result<Vec<(u64, Vec<Value>)>, StepError> {
+        let Some(table) = self.tables.get(name) else {
+            return Err(StepError::BeforeCommit(DbError::Internal(format!(
+                "updated table '{name}' is not in the catalog"
+            ))));
+        };
+        let mut changes = Vec::with_capacity(row_ids.len());
+        for row_id in row_ids {
+            let Some(position) = table.position(*row_id) else {
+                return Err(StepError::BeforeCommit(DbError::Internal(format!(
+                    "updated row {row_id} is not in '{name}'"
+                ))));
+            };
+            let Some(values) = table.rows().get(position) else {
+                return Err(StepError::BeforeCommit(DbError::Internal(format!(
+                    "updated row {row_id} is not in '{name}'"
+                ))));
+            };
+            changes.push((*row_id, values.clone()));
+        }
+        Ok(changes)
     }
 
     pub(crate) fn create_table(

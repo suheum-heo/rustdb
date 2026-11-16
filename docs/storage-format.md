@@ -150,6 +150,8 @@ A failure before step 3, while the bytes on disk are still an incomplete log, re
 
 A single-row insert rewrites page 0, the catalog page, and one new heap page, and the file grows by one page. An in-place update of that row rewrites page 0 and the heap page. The file length does not change. Deleting that only row turns the heap page into a free page without growing the file, and a later insert can reuse it.
 
+An `UPDATE` asks the editor for the matched row ids only. The page format is unchanged. A new encoding that fits the old slot overwrites that slot. A larger encoding deletes the slot and inserts the record on the same page, or on a newly allocated heap page when the page is full, and patches the heap links. The row id stays on that logical row. Unchanged integer keys do not dirty an index page. Changed keys delete the old posting and insert the new one in the same commit. A second assignment of the same value dirties nothing, including page 0.
+
 `SELECT` reads the in-memory tables and does not write the log. A no-op publish that dirties nothing also skips the log.
 
 The log layout is a 64-byte header, then frames, then a 32-byte trailer. The header is magic `RUSTWAL\0`, log version `1`, page size `4096`, the database nonce, and the base commit id. A frame is a `u32` page id plus the 4096-byte sealed page. The trailer is magic `RUSTCMT\0`, the frame count, a CRC-32 of the frame bytes, and the new commit id, which must be the base commit id plus one. The trailer is valid only when the file length is `64 + frame count * 4100 + 32`, the magic and checksum match, and the new commit id is exactly one past the base.

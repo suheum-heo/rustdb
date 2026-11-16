@@ -1110,3 +1110,103 @@ At 100,000 rows a point update is 76,878 µs indexed and 74,061 µs scanned. The
 Deleting one row at 100,000 is 34,327 µs indexed and 34,083 µs scanned. The value compare is 0. Publish warm is 2,971 µs, the WAL warm time is 9,561 µs, and the equality check is 448 µs. Deleting the 10,000 rows with `bucket = 1` is 298,810 µs indexed and 294,386 µs scanned. Publish warm is 243,863 µs and the WAL warm time is 13,669 µs. The probe for those 10,000 candidates is 3,133 µs and the equality check is 503 µs. Updating the same 10,000 rows is 187,826 µs indexed and 183,723 µs scanned.
 
 The equality check is visible and small next to publish and the WAL. At 100,000 rows it stays under 510 µs on every workload in this run. The index and the forced scan stay within a few percent. This run does not support a claim that indexed candidate selection makes `UPDATE` or `DELETE` faster. The statement still stages a full replacement, and the WAL plus the publish walk dominate both the probe and the completeness check. The staged image at 100,000 rows is 12,800,008 bytes for one changed row and 11,600,000 bytes after deleting 10,000 rows. Those figures are the estimate above, not process RSS.
+
+## Milestone 26 selective UPDATE publishing
+
+Release profile `profile_milestone26`, 15 Nov 2026. Apple M5, 17179869184 bytes of memory, `rustc 1.100.0 (0ef1bc386 2026-11-09)`. `Value` is 32 bytes. The table is the Milestone 25 table: `id` from 0 through `rows - 1`, name `n{id}`, `active` TRUE, `bucket = id % 10`, then `idx_users_bucket` and `idx_users_id`. One database is built per size and copied. The selective database publishes only the matched row ids. The full database runs the same SQL through the full-rewrite guard, which still builds a replacement of every row and compares every stored value. Checksums of `SELECT id, name, active, bucket` matched after the untimed statement. Loading is outside the timer.
+
+Below 100,000 rows there are six timed samples. At 100,000 there are three. Cold is the first sample. Warm is the median of the rest. `one`, `ten`, `many`, and `duplicates` assign `name`, alternating `'m'` and `'n'` after an untimed `'n'`, so every timed sample writes. `fixed` assigns `active = FALSE` before the timer, so its cold sample assigns `FALSE` again and can skip the write. Its warm samples alternate `TRUE` and `FALSE` and do write. `key` sets `id = -1` and restores `id = 1` outside the timer. `grow` assigns a 200-character name and restores `n1`. `shrink` starts from that 200-character name, assigns `n`, and restores the long name outside the timer. `miss` matches nothing. `ten` is `id < 10`, a heap scan of exactly 10 rows. `many` is `active = TRUE`, a heap scan of every row. `duplicates` is `bucket = 1`, about 10% of the rows, through the index.
+
+`probe`, `validate`, `filter`, `stage`, and `apply` are the untimed selective execution. `discover` in the log is `probe + validate + filter`. `staged_bytes` is `modified * 8 + staged_rows * 4 * 32`. On the selective path `staged_rows` is the match count. The full guard stages every heap row, so a one-row update of 100,000 rows is 12,800,008 bytes there and 136 bytes here. A miss is 12,800,000 bytes there and 0 here. An update of every row is 13,600,000 bytes on both. None of this is process RSS. The pre-statement undo still clones the table on both paths and is not included.
+
+`wal` is WAL write, WAL sync, database write, database sync, and WAL clear. `publish` is the editor apply. `compare` is `same_values` inside that apply. `compares` is the last sample. WAL bytes and the heap, index, and other page counts were the same on both paths for every workload in this run. Other pages are page 0 and any catalog page. Frames are the sum. A name change dirties no index page. A key change does. Growing the text onto a new heap page adds a heap page. Shrinking it back fits the old slot and does not.
+
+| Workload | Rows | Selective cold | Selective warm | Full cold | Full warm | WAL sel | WAL full | Publish sel | Publish full | Compare sel | Compare full |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| one | 100 | 10,653 µs | 10,988 µs | 11,028 µs | 12,016 µs | 10,602 µs | 11,433 µs | 185 µs | 341 µs | 39 µs | 129 µs |
+| miss | 100 | 53 µs | 24 µs | 69 µs | 66 µs | 0 µs | 0 µs | 0 µs | 23 µs | 0 µs | 16 µs |
+| ten | 100 | 10,935 µs | 10,986 µs | 10,024 µs | 11,944 µs | 10,605 µs | 11,327 µs | 225 µs | 352 µs | 53 µs | 130 µs |
+| many | 100 | 11,695 µs | 11,839 µs | 12,814 µs | 11,271 µs | 11,206 µs | 10,638 µs | 360 µs | 359 µs | 95 µs | 98 µs |
+| key | 100 | 11,954 µs | 11,919 µs | 12,960 µs | 12,911 µs | 11,424 µs | 12,295 µs | 230 µs | 292 µs | 38 µs | 90 µs |
+| fixed | 100 | 151 µs | 11,774 µs | 290 µs | 10,968 µs | 11,385 µs | 10,511 µs | 167 µs | 227 µs | 37 µs | 89 µs |
+| grow | 100 | 9,949 µs | 11,833 µs | 9,969 µs | 10,933 µs | 11,235 µs | 10,502 µs | 257 µs | 233 µs | 34 µs | 84 µs |
+| shrink | 100 | 11,062 µs | 11,164 µs | 12,012 µs | 11,125 µs | 10,776 µs | 10,582 µs | 229 µs | 280 µs | 46 µs | 125 µs |
+| duplicates | 100 | 12,868 µs | 11,978 µs | 11,064 µs | 11,962 µs | 11,445 µs | 11,252 µs | 269 µs | 303 µs | 72 µs | 95 µs |
+| one | 1,000 | 12,345 µs | 10,062 µs | 11,044 µs | 11,852 µs | 9,481 µs | 10,214 µs | 193 µs | 863 µs | 38 µs | 660 µs |
+| miss | 1,000 | 137 µs | 122 µs | 688 µs | 662 µs | 0 µs | 0 µs | 1 µs | 270 µs | 0 µs | 200 µs |
+| ten | 1,000 | 12,668 µs | 11,938 µs | 11,062 µs | 12,032 µs | 11,408 µs | 10,592 µs | 212 µs | 888 µs | 51 µs | 678 µs |
+| many | 1,000 | 15,531 µs | 14,939 µs | 15,205 µs | 15,003 µs | 10,979 µs | 11,212 µs | 2,895 µs | 2,628 µs | 836 µs | 789 µs |
+| key | 1,000 | 12,965 µs | 12,040 µs | 13,249 µs | 13,041 µs | 11,088 µs | 11,323 µs | 503 µs | 1,009 µs | 55 µs | 671 µs |
+| fixed | 1,000 | 427 µs | 11,938 µs | 2,028 µs | 12,931 µs | 11,203 µs | 11,412 µs | 283 µs | 860 µs | 45 µs | 657 µs |
+| grow | 1,000 | 12,999 µs | 12,040 µs | 13,090 µs | 13,063 µs | 11,297 µs | 11,350 µs | 285 µs | 996 µs | 35 µs | 731 µs |
+| shrink | 1,000 | 10,936 µs | 11,943 µs | 13,109 µs | 12,937 µs | 11,360 µs | 11,359 µs | 191 µs | 890 µs | 37 µs | 688 µs |
+| duplicates | 1,000 | 14,641 µs | 13,956 µs | 14,094 µs | 13,998 µs | 11,591 µs | 11,130 µs | 1,480 µs | 1,697 µs | 479 µs | 657 µs |
+| one | 10,000 | 12,487 µs | 12,001 µs | 19,360 µs | 18,855 µs | 10,897 µs | 10,798 µs | 246 µs | 5,575 µs | 31 µs | 5,029 µs |
+| miss | 10,000 | 536 µs | 527 µs | 2,872 µs | 2,733 µs | 0 µs | 0 µs | 3 µs | 1,085 µs | 0 µs | 754 µs |
+| ten | 10,000 | 12,822 µs | 11,884 µs | 18,484 µs | 18,161 µs | 10,691 µs | 10,502 µs | 236 µs | 5,460 µs | 31 µs | 4,950 µs |
+| many | 10,000 | 34,975 µs | 29,110 µs | 30,083 µs | 28,774 µs | 10,714 µs | 9,453 µs | 13,674 µs | 13,249 µs | 4,065 µs | 4,144 µs |
+| key | 10,000 | 12,556 µs | 12,076 µs | 22,726 µs | 20,085 µs | 10,840 µs | 11,448 µs | 447 µs | 5,751 µs | 38 µs | 5,108 µs |
+| fixed | 10,000 | 864 µs | 12,794 µs | 8,483 µs | 18,179 µs | 11,721 µs | 10,412 µs | 232 µs | 5,462 µs | 29 µs | 4,949 µs |
+| grow | 10,000 | 11,555 µs | 12,016 µs | 22,682 µs | 19,069 µs | 10,633 µs | 10,883 µs | 378 µs | 5,786 µs | 34 µs | 5,201 µs |
+| shrink | 10,000 | 11,641 µs | 12,075 µs | 23,606 µs | 18,977 µs | 10,699 µs | 11,101 µs | 339 µs | 5,539 µs | 41 µs | 5,005 µs |
+| duplicates | 10,000 | 26,582 µs | 25,908 µs | 28,391 µs | 27,065 µs | 11,063 µs | 10,828 µs | 10,286 µs | 11,093 µs | 3,468 µs | 4,166 µs |
+| one | 100,000 | 18,804 µs | 18,006 µs | 74,766 µs | 72,221 µs | 10,549 µs | 11,276 µs | 1,080 µs | 43,555 µs | 28 µs | 40,209 µs |
+| miss | 100,000 | 6,490 µs | 6,065 µs | 29,031 µs | 29,485 µs | 0 µs | 0 µs | 27 µs | 11,352 µs | 0 µs | 8,017 µs |
+| ten | 100,000 | 19,178 µs | 18,140 µs | 74,075 µs | 72,658 µs | 10,503 µs | 11,020 µs | 1,061 µs | 43,448 µs | 32 µs | 40,109 µs |
+| many | 100,000 | 206,349 µs | 208,142 µs | 211,218 µs | 211,072 µs | 16,004 µs | 16,336 µs | 139,142 µs | 133,290 µs | 41,205 µs | 41,449 µs |
+| key | 100,000 | 18,305 µs | 19,039 µs | 75,112 µs | 72,829 µs | 11,384 µs | 11,283 µs | 1,229 µs | 43,543 µs | 30 µs | 40,041 µs |
+| fixed | 100,000 | 7,307 µs | 19,057 µs | 61,696 µs | 72,169 µs | 11,752 µs | 10,908 µs | 1,046 µs | 43,536 µs | 28 µs | 40,213 µs |
+| grow | 100,000 | 18,846 µs | 19,177 µs | 73,438 µs | 73,929 µs | 11,501 µs | 12,009 µs | 1,301 µs | 43,849 µs | 33 µs | 40,411 µs |
+| shrink | 100,000 | 19,787 µs | 20,141 µs | 73,795 µs | 72,878 µs | 12,300 µs | 10,330 µs | 1,102 µs | 43,800 µs | 30 µs | 40,470 µs |
+| duplicates | 100,000 | 156,462 µs | 155,849 µs | 179,198 µs | 177,187 µs | 15,883 µs | 15,310 µs | 98,527 µs | 108,111 µs | 33,401 µs | 41,497 µs |
+
+| Workload | Rows | Access | Candidates | Modified | Probe | Validate | Filter | Staged bytes | Compares sel | Compares full | WAL bytes | Heap | Index | Frames | Checksum |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| one | 100 | IndexLookup | 1 | 1 | 13 µs | 0 µs | 0 µs | 136 | 1 | 100 | 8,296 | 1 | 0 | 2 | 5,789 |
+| miss | 100 | IndexLookup | 0 | 0 | 2 µs | 0 µs | 0 µs | 0 | 0 | 100 | 0 | 0 | 0 | 0 | 5,790 |
+| ten | 100 | HeapScan | 100 | 10 | 0 µs | 0 µs | 4 µs | 1,360 | 10 | 100 | 8,296 | 1 | 0 | 2 | 5,780 |
+| many | 100 | HeapScan | 100 | 100 | 0 µs | 0 µs | 18 µs | 13,600 | 100 | 100 | 12,396 | 2 | 0 | 3 | 5,600 |
+| key | 100 | IndexLookup | 1 | 1 | 3 µs | 0 µs | 1 µs | 136 | 1 | 100 | 12,396 | 1 | 1 | 3 | 5,788 |
+| fixed | 100 | IndexLookup | 1 | 1 | 3 µs | 0 µs | 1 µs | 136 | 1 | 100 | 8,296 | 1 | 0 | 2 | 5,789 |
+| grow | 100 | IndexLookup | 1 | 1 | 3 µs | 0 µs | 1 µs | 136 | 1 | 100 | 12,396 | 2 | 0 | 3 | 5,988 |
+| shrink | 100 | IndexLookup | 1 | 1 | 31 µs | 0 µs | 0 µs | 136 | 1 | 100 | 8,296 | 1 | 0 | 2 | 5,789 |
+| duplicates | 100 | IndexLookup | 10 | 10 | 4 µs | 0 µs | 2 µs | 1,360 | 10 | 100 | 12,396 | 2 | 0 | 3 | 5,771 |
+| one | 1,000 | IndexLookup | 1 | 1 | 2 µs | 0 µs | 0 µs | 136 | 1 | 1,000 | 8,296 | 1 | 0 | 2 | 508,889 |
+| miss | 1,000 | IndexLookup | 0 | 0 | 4 µs | 1 µs | 0 µs | 0 | 0 | 1,000 | 0 | 0 | 0 | 0 | 508,890 |
+| ten | 1,000 | HeapScan | 1,000 | 10 | 0 µs | 0 µs | 18 µs | 1,360 | 10 | 1,000 | 8,296 | 1 | 0 | 2 | 508,880 |
+| many | 1,000 | HeapScan | 1,000 | 1,000 | 0 µs | 0 µs | 154 µs | 136,000 | 1,000 | 1,000 | 61,596 | 14 | 0 | 15 | 506,000 |
+| key | 1,000 | IndexLookup | 1 | 1 | 10 µs | 1 µs | 1 µs | 136 | 1 | 1,000 | 16,496 | 1 | 2 | 4 | 508,888 |
+| fixed | 1,000 | IndexLookup | 1 | 1 | 4 µs | 2 µs | 0 µs | 136 | 1 | 1,000 | 8,296 | 1 | 0 | 2 | 508,889 |
+| grow | 1,000 | IndexLookup | 1 | 1 | 3 µs | 2 µs | 1 µs | 136 | 1 | 1,000 | 12,396 | 2 | 0 | 3 | 509,088 |
+| shrink | 1,000 | IndexLookup | 1 | 1 | 79 µs | 1 µs | 0 µs | 136 | 1 | 1,000 | 8,296 | 1 | 0 | 2 | 508,889 |
+| duplicates | 1,000 | IndexLookup | 100 | 100 | 11 µs | 4 µs | 5 µs | 13,600 | 100 | 1,000 | 61,596 | 14 | 0 | 15 | 508,601 |
+| one | 10,000 | IndexLookup | 1 | 1 | 3 µs | 11 µs | 0 µs | 136 | 1 | 10,000 | 8,296 | 1 | 0 | 2 | 50,098,889 |
+| miss | 10,000 | IndexLookup | 0 | 0 | 2 µs | 11 µs | 0 µs | 0 | 0 | 10,000 | 0 | 0 | 0 | 0 | 50,098,890 |
+| ten | 10,000 | HeapScan | 10,000 | 10 | 0 µs | 0 µs | 74 µs | 1,360 | 10 | 10,000 | 8,296 | 1 | 0 | 2 | 50,098,880 |
+| many | 10,000 | HeapScan | 10,000 | 10,000 | 0 µs | 0 µs | 812 µs | 1,360,000 | 10,000 | 10,000 | 574,096 | 139 | 0 | 140 | 50,060,000 |
+| key | 10,000 | IndexLookup | 1 | 1 | 2 µs | 10 µs | 0 µs | 136 | 1 | 10,000 | 16,496 | 1 | 2 | 4 | 50,098,888 |
+| fixed | 10,000 | IndexLookup | 1 | 1 | 2 µs | 10 µs | 0 µs | 136 | 1 | 10,000 | 8,296 | 1 | 0 | 2 | 50,098,889 |
+| grow | 10,000 | IndexLookup | 1 | 1 | 2 µs | 10 µs | 0 µs | 136 | 1 | 10,000 | 12,396 | 2 | 0 | 3 | 50,099,088 |
+| shrink | 10,000 | IndexLookup | 1 | 1 | 62 µs | 12 µs | 0 µs | 136 | 1 | 10,000 | 8,296 | 1 | 0 | 2 | 50,098,889 |
+| duplicates | 10,000 | IndexLookup | 1,000 | 1,000 | 34 µs | 14 µs | 15 µs | 136,000 | 1,000 | 10,000 | 574,096 | 139 | 0 | 140 | 50,095,001 |
+| one | 100,000 | IndexLookup | 1 | 1 | 6 µs | 136 µs | 0 µs | 136 | 1 | 100,000 | 8,296 | 1 | 0 | 2 | 5,001,088,889 |
+| miss | 100,000 | IndexLookup | 0 | 0 | 5 µs | 165 µs | 0 µs | 0 | 0 | 100,000 | 0 | 0 | 0 | 0 | 5,001,088,890 |
+| ten | 100,000 | HeapScan | 100,000 | 10 | 0 µs | 0 µs | 886 µs | 1,360 | 10 | 100,000 | 8,296 | 1 | 0 | 2 | 5,001,088,880 |
+| many | 100,000 | HeapScan | 100,000 | 100,000 | 0 µs | 0 µs | 6,731 µs | 13,600,000 | 100,000 | 100,000 | 5,772,896 | 1,407 | 0 | 1,408 | 5,000,600,000 |
+| key | 100,000 | IndexLookup | 1 | 1 | 5 µs | 198 µs | 0 µs | 136 | 1 | 100,000 | 20,596 | 1 | 3 | 5 | 5,001,088,888 |
+| fixed | 100,000 | IndexLookup | 1 | 1 | 5 µs | 166 µs | 0 µs | 136 | 1 | 100,000 | 8,296 | 1 | 0 | 2 | 5,001,088,889 |
+| grow | 100,000 | IndexLookup | 1 | 1 | 5 µs | 189 µs | 0 µs | 136 | 1 | 100,000 | 12,396 | 2 | 0 | 3 | 5,001,089,088 |
+| shrink | 100,000 | IndexLookup | 1 | 1 | 102 µs | 175 µs | 0 µs | 136 | 1 | 100,000 | 8,296 | 1 | 0 | 2 | 5,001,088,889 |
+| duplicates | 100,000 | IndexLookup | 10,000 | 10,000 | 903 µs | 409 µs | 243 µs | 1,360,000 | 10,000 | 100,000 | 5,768,796 | 1,406 | 0 | 1,407 | 5,001,040,001 |
+
+At 100,000 rows a one-row name update is 18,006 µs selective and 72,221 µs on the full-rewrite guard. The compare is 28 µs against one row, versus 40,209 µs against all 100,000. Publish is 1,080 µs versus 43,555 µs. WAL time is 10,549 µs versus 11,276 µs, and both logs are 8,296 bytes: page 0 and one heap page. WAL sync on those warm samples is 3,609 µs and 4,124 µs. The durable write did not get smaller. The CPU compare and the full-image publish did. The equality check is 136 µs. Staging the matched row is 136 bytes, against 12,800,008 bytes for the guard. The undo clone is extra on both and is not in that figure.
+
+A miss at 100,000 rows is 6,065 µs selective and 29,485 µs full. Both write 0 WAL bytes. The selective path compares 0 rows. The full path compares 100,000 and spends 8,017 µs in that compare and 11,352 µs in publish. The selective validate walk is 165 µs. The statement is not free: the equality check and the rest of execution remain.
+
+Ten rows at 100,000, found by a heap scan, are 18,140 µs versus 72,658 µs. The scan's filter is 886 µs. The publish compare is 32 µs versus 40,109 µs. WAL bytes stay 8,296 because those ten ids share one heap page. Changing the indexed key is 19,039 µs versus 72,829 µs, with 20,596 WAL bytes, one heap page, and three index pages on both paths. Growing a name to 200 characters is 19,177 µs versus 73,929 µs, 12,396 WAL bytes, and two heap pages: the record moved to a new page. Shrinking it is 20,141 µs versus 72,878 µs, 8,296 WAL bytes, and one heap page. Neither growth nor shrinkage fell back to a full-table image. A boolean update has the same shape as the one-row name update once the warm samples actually change the bit. Its cold sample is the no-op described above.
+
+Updating every row at 100,000 is 208,142 µs selective and 211,072 µs full. Both compare 100,000 rows, dirty 1,407 heap pages, and write 5,772,896 WAL bytes. WAL sync is 6,000 µs and 5,760 µs. This path still rewrites the table. The 10,000 duplicate-key rows are 155,849 µs versus 177,187 µs. WAL bytes match at 5,768,796, heap pages match at 1,406, and the compare drops from 41,497 µs to 33,401 µs. That is less CPU, not less durable I/O.
+
+At 100 rows the warm times sit inside the WAL and neither path is consistently faster. At 1,000 rows a one-row update is 10,062 µs versus 11,852 µs, and the compare is 38 µs versus 660 µs. The gap is real and still smaller than one sync. At 10,000 rows the one-row update is 12,001 µs versus 18,855 µs. Updating every row at 10,000 is 29,110 µs versus 28,774 µs, the same 574,096 WAL bytes, so the full-table case does not get faster.
+
+The selective path reduces the rows decoded during publish and the bytes staged for the replacement. It does not reduce WAL bytes when the same pages are dirty, and it does not remove the pre-statement undo clone or the equality walk. An update of every row still rewrites those heap pages. Injected errors are not a power-loss test.

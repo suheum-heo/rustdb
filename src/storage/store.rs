@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::error::DbError;
 use crate::schema::{Column, Schema};
 use crate::storage::btree::{self, Nodes};
-use crate::storage::edit::{Editor, LiveIndex, LiveTable, Snapshot};
+use crate::storage::edit::{Editor, LiveIndex, LiveTable, Prepared, Snapshot};
 use crate::storage::page::{self, InsertError, PAGE_SIZE, Page};
 use crate::storage::pager::{Image, Pager};
 use crate::storage::profile;
@@ -260,6 +260,49 @@ impl Store {
             .apply(&mut self.pager, &owned, indexes)
             .map_err(StepError::BeforeCommit)?;
         profile::add_apply(apply_mark);
+        self.commit_prepared(prepared, nonce, base_commit)
+    }
+
+    /// True when `table` still has the row ids and counter stored on disk.
+    pub(crate) fn matches_row_identity(
+        &self,
+        table: &str,
+        row_ids: &[u64],
+        next_row_id: u64,
+    ) -> bool {
+        self.state.tables.get(table).is_some_and(|live| {
+            live.next_row_id == next_row_id && live.row_ids.as_slice() == row_ids
+        })
+    }
+
+    /// Publish one table's changed rows through the existing page-image commit.
+    ///
+    /// Unlisted rows are not read. Index pages change only when a key changes.
+    /// The WAL record type is unchanged: the commit is the dirty page images.
+    pub(crate) fn publish_row_changes(
+        &mut self,
+        table: &str,
+        changes: &[(u64, Vec<Value>)],
+    ) -> Result<(), StepError> {
+        if let Some(error) = &self.fence {
+            return Err(StepError::AfterCommit(error.clone()));
+        }
+        let base_commit = self.state.commit_id;
+        let nonce = self.state.nonce;
+        let apply_mark = profile::start();
+        let prepared = Editor::new(self.state.clone())
+            .rewrite_changes(&mut self.pager, table, changes)
+            .map_err(StepError::BeforeCommit)?;
+        profile::add_apply(apply_mark);
+        self.commit_prepared(prepared, nonce, base_commit)
+    }
+
+    fn commit_prepared(
+        &mut self,
+        prepared: Option<Prepared>,
+        nonce: u64,
+        base_commit: u64,
+    ) -> Result<(), StepError> {
         let Some(prepared) = prepared else {
             return Ok(());
         };

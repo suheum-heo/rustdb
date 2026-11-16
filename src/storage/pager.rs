@@ -182,6 +182,7 @@ impl Pager {
         } else {
             wal::encode_committed(&plan).map_err(StepError::BeforeCommit)?
         };
+        profile::note_wal_bytes(bytes.len());
         let wal_mark = profile::start();
         let written = write_log(&wal_path, &bytes);
         profile::add_wal_write(wal_mark);

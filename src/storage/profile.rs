@@ -18,6 +18,14 @@ pub(crate) struct Profile {
     pub frames: u32,
     #[cfg_attr(not(test), allow(dead_code))]
     pub row_compares: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub heap_pages: u32,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub index_pages: u32,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub other_pages: u32,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub wal_bytes: u64,
 }
 
 #[cfg(test)]
@@ -33,6 +41,10 @@ thread_local! {
         wal_clear: Duration::ZERO,
         frames: 0,
         row_compares: 0,
+        heap_pages: 0,
+        index_pages: 0,
+        other_pages: 0,
+        wal_bytes: 0,
     }) };
 }
 
@@ -89,6 +101,50 @@ pub(crate) fn note_frames(count: u32) {
     #[cfg(not(test))]
     {
         let _ = count;
+    }
+}
+
+pub(crate) fn note_heap_page() {
+    note_counter(|profile| &mut profile.heap_pages);
+}
+
+pub(crate) fn note_index_page() {
+    note_counter(|profile| &mut profile.index_pages);
+}
+
+pub(crate) fn note_other_page() {
+    note_counter(|profile| &mut profile.other_pages);
+}
+
+pub(crate) fn note_wal_bytes(bytes: usize) {
+    #[cfg(test)]
+    if ENABLED.with(std::cell::Cell::get) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        DATA.with(|data| {
+            let mut profile = data.get();
+            profile.wal_bytes = profile.wal_bytes.saturating_add(bytes);
+            data.set(profile);
+        });
+    }
+    #[cfg(not(test))]
+    {
+        let _ = bytes;
+    }
+}
+
+fn note_counter(slot: fn(&mut Profile) -> &mut u32) {
+    #[cfg(test)]
+    if ENABLED.with(std::cell::Cell::get) {
+        DATA.with(|data| {
+            let mut profile = data.get();
+            let current = *slot(&mut profile);
+            *slot(&mut profile) = current.saturating_add(1);
+            data.set(profile);
+        });
+    }
+    #[cfg(not(test))]
+    {
+        let _ = slot;
     }
 }
 
