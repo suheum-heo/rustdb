@@ -69,6 +69,24 @@ pub(crate) struct Profile {
     /// Bytes of the posting vectors built for one bulk rebuild.
     #[cfg_attr(not(test), allow(dead_code))]
     pub scratch_bytes: u64,
+    /// Leaf pages decoded while checking or editing an index.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub leaf_decodes: u64,
+    /// Right-sibling steps during ordered verification and span loading.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub sibling_steps: u64,
+    /// Entry comparisons while matching a delete request to a leaf.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub posting_compares: u64,
+    /// Checks that a request pair has not already been accepted.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub duplicate_checks: u64,
+    /// Postings accepted by the ordered leaf-chain check.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub ordered_verified: u64,
+    /// Postings accepted by a root descent per posting.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fallback_verified: u64,
 }
 
 #[cfg(test)]
@@ -104,6 +122,12 @@ thread_local! {
         pages_freed: 0,
         bulk_spans: 0,
         scratch_bytes: 0,
+        leaf_decodes: 0,
+        sibling_steps: 0,
+        posting_compares: 0,
+        duplicate_checks: 0,
+        ordered_verified: 0,
+        fallback_verified: 0,
     }) };
 }
 
@@ -206,6 +230,30 @@ pub(crate) fn note_bulk_span() {
 
 pub(crate) fn note_scratch(bytes: u64) {
     note_u64(|profile| &mut profile.scratch_bytes, bytes);
+}
+
+pub(crate) fn note_leaf_decode() {
+    note_u64(|profile| &mut profile.leaf_decodes, 1);
+}
+
+pub(crate) fn note_sibling_step() {
+    note_u64(|profile| &mut profile.sibling_steps, 1);
+}
+
+pub(crate) fn note_posting_compare_n(count: u64) {
+    note_u64(|profile| &mut profile.posting_compares, count);
+}
+
+pub(crate) fn note_duplicate_check_n(count: u64) {
+    note_u64(|profile| &mut profile.duplicate_checks, count);
+}
+
+pub(crate) fn note_ordered_verified(count: u64) {
+    note_u64(|profile| &mut profile.ordered_verified, count);
+}
+
+pub(crate) fn note_fallback_verified(count: u64) {
+    note_u64(|profile| &mut profile.fallback_verified, count);
 }
 
 fn note_u64(slot: fn(&mut Profile) -> &mut u64, amount: u64) {

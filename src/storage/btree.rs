@@ -174,7 +174,11 @@ pub(crate) fn delete(
 /// below its minimum is removed by repacking the sibling span that holds the
 /// verified prefix, then rebuilding internal pages over the surviving leaves.
 /// The prefix stops at the first missing or repeated pair, and that error is
-/// the same as [`delete`]. A test can force the grouped path for every run.
+/// the same as [`delete`]. A run that moves only forward or only backward in
+/// `(key, row id)` order is checked along the leaf chain after the first root
+/// descent. Any other order, a repeated pair, and a test that forces it still
+/// descend once per posting. A test can also force the grouped path for every
+/// run.
 pub(crate) fn delete_many(
     store: &mut dyn Nodes,
     mut root: u32,
@@ -198,12 +202,7 @@ pub(crate) fn delete_many(
         let mut run = 0;
         while cursor + run < entries.len() {
             let wanted = entries[cursor + run];
-            let Some(slot) = leaf
-                .entries
-                .iter()
-                .enumerate()
-                .position(|(index, entry)| !claimed[index] && *entry == wanted)
-            else {
+            let Some(slot) = unclaimed_slot(&leaf.entries, &claimed, wanted) else {
                 break;
             };
             claimed[slot] = true;
@@ -226,7 +225,7 @@ pub(crate) fn delete_many(
             cursor += take;
         } else if run > room {
             let (new_root, taken) =
-                bulk_rebalance(store, root, &entries[cursor..], leaf_id, run, limits)?;
+                bulk_rebalance(store, root, &entries[cursor..], leaf_id, run, &path, limits)?;
             if taken == 0 {
                 root = delete(store, root, entries[cursor].0, entries[cursor].1, limits)?;
                 cursor += 1;
@@ -261,12 +260,7 @@ fn delete_grouped(
         let mut run = 0;
         while cursor + run < entries.len() {
             let wanted = entries[cursor + run];
-            let Some(slot) = leaf
-                .entries
-                .iter()
-                .enumerate()
-                .position(|(index, entry)| !claimed[index] && *entry == wanted)
-            else {
+            let Some(slot) = unclaimed_slot(&leaf.entries, &claimed, wanted) else {
                 break;
             };
             claimed[slot] = true;
@@ -330,6 +324,41 @@ fn grouped_only() -> bool {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_DESCENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Check every posting with a root descent, as Milestone 31 did.
+#[cfg(test)]
+pub(crate) struct ForceDescentVerify;
+
+#[cfg(test)]
+impl ForceDescentVerify {
+    pub(crate) fn new() -> Self {
+        FORCE_DESCENT.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceDescentVerify {
+    fn drop(&mut self) {
+        FORCE_DESCENT.with(|flag| flag.set(false));
+    }
+}
+
+fn descent_only() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_DESCENT.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 struct Hit {
     entry: Entry,
     leaf: u32,
@@ -356,9 +385,10 @@ fn bulk_rebalance(
     entries: &[Entry],
     seed_leaf: u32,
     seed_count: usize,
+    path: &[(u32, usize)],
     limits: Limits,
 ) -> Result<(u32, usize), DbError> {
-    let hits = collect_hits(store, root, entries, seed_leaf, seed_count)?;
+    let hits = collect_hits(store, root, entries, seed_leaf, seed_count, path)?;
     if hits.len() < 2 {
         return Ok((root, 0));
     }
@@ -533,27 +563,54 @@ fn collect_hits(
     entries: &[Entry],
     seed_leaf: u32,
     seed_count: usize,
+    path: &[(u32, usize)],
 ) -> Result<Vec<Hit>, DbError> {
     let mut hits = Vec::new();
     let mut claimed = HashSet::new();
     for entry in entries.iter().copied().take(seed_count) {
-        if !claimed.insert(entry) {
-            break;
+        if !claim_posting(&mut claimed, entry) {
+            super::profile::note_fallback_verified(count_u64(hits.len()));
+            return Ok(hits);
         }
         hits.push(Hit {
             entry,
             leaf: seed_leaf,
         });
     }
+    // The ordered walk accepts a request that only moves forward or only
+    // backward. A repeated pair or a change of direction keeps the per-posting
+    // descent, so the first rejected request stays the one descent would reject.
+    let direction = monotonic_direction(entries);
+    if seed_count > 0
+        && !descent_only()
+        && let Some(direction) = direction
+        && let Some(extra) = verify_ordered_suffix(
+            store,
+            entries,
+            seed_leaf,
+            seed_count,
+            path,
+            direction == Direction::Forward,
+        )?
+    {
+        for hit in extra {
+            if !claim_posting(&mut claimed, hit.entry) {
+                break;
+            }
+            hits.push(hit);
+        }
+        super::profile::note_ordered_verified(count_u64(hits.len()));
+        return Ok(hits);
+    }
     let mut index = hits.len();
     while index < entries.len() {
         let entry = entries[index];
-        if !claimed.insert(entry) {
+        if !claim_posting(&mut claimed, entry) {
             break;
         }
         let (_path, leaf_id) = path_to_leaf(store, root, entry)?;
         let leaf = decode_leaf(&store.read_node(leaf_id)?)?;
-        if !leaf.entries.contains(&entry) {
+        if !leaf_contains(&leaf.entries, entry) {
             break;
         }
         hits.push(Hit {
@@ -562,7 +619,508 @@ fn collect_hits(
         });
         index += 1;
     }
+    super::profile::note_fallback_verified(count_u64(hits.len()));
     Ok(hits)
+}
+
+fn count_u64(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+fn claim_posting(claimed: &mut HashSet<Entry>, entry: Entry) -> bool {
+    super::profile::note_duplicate_check_n(1);
+    claimed.insert(entry)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Forward,
+    Backward,
+}
+
+/// `Some` when every adjacent pair moves the same way. Equal pairs and a
+/// change of direction are `None`, and those requests keep the per-posting
+/// descent. A one-entry slice is forward because it has no later posting.
+fn monotonic_direction(entries: &[Entry]) -> Option<Direction> {
+    let mut direction = None;
+    let mut checks = 0_u64;
+    for pair in entries.windows(2) {
+        checks += 1;
+        let step = match cmp_entry(pair[0], pair[1]) {
+            Ordering::Less => Direction::Forward,
+            Ordering::Greater => Direction::Backward,
+            Ordering::Equal => return None,
+        };
+        match direction {
+            None => direction = Some(step),
+            Some(current) if current != step => return None,
+            Some(_) => {}
+        }
+    }
+    super::profile::note_duplicate_check_n(checks);
+    super::profile::note_posting_compare_n(checks);
+    Some(direction.unwrap_or(Direction::Forward))
+}
+
+fn leaf_contains(entries: &[Entry], wanted: Entry) -> bool {
+    let mut compares = 0_u64;
+    let found = entries.iter().any(|entry| {
+        compares += 1;
+        *entry == wanted
+    });
+    super::profile::note_posting_compare_n(compares);
+    found
+}
+
+fn unclaimed_slot(entries: &[Entry], claimed: &[bool], wanted: Entry) -> Option<usize> {
+    let mut compares = 0_u64;
+    let slot = entries.iter().enumerate().position(|(index, entry)| {
+        compares += 1;
+        !claimed[index] && *entry == wanted
+    });
+    super::profile::note_posting_compare_n(compares);
+    super::profile::note_duplicate_check_n(compares);
+    slot
+}
+
+fn leaf_is_strict(entries: &[Entry]) -> bool {
+    entries
+        .windows(2)
+        .all(|pair| cmp_entry(pair[0], pair[1]) == Ordering::Less)
+}
+
+struct PostedCompares(u64);
+
+impl Drop for PostedCompares {
+    fn drop(&mut self) {
+        super::profile::note_posting_compare_n(self.0);
+    }
+}
+
+/// `None` means the chain walk is not a safe substitute, and the caller must
+/// use a root descent per posting. A `Some` prefix stops before the first
+/// missing pair and does not include it.
+fn verify_ordered_suffix(
+    store: &mut dyn Nodes,
+    entries: &[Entry],
+    seed_leaf: u32,
+    seed_count: usize,
+    path: &[(u32, usize)],
+    forward: bool,
+) -> Result<Option<Vec<Hit>>, DbError> {
+    let loaded = match load_leaf(store, seed_leaf) {
+        Ok(loaded) => loaded,
+        Err(_) => return Ok(None),
+    };
+    if !leaf_is_strict(&loaded.entries) {
+        return Ok(None);
+    }
+    let last_seed = entries[seed_count - 1];
+    let Some(position) = loaded.entries.iter().position(|entry| *entry == last_seed) else {
+        return Ok(None);
+    };
+    let (low, high) = match leaf_bounds(store, path) {
+        Ok(bounds) => bounds,
+        Err(_) => return Ok(None),
+    };
+    if !in_bounds(last_seed, low, high) {
+        return Ok(None);
+    }
+    let mut cursor = LeafCursor {
+        id: loaded.id,
+        entries: loaded.entries,
+        left: loaded.left,
+        right: loaded.right,
+        low,
+        high,
+        path: path.to_vec(),
+        // Forward scans the next larger slot. Backward starts on the last
+        // seed and steps to the previous slot before comparing.
+        slot: if forward { position + 1 } else { position },
+    };
+    let mut seen = HashSet::new();
+    seen.insert(cursor.id);
+    let mut extra = Vec::new();
+    let mut index = seed_count;
+    let mut compares = PostedCompares(0);
+    while index < entries.len() {
+        let wanted = entries[index];
+        let moved = if forward {
+            while !below_high(wanted, cursor.high) {
+                match step_to_next_leaf(store, &mut cursor, &mut seen) {
+                    ChainStep::Moved => {}
+                    ChainStep::End => return Ok(Some(extra)),
+                    ChainStep::Fallback => return Ok(None),
+                }
+                if !leaf_is_strict(&cursor.entries) {
+                    return Ok(None);
+                }
+            }
+            !at_or_above_low(wanted, cursor.low)
+        } else {
+            while !at_or_above_low(wanted, cursor.low) {
+                match step_to_previous_leaf(store, &mut cursor, &mut seen) {
+                    ChainStep::Moved => {}
+                    ChainStep::End => return Ok(Some(extra)),
+                    ChainStep::Fallback => return Ok(None),
+                }
+                if !leaf_is_strict(&cursor.entries) {
+                    return Ok(None);
+                }
+            }
+            !below_high(wanted, cursor.high)
+        };
+        if moved {
+            // The separator range and the leaf just entered do not agree.
+            // Descent decides whether that key is missing or the page is corrupt.
+            return Ok(None);
+        }
+        let found = if forward {
+            let mut found = false;
+            while cursor.slot < cursor.entries.len() {
+                compares.0 += 1;
+                match cmp_entry(wanted, cursor.entries[cursor.slot]) {
+                    Ordering::Equal => {
+                        found = true;
+                        break;
+                    }
+                    Ordering::Less => break,
+                    Ordering::Greater => cursor.slot += 1,
+                }
+            }
+            found
+        } else {
+            let mut found = false;
+            while cursor.slot > 0 {
+                cursor.slot -= 1;
+                compares.0 += 1;
+                match cmp_entry(wanted, cursor.entries[cursor.slot]) {
+                    Ordering::Equal => {
+                        found = true;
+                        break;
+                    }
+                    Ordering::Greater => {
+                        cursor.slot += 1;
+                        break;
+                    }
+                    Ordering::Less => {}
+                }
+            }
+            found
+        };
+        if !found {
+            return Ok(Some(extra));
+        }
+        extra.push(Hit {
+            entry: wanted,
+            leaf: cursor.id,
+        });
+        if forward {
+            cursor.slot += 1;
+        }
+        index += 1;
+    }
+    Ok(Some(extra))
+}
+
+struct LeafCursor {
+    id: u32,
+    entries: Vec<Entry>,
+    left: u32,
+    right: u32,
+    low: Option<Entry>,
+    high: Option<Entry>,
+    path: Vec<(u32, usize)>,
+    slot: usize,
+}
+
+enum ChainStep {
+    Moved,
+    End,
+    Fallback,
+}
+
+fn in_bounds(key: Entry, low: Option<Entry>, high: Option<Entry>) -> bool {
+    at_or_above_low(key, low) && below_high(key, high)
+}
+
+fn at_or_above_low(key: Entry, low: Option<Entry>) -> bool {
+    match low {
+        None => true,
+        Some(low) => cmp_entry(key, low) != Ordering::Less,
+    }
+}
+
+fn below_high(key: Entry, high: Option<Entry>) -> bool {
+    match high {
+        None => true,
+        Some(high) => cmp_entry(key, high) == Ordering::Less,
+    }
+}
+
+fn leaf_bounds(
+    store: &mut dyn Nodes,
+    path: &[(u32, usize)],
+) -> Result<(Option<Entry>, Option<Entry>), DbError> {
+    let mut low = None;
+    let mut high = None;
+    for &(id, child_index) in path {
+        let node = decode_internal(&store.read_node(id)?)?;
+        if child_index >= node.children.len() {
+            return Err(corrupt(id));
+        }
+        if child_index > 0 {
+            let separator = node.keys[child_index - 1];
+            low = Some(match low {
+                Some(current) if cmp_entry(current, separator) == Ordering::Greater => current,
+                _ => separator,
+            });
+        }
+        if child_index < node.keys.len() {
+            let separator = node.keys[child_index];
+            high = Some(match high {
+                Some(current) if cmp_entry(current, separator) == Ordering::Less => current,
+                _ => separator,
+            });
+        }
+    }
+    Ok((low, high))
+}
+
+/// Move to the next leaf using the ancestor path. The right-sibling pointer
+/// must name that same leaf and point back. A disagreement, a cycle, or a
+/// page that will not decode returns [`ChainStep::Fallback`] so the caller
+/// repeats the check with one descent per posting.
+fn step_to_next_leaf(
+    store: &mut dyn Nodes,
+    cursor: &mut LeafCursor,
+    seen: &mut HashSet<u32>,
+) -> ChainStep {
+    if cursor.path.is_empty() {
+        if cursor.right != 0 {
+            return ChainStep::Fallback;
+        }
+        return ChainStep::End;
+    }
+    if seen.len() > 1_000_000 {
+        return ChainStep::Fallback;
+    }
+    let mut path = cursor.path.clone();
+    let mut branched: Option<(u32, usize)> = None;
+    while let Some((id, child_index)) = path.pop() {
+        let page = match store.read_node(id) {
+            Ok(page) => page,
+            Err(_) => return ChainStep::Fallback,
+        };
+        let node = match decode_internal(&page) {
+            Ok(node) => node,
+            Err(_) => return ChainStep::Fallback,
+        };
+        if child_index >= node.children.len() {
+            return ChainStep::Fallback;
+        }
+        if child_index + 1 < node.children.len() {
+            branched = Some((id, child_index + 1));
+            break;
+        }
+    }
+    let Some((parent_id, child_index)) = branched else {
+        if cursor.right != 0 {
+            return ChainStep::Fallback;
+        }
+        return ChainStep::End;
+    };
+    path.push((parent_id, child_index));
+    let parent_page = match store.read_node(parent_id) {
+        Ok(page) => page,
+        Err(_) => return ChainStep::Fallback,
+    };
+    let parent = match decode_internal(&parent_page) {
+        Ok(node) => node,
+        Err(_) => return ChainStep::Fallback,
+    };
+    if child_index >= parent.children.len() {
+        return ChainStep::Fallback;
+    }
+    let mut id = parent.children[child_index];
+    if id == 0 {
+        return ChainStep::Fallback;
+    }
+    for _ in 0..MAX_DEPTH {
+        let page = match store.read_node(id) {
+            Ok(page) => page,
+            Err(_) => return ChainStep::Fallback,
+        };
+        let kind = match page_type(&page) {
+            Ok(kind) => kind,
+            Err(_) => return ChainStep::Fallback,
+        };
+        if kind == TYPE_INDEX_LEAF {
+            if id != cursor.right || !seen.insert(id) {
+                return ChainStep::Fallback;
+            }
+            let loaded = match decode_leaf(&page) {
+                Ok(leaf) => leaf,
+                Err(_) => return ChainStep::Fallback,
+            };
+            if loaded.left != cursor.id {
+                return ChainStep::Fallback;
+            }
+            let previous = cursor.entries.last().copied();
+            if let Some(previous) = previous
+                && loaded
+                    .entries
+                    .first()
+                    .is_none_or(|entry| cmp_entry(*entry, previous) != Ordering::Greater)
+            {
+                return ChainStep::Fallback;
+            }
+            let (low, high) = match leaf_bounds(store, &path) {
+                Ok(bounds) => bounds,
+                Err(_) => return ChainStep::Fallback,
+            };
+            super::profile::note_sibling_step();
+            cursor.id = id;
+            cursor.left = loaded.left;
+            cursor.right = loaded.right;
+            cursor.entries = loaded.entries;
+            cursor.low = low;
+            cursor.high = high;
+            cursor.path = path;
+            cursor.slot = 0;
+            return ChainStep::Moved;
+        }
+        let node = match decode_internal(&page) {
+            Ok(node) => node,
+            Err(_) => return ChainStep::Fallback,
+        };
+        let Some(child) = node.children.first().copied() else {
+            return ChainStep::Fallback;
+        };
+        if child == 0 {
+            return ChainStep::Fallback;
+        }
+        path.push((id, 0));
+        id = child;
+    }
+    ChainStep::Fallback
+}
+
+/// Move to the previous leaf. The left-sibling pointer must name that leaf,
+/// and that leaf's right pointer must point back.
+fn step_to_previous_leaf(
+    store: &mut dyn Nodes,
+    cursor: &mut LeafCursor,
+    seen: &mut HashSet<u32>,
+) -> ChainStep {
+    if cursor.path.is_empty() {
+        if cursor.left != 0 {
+            return ChainStep::Fallback;
+        }
+        return ChainStep::End;
+    }
+    if seen.len() > 1_000_000 {
+        return ChainStep::Fallback;
+    }
+    let mut path = cursor.path.clone();
+    let mut branched: Option<(u32, usize)> = None;
+    while let Some((id, child_index)) = path.pop() {
+        let page = match store.read_node(id) {
+            Ok(page) => page,
+            Err(_) => return ChainStep::Fallback,
+        };
+        let node = match decode_internal(&page) {
+            Ok(node) => node,
+            Err(_) => return ChainStep::Fallback,
+        };
+        if child_index >= node.children.len() {
+            return ChainStep::Fallback;
+        }
+        if child_index > 0 {
+            branched = Some((id, child_index - 1));
+            break;
+        }
+    }
+    let Some((parent_id, child_index)) = branched else {
+        if cursor.left != 0 {
+            return ChainStep::Fallback;
+        }
+        return ChainStep::End;
+    };
+    path.push((parent_id, child_index));
+    let parent_page = match store.read_node(parent_id) {
+        Ok(page) => page,
+        Err(_) => return ChainStep::Fallback,
+    };
+    let parent = match decode_internal(&parent_page) {
+        Ok(node) => node,
+        Err(_) => return ChainStep::Fallback,
+    };
+    if child_index >= parent.children.len() {
+        return ChainStep::Fallback;
+    }
+    let mut id = parent.children[child_index];
+    if id == 0 {
+        return ChainStep::Fallback;
+    }
+    for _ in 0..MAX_DEPTH {
+        let page = match store.read_node(id) {
+            Ok(page) => page,
+            Err(_) => return ChainStep::Fallback,
+        };
+        let kind = match page_type(&page) {
+            Ok(kind) => kind,
+            Err(_) => return ChainStep::Fallback,
+        };
+        if kind == TYPE_INDEX_LEAF {
+            if id != cursor.left || !seen.insert(id) {
+                return ChainStep::Fallback;
+            }
+            let loaded = match decode_leaf(&page) {
+                Ok(leaf) => leaf,
+                Err(_) => return ChainStep::Fallback,
+            };
+            if loaded.right != cursor.id {
+                return ChainStep::Fallback;
+            }
+            let current_first = cursor.entries.first().copied();
+            if let Some(current_first) = current_first
+                && loaded
+                    .entries
+                    .last()
+                    .is_none_or(|entry| cmp_entry(*entry, current_first) != Ordering::Less)
+            {
+                return ChainStep::Fallback;
+            }
+            let (low, high) = match leaf_bounds(store, &path) {
+                Ok(bounds) => bounds,
+                Err(_) => return ChainStep::Fallback,
+            };
+            super::profile::note_sibling_step();
+            cursor.id = id;
+            cursor.left = loaded.left;
+            cursor.right = loaded.right;
+            cursor.entries = loaded.entries;
+            cursor.low = low;
+            cursor.high = high;
+            cursor.path = path;
+            cursor.slot = cursor.entries.len();
+            return ChainStep::Moved;
+        }
+        let node = match decode_internal(&page) {
+            Ok(node) => node,
+            Err(_) => return ChainStep::Fallback,
+        };
+        let Some(&child) = node.children.last() else {
+            return ChainStep::Fallback;
+        };
+        if child == 0 || node.children.is_empty() {
+            return ChainStep::Fallback;
+        }
+        path.push((id, node.children.len() - 1));
+        id = child;
+    }
+    ChainStep::Fallback
 }
 
 fn load_span(store: &mut dyn Nodes, hits: &[Hit]) -> Result<Vec<Loaded>, DbError> {
@@ -590,6 +1148,7 @@ fn load_span(store: &mut dyn Nodes, hits: &[Hit]) -> Result<Vec<Loaded>, DbError
         if right == 0 {
             return Err(corrupt(id));
         }
+        super::profile::note_sibling_step();
         id = right;
     }
     for hit in hits {
@@ -1757,6 +2316,7 @@ fn encode_leaf(id: u32, leaf: &Leaf) -> Result<Page, DbError> {
 }
 
 fn decode_leaf(page: &Page) -> Result<Leaf, DbError> {
+    super::profile::note_leaf_decode();
     let bytes = page.as_slice();
     let id = read_u32(bytes, OFF_ID);
     if page_type(page)? != TYPE_INDEX_LEAF || read_u16(bytes, OFF_SLOTS) != 0 {
@@ -3868,5 +4428,241 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn agree_verifiers(limits: Limits, entries: &[Entry], remove: &[Entry]) {
+        let (mut ordered_store, ordered_root) = fill(limits, entries);
+        let (mut descent_store, descent_root) = fill(limits, entries);
+        let ordered = delete_many(&mut ordered_store, ordered_root, remove, limits);
+        let descent = {
+            let _guard = ForceDescentVerify::new();
+            delete_many(&mut descent_store, descent_root, remove, limits)
+        };
+        match (ordered, descent) {
+            (Ok(left), Ok(right)) => {
+                let ordered_entries = validate(&mut ordered_store, left, limits).unwrap();
+                let descent_entries = validate(&mut descent_store, right, limits).unwrap();
+                assert_eq!(ordered_entries, descent_entries, "{remove:?}");
+                assert_eq!(page_image(&ordered_store), page_image(&descent_store));
+                assert_eq!(ordered_store.free, descent_store.free);
+                assert_eq!(ordered_store.next, descent_store.next);
+                assert_pages(&mut ordered_store, left);
+            }
+            (Err(left), Err(right)) => {
+                assert_eq!(left.to_string(), right.to_string(), "{remove:?}");
+                assert_eq!(page_image(&ordered_store), page_image(&descent_store));
+                assert_eq!(ordered_store.free, descent_store.free);
+            }
+            (left, right) => panic!("verifier split ordered={left:?} descent={right:?}"),
+        }
+    }
+
+    #[test]
+    fn ordered_leaf_chain_matches_per_posting_verification() {
+        let limits = small();
+        let entries = sequential(48);
+        let (mut probe, root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut probe, root);
+        assert!(runs.len() >= 4, "leaves {}", runs.len());
+        assert!(height(&mut probe, root).unwrap() >= 2);
+
+        agree_verifiers(limits, &entries, &[]);
+        agree_verifiers(limits, &entries, &[(0, 1)]);
+        agree_verifiers(limits, &entries, &[(99, 99), entries[0]]);
+        agree_verifiers(limits, &entries, &[entries[10], (99, 99), entries[11]]);
+        agree_verifiers(limits, &entries, &entries[..entries.len() - 1]);
+        let mut missing_last = entries.clone();
+        missing_last.push((49, 49));
+        agree_verifiers(limits, &entries, &missing_last);
+        agree_verifiers(limits, &entries, &[entries[0], entries[0]]);
+        agree_verifiers(limits, &entries, &[entries[3], entries[4], entries[3]]);
+        agree_verifiers(limits, &entries, &[(4, 4), (4, 40)]);
+        agree_verifiers(limits, &entries, &[entries[0], (4, 0)]);
+        agree_verifiers(limits, &entries, &entries);
+        agree_verifiers(limits, &entries, &entries[..1]);
+
+        let mut reversed = entries.clone();
+        reversed.reverse();
+        agree_verifiers(limits, &entries, &reversed);
+        let partial = vec![entries[0], entries[2], entries[1], entries[4]];
+        agree_verifiers(limits, &entries, &partial);
+        let back = vec![entries[0], entries[20], entries[5], entries[21]];
+        agree_verifiers(limits, &entries, &back);
+
+        let boundary = runs[0].entries.len();
+        let mut after_boundary = entries[..boundary].to_vec();
+        after_boundary.push((entries[boundary - 1].0, entries[boundary - 1].1 + 1));
+        agree_verifiers(limits, &entries, &after_boundary);
+        let mut before_boundary = entries[..boundary - 1].to_vec();
+        before_boundary.push((entries[boundary].0, entries[boundary].1.saturating_add(1)));
+        before_boundary.push(entries[boundary]);
+        agree_verifiers(limits, &entries, &before_boundary);
+
+        let duplicates: Vec<Entry> = (1..=30).map(|row| (4, row)).collect();
+        agree_verifiers(limits, &duplicates, &duplicates[2..20]);
+        agree_verifiers(
+            limits,
+            &duplicates,
+            &[duplicates[0], duplicates[0], duplicates[1]],
+        );
+        let extremes = vec![
+            (i64::MIN, 1),
+            (i64::MIN, u64::MAX),
+            (-1, 2),
+            (0, 3),
+            (i64::MAX, 6),
+            (i64::MAX, 7),
+        ];
+        agree_verifiers(limits, &extremes, &extremes);
+        agree_verifiers(limits, &extremes, &[extremes[0], (i64::MIN, 2)]);
+
+        for id in [runs[1].id, runs[3].id, root] {
+            let (mut left, left_root) = fill(limits, &entries);
+            let (mut right, right_root) = fill(limits, &entries);
+            for store in [&mut left, &mut right] {
+                let mut page = store.read_node(id).unwrap();
+                page.as_mut_slice()[0] = 0;
+                store.write_node(id, page).unwrap();
+            }
+            let remove = runs[0].entries.clone();
+            let ordered = delete_many(&mut left, left_root, &remove, limits);
+            let descent = {
+                let _guard = ForceDescentVerify::new();
+                delete_many(&mut right, right_root, &remove, limits)
+            };
+            match (ordered, descent) {
+                (Err(left_error), Err(right_error)) => {
+                    assert_eq!(left_error.to_string(), right_error.to_string(), "page {id}");
+                }
+                (left_result, right_result) => {
+                    panic!("corrupt page {id} split {left_result:?} {right_result:?}")
+                }
+            }
+            assert_eq!(page_image(&left), page_image(&right), "page {id}");
+        }
+
+        let (mut left, left_root) = fill(limits, &entries);
+        let (mut right, right_root) = fill(limits, &entries);
+        for store in [&mut left, &mut right] {
+            let mut node = decode_internal(&store.read_node(root).unwrap()).unwrap();
+            node.keys[0] = (i64::MIN, 0);
+            store
+                .write_node(root, encode_internal(root, &node).unwrap())
+                .unwrap();
+        }
+        let ordered = delete_many(&mut left, left_root, &runs[0].entries, limits);
+        let descent = {
+            let _guard = ForceDescentVerify::new();
+            delete_many(&mut right, right_root, &runs[0].entries, limits)
+        };
+        let (Err(left_error), Err(right_error)) = (ordered, descent) else {
+            panic!("separator errors diverged");
+        };
+        assert_eq!(left_error.to_string(), right_error.to_string());
+        assert_eq!(page_image(&left), page_image(&right));
+
+        let (mut left, left_root) = fill(limits, &entries);
+        let (mut right, right_root) = fill(limits, &entries);
+        for store in [&mut left, &mut right] {
+            let mut page = store.read_node(runs[1].id).unwrap();
+            crate::storage::page::set_next_page(&mut page, runs[1].id);
+            store.write_node(runs[1].id, page).unwrap();
+        }
+        let span = {
+            let mut remove = runs[0].entries.clone();
+            remove.extend(runs[1].entries.iter().copied());
+            remove.extend(runs[2].entries.iter().copied());
+            remove
+        };
+        let ordered = delete_many(&mut left, left_root, &span, limits);
+        let descent = {
+            let _guard = ForceDescentVerify::new();
+            delete_many(&mut right, right_root, &span, limits)
+        };
+        let (Err(left_error), Err(right_error)) = (ordered, descent) else {
+            panic!("cycle errors diverged");
+        };
+        assert_eq!(left_error.to_string(), right_error.to_string());
+        assert_eq!(page_image(&left), page_image(&right));
+
+        let _profile = crate::storage::profile::enable();
+        let (mut store, root) = fill(limits, &entries);
+        delete_many(&mut store, root, &entries, limits).unwrap();
+        let ordered_profile = crate::storage::profile::take();
+        crate::storage::profile::reset();
+        let (mut store, root) = fill(limits, &entries);
+        {
+            let _guard = ForceDescentVerify::new();
+            delete_many(&mut store, root, &entries, limits).unwrap();
+        }
+        let descent_profile = crate::storage::profile::take();
+        assert!(
+            ordered_profile.descents < descent_profile.descents,
+            "ordered {:?} descent {:?}",
+            ordered_profile.descents,
+            descent_profile.descents
+        );
+        assert!(ordered_profile.ordered_verified >= entries.len() as u64);
+        assert_eq!(ordered_profile.fallback_verified, 0);
+        assert!(descent_profile.fallback_verified >= entries.len() as u64);
+        assert!(ordered_profile.sibling_steps > 0);
+
+        crate::storage::profile::reset();
+        let (mut store, root) = fill(limits, &entries);
+        delete_many(&mut store, root, &reversed, limits).unwrap();
+        let reversed_profile = crate::storage::profile::take();
+        assert!(
+            reversed_profile.ordered_verified > 0,
+            "{reversed_profile:?}"
+        );
+        assert_eq!(
+            reversed_profile.fallback_verified, 0,
+            "{reversed_profile:?}"
+        );
+        assert!(
+            reversed_profile.descents < descent_profile.descents,
+            "reversed {} forward-descent {}",
+            reversed_profile.descents,
+            descent_profile.descents
+        );
+        crate::storage::profile::reset();
+        let (mut store, root) = fill(limits, &entries);
+        delete_many(&mut store, root, &partial, limits).unwrap();
+        let partial_profile = crate::storage::profile::take();
+        assert_eq!(partial_profile.ordered_verified, 0);
+        assert!(partial_profile.fallback_verified > 0);
+
+        let (mut ordered_store, mut ordered_root) = fill(limits, &entries);
+        let (mut descent_store, mut descent_root) = fill(limits, &entries);
+        for _ in 0..3 {
+            let runs = leaf_runs(&mut ordered_store, ordered_root);
+            let mut remove = runs[0].entries.clone();
+            if runs.len() > 1 {
+                remove.extend(runs[1].entries.iter().copied());
+            }
+            ordered_root = delete_many(&mut ordered_store, ordered_root, &remove, limits).unwrap();
+            {
+                let _guard = ForceDescentVerify::new();
+                descent_root =
+                    delete_many(&mut descent_store, descent_root, &remove, limits).unwrap();
+            }
+            assert_eq!(
+                validate(&mut ordered_store, ordered_root, limits).unwrap(),
+                validate(&mut descent_store, descent_root, limits).unwrap()
+            );
+            assert_eq!(page_image(&ordered_store), page_image(&descent_store));
+            for entry in &remove {
+                ordered_root =
+                    insert(&mut ordered_store, ordered_root, entry.0, entry.1, limits).unwrap();
+                {
+                    let _guard = ForceDescentVerify::new();
+                    descent_root =
+                        insert(&mut descent_store, descent_root, entry.0, entry.1, limits).unwrap();
+                }
+            }
+            assert_eq!(page_image(&ordered_store), page_image(&descent_store));
+        }
+
+        agree_verifiers(production(), &sequential(800), &sequential(400));
     }
 }

@@ -1427,3 +1427,34 @@ Deleting every row spends 132,146 µs in the index versus 227,037 µs. Both logs
 A one-row delete does not rebuild a span. At 100,000 rows it is 20,174 µs versus 19,892 µs, with the same 36,996-byte log. The difference is the log sync, not the tree. At 100 rows every workload is inside that sync, about 11–13 ms, and the logs match. At 1,000 rows the half index is 1,005 µs versus 1,787 µs. At 10,000 rows it is 5,204 µs versus 18,251 µs, and the statement is 30,381 µs versus 41,899 µs.
 
 The span rebuild is not faster on every workload. A one-row delete and a 100-row tree do not use it. On a consecutive delete the extra log is large enough to return part of the index saving, and the statement is still faster. No cost heuristic was added to skip the rebuild. Peak RSS was not measured. The no-match decode is unchanged.
+
+## Milestone 32 ordered posting-run verification
+
+16 Nov 2026, Apple M5, 17179869184 bytes of memory, rustc 1.100.0. The ignored test is `profile_milestone32`. It uses the same seed `0x3100` database as Milestone 31. `ordered` checks a run that only moves forward or only backward along the leaf chain after one root descent. `descent` forces the Milestone 31 check, one root descent per posting, and then the same span rebuild. `grouped` is still the Milestone 30 path. At 100,000 rows each workload is the median of three fresh copies. Smaller sizes are one sample. This is not a power-loss test.
+
+Publish hands the editor postings in descending stored order. An `id` delete is therefore strictly decreasing and takes the leaf-chain walk. A `bucket` delete in that same row order is not monotonic, so it still descends once per posting. The walk does not sort the request. A repeated pair or a change of direction stops the ordered prefix and uses the older check, so the first rejected posting stays the one the older check would reject.
+
+The log, the span count, the page counts, and the checksum match the Milestone 31 bulk column. The chain walk does not allocate a second rebuild and does not change the scratch vector. `descents` is the root-to-leaf count. `verified` is the postings accepted by the chain walk. `fallback` is the postings accepted by a descent. Times are microseconds.
+
+| rows | workload | ordered | descent | ordered index | descent index | descents | old descents | verified | fallback | WAL | checksum |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100,000 | one | 20,100 | 19,708 | 14 | 15 | 1 | 1 | 0 | 0 | 36,996 | 5001482560 |
+| 100,000 | sparse | 200,463 | 209,251 | 5,521 | 17,831 | 2 | 19,941 | 19,965 | 0 | 9,581,796 | 4001250051 |
+| 100,000 | duplicates | 217,071 | 239,117 | 9,219 | 33,832 | 4 | 39,755 | 39,903 | 0 | 10,262,396 | 4001190051 |
+| 100,000 | half | 210,462 | 242,871 | 41,517 | 72,273 | 40,000 | 89,911 | 49,999 | 39,999 | 7,101,296 | 3750796338 |
+| 100,000 | all | 342,302 | 408,081 | 77,901 | 142,550 | 80,248 | 180,070 | 99,949 | 79,754 | 12,168,896 | 0 |
+| 100,000 | alternating | 362,133 | 354,937 | 72,767 | 81,206 | 40,032 | 89,943 | 49,949 | 39,877 | 11,537,496 | 2500711280 |
+| 100,000 | consecutive | 149,283 | 163,974 | 23,965 | 40,398 | 20,000 | 44,892 | 24,999 | 19,999 | 4,555,196 | 4688644540 |
+| 100,000 | wide | 268,277 | 274,075 | 15,204 | 20,503 | 7,343 | 16,406 | 9,074 | 7,203 | 12,181,196 | 4546235365 |
+
+The half delete is the number Milestone 31 left at 89,911 descents. The id index is one decreasing run, so those 49,999 postings are accepted after one descent and 1,335 sibling steps. The bucket index is not in posting order, and its 39,999 postings still descend. Index time falls from 72,273 µs to 41,517 µs. The statement falls from 242,871 µs to 210,462 µs. The log stays 7,101,296 bytes, the id index stays height 3 and 396 pages, and the checksum stays 3750796338. The span rebuild is unchanged: 2 spans, 825 leaf merges, 11 internal merges, 1 root contraction, 4 pages allocated, 840 freed, and 1,924,176 scratch bytes.
+
+Sparse NULL-bucket rows and duplicate bucket 1 are monotonic on both indexes. Their descents fall to 2 and 4. Index time falls from 17,831 µs to 5,521 µs, and from 33,832 µs to 9,219 µs. The statements are faster by about 9 ms and 22 ms. The logs are unchanged.
+
+Delete-all still has 246 single-entry removals, the same tail the span rebuild left. Its descents fall from 180,070 to 80,248, and index time falls from 142,550 µs to 77,901 µs. The statement falls from 408,081 µs to 342,302 µs. Both logs stay 12,168,896 bytes.
+
+Consecutive keys cut index time from 40,398 µs to 23,965 µs and the statement from 163,974 µs to 149,283 µs. Alternating keys cut the index from 81,206 µs to 72,767 µs, and the statement in this run is 362,133 µs against 354,937 µs, so the statement does not get faster. The wide-name delete cuts the index from 20,503 µs to 15,204 µs and the statement from 274,075 µs to 268,277 µs. A one-row delete never walks a chain. At 100,000 rows it is 20,100 µs against 19,708 µs, with the same 36,996-byte log.
+
+At 100 rows the tree is one leaf. The chain walk does not run, the two verifiers seal the same log, and the statement is the log sync, about 11–13 ms. At 1,000 rows the half index is 463 µs against 706 µs, and the statement is 15,010 µs against 13,609 µs, so the statement does not get faster at that size. At 10,000 rows the half index is 3,130 µs against 5,387 µs, and the statement is 30,068 µs against 31,719 µs.
+
+The chain walk is not a cost heuristic. It does not choose between the span rebuild and the grouped path. Peak RSS was not measured. A request that is not monotonic still pays one descent per posting, and that is the remaining index cost on a half delete.
