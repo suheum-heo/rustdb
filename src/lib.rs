@@ -47,17 +47,19 @@
 //! strictly decreasing is checked along the leaf chain after one root descent.
 //! Publish hands postings over in descending stored order, which is decreasing
 //! for an indexed `id`. A run that changes direction is planned before the
-//! per-leaf loop. The plan reads the root shape and builds a temporary map of
-//! the validated postings when the remaining descents would read more pages
-//! than that estimate. The structural walk records each leaf's parent path,
-//! and the map is filled from the pairs that walk already accepted.
-//! An exact page count also requires the request to be
-//! longer than that count. A repeated posting, a map that is not worth building,
-//! a map that cannot be reserved, and a test that forces the older check
-//! still descend once per posting. The map is dropped when a rebuild frees
-//! pages. An allocator abort is process-level and is not a query error. One posting, and any run that stays
-//! at the minimum, still uses the earlier delete. A test can force that
-//! grouped path. The rebuilt pages can differ from deleting one posting at a
+//! per-leaf loop. The plan reads the root shape. It builds a temporary map of
+//! the validated postings when those descents would read more pages than the
+//! largest tree of this height, or, for an exact smaller tree, when the
+//! request is longer than one full walk per level. The structural walk records
+//! each leaf's parent path, and the map is filled from the pairs that walk
+//! already accepted. A single posting that leaves its leaf at or above the minimum is removed
+//! through the path already in hand, after the live leaf is decoded and the
+//! posting is found there. A borrow, a merge, and a root contraction still
+//! descend from the root. The map is dropped when a rebuild, a merge, or a
+//! root change moves pages. A grouped rewrite and that non-underflow single
+//! keep the other paths. An allocator abort is process-level and is not a
+//! query error. A test can force the grouped path or the earlier single-entry
+//! descent. The rebuilt pages can differ from deleting one posting at a
 //! time. A delete that matches nothing still audits
 //! memory and decodes the stored rows, and it writes no log when they already
 //! match. `INSERT` still snapshots the table.

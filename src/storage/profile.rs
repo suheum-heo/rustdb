@@ -129,6 +129,12 @@ pub(crate) struct Profile {
     /// This sits inside `presence_build` and does not read pages.
     #[cfg_attr(not(test), allow(dead_code))]
     pub path_record: Duration,
+    /// Non-underflow singles applied through a parent path already in hand.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub reused_paths: u64,
+    /// Plans discarded because a rebuild, merge, or root change moved pages.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub path_invalidations: u64,
 }
 
 #[cfg(test)]
@@ -183,6 +189,8 @@ thread_local! {
         validations_skipped: 0,
         tree_validations: 0,
         path_record: Duration::ZERO,
+        reused_paths: 0,
+        path_invalidations: 0,
     }) };
 }
 
@@ -249,6 +257,14 @@ pub(crate) fn note_index_single() {
             data.set(profile);
         });
     }
+}
+
+pub(crate) fn note_reused_path() {
+    note_u64(|profile| &mut profile.reused_paths, 1);
+}
+
+pub(crate) fn note_path_invalidation() {
+    note_u64(|profile| &mut profile.path_invalidations, 1);
 }
 
 pub(crate) fn note_descent() {
