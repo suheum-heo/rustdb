@@ -22965,6 +22965,13 @@ mod tests {
         map_misses: u64,
         presence_build_us: u128,
         presence_member_us: u128,
+        early_plans: u64,
+        estimated_pages: u64,
+        scanned_pages: u64,
+        validations_skipped: u64,
+        tree_validations: u64,
+        path_us: u128,
+        grouped_postings: u64,
         id_height: u32,
         id_pages: usize,
         checksum: i64,
@@ -22973,6 +22980,7 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum VerifyMode {
         Presence,
+        Late,
         Chain,
         Descent,
     }
@@ -23020,6 +23028,10 @@ mod tests {
                 change_count(&mut bulk, &sql)
             }
             VerifyMode::Presence => change_count(&mut bulk, &sql),
+            VerifyMode::Late => {
+                let _guard = crate::storage::ForceLatePresence::new();
+                change_count(&mut bulk, &sql)
+            }
         };
         let bulk_us = started.elapsed().as_micros();
         let bulk_phases = crate::storage::take_phases();
@@ -23120,6 +23132,13 @@ mod tests {
             map_misses: bulk_phases.map_misses,
             presence_build_us: bulk_phases.presence_build.as_micros(),
             presence_member_us: bulk_phases.presence_member.as_micros(),
+            early_plans: bulk_phases.early_plans,
+            estimated_pages: bulk_phases.estimated_pages,
+            scanned_pages: bulk_phases.scanned_pages,
+            validations_skipped: bulk_phases.validations_skipped,
+            tree_validations: bulk_phases.tree_validations,
+            path_us: bulk_phases.path_record.as_micros(),
+            grouped_postings: bulk_phases.leaf_batches,
             id_height,
             id_pages,
             checksum,
@@ -23727,6 +23746,125 @@ mod tests {
     }
 
     #[test]
+    fn early_presence_plan_matches_late_map_and_chain() {
+        let _phases = crate::storage::enable_phases();
+        let (_dir, base) = seed_delete_db("m34-agree", 2_000, 0x3400);
+        let wide = format!("DELETE FROM users WHERE name = '{}';", "w".repeat(80));
+        let statements = [
+            ("one", "DELETE FROM users WHERE id = 1;".to_string()),
+            (
+                "ten",
+                "DELETE FROM users WHERE id >= 1 AND id <= 10;".to_string(),
+            ),
+            ("half", "DELETE FROM users WHERE id < 1000;".to_string()),
+            (
+                "buckets",
+                "DELETE FROM users WHERE bucket = 0 OR bucket = 1;".to_string(),
+            ),
+            ("wide", wide),
+        ];
+        for (label, sql) in &statements {
+            let (_early_dir, early_path, mut early) = open_copy(&base, &format!("m34-{label}-e"));
+            let (_late_dir, late_path, mut late) = open_copy(&base, &format!("m34-{label}-l"));
+            let (_chain_dir, _, mut chain) = open_copy(&base, &format!("m34-{label}-c"));
+            crate::storage::reset_phases();
+            let early_count = change_count(&mut early, sql);
+            let early_phases = crate::storage::take_phases();
+            crate::storage::reset_phases();
+            let late_count = {
+                let _guard = crate::storage::ForceLatePresence::new();
+                change_count(&mut late, sql)
+            };
+            let late_phases = crate::storage::take_phases();
+            crate::storage::reset_phases();
+            let chain_count = {
+                let _guard = crate::storage::ForceChainVerify::new();
+                change_count(&mut chain, sql)
+            };
+            assert_eq!(early_count, late_count, "{label}");
+            assert_eq!(early_count, chain_count, "{label}");
+            assert_eq!(
+                mutation_checksum(&mut early),
+                mutation_checksum(&mut late),
+                "{label}"
+            );
+            assert_eq!(
+                mutation_checksum(&mut early),
+                mutation_checksum(&mut chain),
+                "{label}"
+            );
+            assert_eq!(table_rows(&mut early), table_rows(&mut late), "{label}");
+            assert_eq!(
+                early.table("users").unwrap().row_ids(),
+                late.table("users").unwrap().row_ids(),
+                "{label}"
+            );
+            assert_eq!(
+                early.table("users").unwrap().next_row_id(),
+                chain.table("users").unwrap().next_row_id(),
+                "{label}"
+            );
+            for index in ["idx_users_id", "idx_users_bucket"] {
+                assert_eq!(
+                    index_postings(&mut early, index),
+                    index_postings(&mut late, index),
+                    "{label} {index}"
+                );
+                assert_eq!(
+                    index_postings(&mut early, index),
+                    index_postings(&mut chain, index),
+                    "{label} {index}"
+                );
+            }
+            assert_eq!(db_file(&early_path), db_file(&late_path), "{label}");
+            assert_eq!(early_phases.wal_bytes, late_phases.wal_bytes, "{label}");
+            assert_eq!(early_phases.bulk_spans, late_phases.bulk_spans, "{label}");
+            assert_eq!(
+                early_phases.index_singles, late_phases.index_singles,
+                "{label}"
+            );
+            if matches!(*label, "one" | "ten") {
+                assert_eq!(early_phases.early_plans, 0, "{label} {early_phases:?}");
+            }
+            if matches!(*label, "half" | "buckets") {
+                assert!(early_phases.early_plans >= 1, "{label} {early_phases:?}");
+                assert!(
+                    early_phases.descents < late_phases.descents,
+                    "{label} early {} late {}",
+                    early_phases.descents,
+                    late_phases.descents
+                );
+                assert_eq!(late_phases.early_plans, 0, "{label}");
+            }
+            let checksum = mutation_checksum(&mut early);
+            drop(early);
+            let mut reopened = Database::open(&early_path).unwrap();
+            assert_eq!(mutation_checksum(&mut reopened), checksum, "{label}");
+            drop(reopened);
+            let mut again = Database::open(&early_path).unwrap();
+            assert_eq!(mutation_checksum(&mut again), checksum, "{label}");
+        }
+        assert_precommit(
+            &base,
+            "m34-pre-buckets",
+            "DELETE FROM users WHERE bucket = 0 OR bucket = 1;",
+            crate::storage::Inject::BeforeLogSync,
+        );
+        for inject in [
+            crate::storage::Inject::AfterLogSync,
+            crate::storage::Inject::CommitSyncFailed,
+            crate::storage::Inject::DuringCheckpoint(1),
+        ] {
+            assert_postcommit(
+                &base,
+                &format!("m34-post-buckets-{inject:?}"),
+                "DELETE FROM users WHERE bucket = 0 OR bucket = 1;",
+                inject,
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "release profile of posting presence-map verification"]
     fn profile_milestone33() {
         let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
@@ -23845,6 +23983,144 @@ mod tests {
                     sample.id_height,
                     sample.id_pages,
                     sample.checksum
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release profile of early presence-map planning"]
+    fn profile_milestone34() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!("milestone34 cpu={cpu} mem_bytes={mem} rustc={rustc}");
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            let (_base_dir, base) = seed_delete_db("m34-base", rows, 0x3100);
+            let samples = if rows == 100_000 { 3 } else { 1 };
+            for workload in [
+                "one",
+                "ten",
+                "buckets",
+                "half",
+                "sparse",
+                "alternating",
+                "consecutive",
+                "all",
+                "wide",
+            ] {
+                let mut early = Vec::with_capacity(samples);
+                let mut late = Vec::with_capacity(samples);
+                let mut chain = Vec::with_capacity(samples);
+                for sample in 0..samples {
+                    early.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Presence,
+                    ));
+                    late.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Late,
+                    ));
+                    chain.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Chain,
+                    ));
+                }
+                for (index, sample) in early.iter().enumerate() {
+                    let previous = &late[index];
+                    let ordered = &chain[index];
+                    assert_eq!(sample.checksum, previous.checksum, "{workload} {rows}");
+                    assert_eq!(sample.checksum, ordered.checksum, "{workload} {rows}");
+                    assert_eq!(sample.bulk_wal, previous.bulk_wal, "{workload} {rows}");
+                    assert_eq!(sample.bulk_wal, ordered.bulk_wal, "{workload} {rows}");
+                    assert_eq!(sample.spans, previous.spans, "{workload} {rows}");
+                    assert_eq!(sample.singles, previous.singles, "{workload} {rows}");
+                    assert_eq!(sample.id_height, previous.id_height, "{workload} {rows}");
+                    assert_eq!(sample.id_pages, previous.id_pages, "{workload} {rows}");
+                    if sample.early_plans > 0 {
+                        assert!(
+                            sample.descents < previous.descents,
+                            "{workload} {rows} early {} late {}",
+                            sample.descents,
+                            previous.descents
+                        );
+                    }
+                }
+                let early_us = median(
+                    &early
+                        .iter()
+                        .map(|sample| sample.bulk_us)
+                        .collect::<Vec<_>>(),
+                );
+                let late_us = median(&late.iter().map(|sample| sample.bulk_us).collect::<Vec<_>>());
+                let chain_us = median(
+                    &chain
+                        .iter()
+                        .map(|sample| sample.bulk_us)
+                        .collect::<Vec<_>>(),
+                );
+                let early_index = median(
+                    &early
+                        .iter()
+                        .map(|sample| sample.bulk_index_us)
+                        .collect::<Vec<_>>(),
+                );
+                let late_index = median(
+                    &late
+                        .iter()
+                        .map(|sample| sample.bulk_index_us)
+                        .collect::<Vec<_>>(),
+                );
+                let chain_index = median(
+                    &chain
+                        .iter()
+                        .map(|sample| sample.bulk_index_us)
+                        .collect::<Vec<_>>(),
+                );
+                let sample = &early[0];
+                let previous = &late[0];
+                let ordered = &chain[0];
+                println!(
+                    "milestone34 median workload={workload} rows={rows} samples={samples} early_us={early_us} late_us={late_us} chain_us={chain_us} early_index_us={early_index} late_index_us={late_index} chain_index_us={chain_index} wal={} checksum={} descents={} late_descents={} chain_descents={} early_plans={} estimated_pages={} scanned_pages={} builds={} late_builds={} build_us={} member_us={} late_build_us={} late_member_us={} path_us={} validations={} late_validations={} skipped_validations={} map_bytes={} spans={} singles={} grouped_postings={} allocated={} freed={} scratch={} verified={} ordered_verified={} fallback={} late_fallback={}",
+                    sample.bulk_wal,
+                    sample.checksum,
+                    sample.descents,
+                    previous.descents,
+                    ordered.descents,
+                    sample.early_plans,
+                    sample.estimated_pages,
+                    sample.scanned_pages,
+                    sample.presence_builds,
+                    previous.presence_builds,
+                    sample.presence_build_us,
+                    sample.presence_member_us,
+                    previous.presence_build_us,
+                    previous.presence_member_us,
+                    sample.path_us,
+                    sample.tree_validations,
+                    previous.tree_validations,
+                    sample.validations_skipped,
+                    sample.map_bytes,
+                    sample.spans,
+                    sample.singles,
+                    sample.grouped_postings,
+                    sample.allocated,
+                    sample.freed,
+                    sample.scratch,
+                    sample.presence_verified,
+                    sample.ordered_verified,
+                    sample.fallback_verified,
+                    previous.fallback_verified
                 );
             }
         }

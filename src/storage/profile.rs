@@ -109,6 +109,26 @@ pub(crate) struct Profile {
     /// Successful presence maps built during deletion.
     #[cfg_attr(not(test), allow(dead_code))]
     pub presence_builds: u64,
+    /// Pages the structure-aware estimate used for one statement.
+    /// This is the sum across indexes, not a peak.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub estimated_pages: u64,
+    /// Pages read while building an early presence map.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub scanned_pages: u64,
+    /// Early presence plans that verified a request before the grouping loop.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub early_plans: u64,
+    /// Rebuild-time validations skipped because this snapshot was already checked.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub validations_skipped: u64,
+    /// Calls to the B+ tree structural validator.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub tree_validations: u64,
+    /// Reserving the presence map and inserting pairs and parent paths.
+    /// This sits inside `presence_build` and does not read pages.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub path_record: Duration,
 }
 
 #[cfg(test)]
@@ -157,6 +177,12 @@ thread_local! {
         map_misses: 0,
         presence_verified: 0,
         presence_builds: 0,
+        estimated_pages: 0,
+        scanned_pages: 0,
+        early_plans: 0,
+        validations_skipped: 0,
+        tree_validations: 0,
+        path_record: Duration::ZERO,
     }) };
 }
 
@@ -311,6 +337,30 @@ pub(crate) fn note_presence_verified(count: u64) {
 
 pub(crate) fn note_presence_build_count() {
     note_u64(|profile| &mut profile.presence_builds, 1);
+}
+
+pub(crate) fn note_estimated_pages(pages: u64) {
+    note_u64(|profile| &mut profile.estimated_pages, pages);
+}
+
+pub(crate) fn note_scanned_pages(pages: u64) {
+    note_u64(|profile| &mut profile.scanned_pages, pages);
+}
+
+pub(crate) fn note_early_plan() {
+    note_u64(|profile| &mut profile.early_plans, 1);
+}
+
+pub(crate) fn note_validation_skipped() {
+    note_u64(|profile| &mut profile.validations_skipped, 1);
+}
+
+pub(crate) fn note_tree_validation() {
+    note_u64(|profile| &mut profile.tree_validations, 1);
+}
+
+pub(crate) fn add_path_record(mark: Option<Instant>) {
+    add(|profile| &mut profile.path_record, mark);
 }
 
 fn note_u64(slot: fn(&mut Profile) -> &mut u64, amount: u64) {
