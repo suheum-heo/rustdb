@@ -139,6 +139,7 @@ pub(crate) fn delete(
     if root == 0 {
         return Err(missing());
     }
+    super::profile::note_index_single();
     match delete_at(store, root, (key, row_id), true, limits, 0)? {
         Removed::Empty => {
             store.free_node(root)?;
@@ -150,6 +151,69 @@ pub(crate) fn delete(
             Ok(child)
         }
     }
+}
+
+/// Delete `entries` in order. The final pages match calling [`delete`] once
+/// per entry.
+///
+/// A run that sits in one leaf and leaves that leaf at or above its minimum is
+/// removed in one rewrite. The ancestors on that path are rewritten once, with
+/// the same separator a series of single deletes would finish on. A removal
+/// that would go under the minimum, borrow, or merge uses [`delete`], so the
+/// tree shape does not change. A missing pair returns the same error as
+/// [`delete`] and does not continue.
+pub(crate) fn delete_many(
+    store: &mut dyn Nodes,
+    mut root: u32,
+    entries: &[Entry],
+    limits: Limits,
+) -> Result<u32, DbError> {
+    let mut cursor = 0;
+    while cursor < entries.len() {
+        if root == 0 {
+            return Err(missing());
+        }
+        let (path, leaf_id) = path_to_leaf(store, root, entries[cursor])?;
+        let leaf = decode_leaf(&store.read_node(leaf_id)?)?;
+        // Count a slot once. A second copy of the same pair ends the run, so
+        // the next pass reports it missing after the first copy is removed.
+        // The length used below is this leaf's, just decoded.
+        let mut claimed = vec![false; leaf.entries.len()];
+        let mut run = 0;
+        while cursor + run < entries.len() {
+            let wanted = entries[cursor + run];
+            let Some(slot) = leaf
+                .entries
+                .iter()
+                .enumerate()
+                .position(|(index, entry)| !claimed[index] && *entry == wanted)
+            else {
+                break;
+            };
+            claimed[slot] = true;
+            run += 1;
+        }
+        if run == 0 {
+            return Err(missing());
+        }
+        let is_root = leaf_id == root;
+        let keep = if is_root { 1 } else { limits.leaf_min.max(1) };
+        let room = leaf.entries.len().saturating_sub(keep);
+        let take = run.min(room);
+        if take >= 2 {
+            let old_first = leaf.entries[0];
+            let mut removed = leaf;
+            remove_leaf_entries(&mut removed, &entries[cursor..cursor + take])?;
+            let minimum_changed = removed.entries[0] != old_first;
+            super::profile::note_leaf_batch(u64::try_from(take).unwrap_or(u64::MAX));
+            rewrite_leaf_path(store, &path, leaf_id, &removed, minimum_changed)?;
+            cursor += take;
+        } else {
+            root = delete(store, root, entries[cursor].0, entries[cursor].1, limits)?;
+            cursor += 1;
+        }
+    }
+    Ok(root)
 }
 
 /// Row ids for one integer key, in row-id order.
@@ -796,6 +860,102 @@ fn rebalance_internal(
     parent.children.remove(index);
     store.write_node(left_id, encode_internal(left_id, &left)?)?;
     store.free_node(id)?;
+    Ok(())
+}
+
+fn path_to_leaf(
+    store: &mut dyn Nodes,
+    root: u32,
+    probe: Entry,
+) -> Result<(Vec<(u32, usize)>, u32), DbError> {
+    let mut path = Vec::new();
+    let mut id = root;
+    for _ in 0..MAX_DEPTH {
+        let page = store.read_node(id)?;
+        if page_type(&page)? == TYPE_INDEX_LEAF {
+            return Ok((path, id));
+        }
+        let node = decode_internal(&page)?;
+        let child_index = child_slot(&node.keys, probe);
+        let child = node
+            .children
+            .get(child_index)
+            .copied()
+            .ok_or_else(|| corrupt(id))?;
+        path.push((id, child_index));
+        id = child;
+    }
+    Err(corrupt(root))
+}
+
+fn remove_leaf_entries(leaf: &mut Leaf, entries: &[Entry]) -> Result<(), DbError> {
+    let mut used = vec![false; leaf.entries.len()];
+    let mut positions = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(index) = leaf
+            .entries
+            .iter()
+            .enumerate()
+            .position(|(index, item)| !used[index] && item == entry)
+        else {
+            return Err(missing());
+        };
+        used[index] = true;
+        positions.push(index);
+    }
+    positions.sort_unstable_by(|left, right| right.cmp(left));
+    for index in positions {
+        leaf.entries.remove(index);
+    }
+    if leaf.entries.is_empty() {
+        return Err(DbError::Internal(
+            "a batched leaf removal emptied the leaf".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Write the leaf and re-encode every ancestor on `path`.
+///
+/// Only the separator that covers this leaf changes, and only when its minimum
+/// entry changed. Higher separators stay put. Rewriting the unchanged
+/// ancestors matches the pages a series of single deletes would seal.
+///
+/// Each ancestor reads its leftmost child, which is the read a single delete
+/// uses to recompute that node's minimum. A corrupt page on that walk fails
+/// the batch before the leaf is written.
+fn rewrite_leaf_path(
+    store: &mut dyn Nodes,
+    path: &[(u32, usize)],
+    leaf_id: u32,
+    leaf: &Leaf,
+    minimum_changed: bool,
+) -> Result<(), DbError> {
+    let minimum = leaf
+        .entries
+        .first()
+        .copied()
+        .ok_or_else(|| corrupt(leaf_id))?;
+    for &(id, _) in path.iter().rev() {
+        let node = decode_internal(&store.read_node(id)?)?;
+        let child = node.children.first().copied().ok_or_else(|| corrupt(id))?;
+        let _ = subtree_min(store, child)?;
+    }
+    store.write_node(leaf_id, encode_leaf(leaf_id, leaf)?)?;
+    let mut branched = false;
+    for &(id, child_index) in path.iter().rev() {
+        let mut node = decode_internal(&store.read_node(id)?)?;
+        if child_index >= node.children.len() {
+            return Err(corrupt(id));
+        }
+        if !branched && child_index > 0 {
+            if minimum_changed {
+                node.keys[child_index - 1] = minimum;
+            }
+            branched = true;
+        }
+        store.write_node(id, encode_internal(id, &node)?)?;
+    }
     Ok(())
 }
 
@@ -1506,5 +1666,474 @@ mod tests {
         }
         let error = owned_pages(&mut deep, previous).unwrap_err();
         assert!(error.to_string().contains("corrupt"), "{error}");
+    }
+
+    fn page_image(store: &Mem) -> Vec<(u32, Vec<u8>)> {
+        let mut pages: Vec<_> = store
+            .pages
+            .iter()
+            .map(|(id, page)| (*id, page.as_slice().to_vec()))
+            .collect();
+        pages.sort_by_key(|(id, _)| *id);
+        pages
+    }
+
+    fn delete_many_matches_one_at_a_time(limits: Limits, entries: Vec<Entry>, remove: Vec<Entry>) {
+        let mut single = Mem::new();
+        let mut batched = Mem::new();
+        let mut single_root = 0;
+        let mut batched_root = 0;
+        for entry in &entries {
+            single_root = insert(&mut single, single_root, entry.0, entry.1, limits).unwrap();
+            batched_root = insert(&mut batched, batched_root, entry.0, entry.1, limits).unwrap();
+        }
+        assert_eq!(page_image(&single), page_image(&batched));
+        for entry in &remove {
+            single_root = delete(&mut single, single_root, entry.0, entry.1, limits).unwrap();
+        }
+        batched_root = delete_many(&mut batched, batched_root, &remove, limits).unwrap();
+        assert_eq!(single_root, batched_root);
+        assert_eq!(page_image(&single), page_image(&batched));
+        assert_eq!(single.free, batched.free);
+        let single_entries = validate(&mut single, single_root, limits).unwrap();
+        let batched_entries = validate(&mut batched, batched_root, limits).unwrap();
+        assert_eq!(single_entries, batched_entries);
+    }
+
+    #[test]
+    fn batched_leaf_removal_matches_single_deletes() {
+        let sequential: Vec<_> = (1..=40).map(|row| (row, row as u64)).collect();
+        delete_many_matches_one_at_a_time(small(), sequential.clone(), sequential.clone());
+        delete_many_matches_one_at_a_time(
+            small(),
+            sequential.clone(),
+            sequential.iter().copied().step_by(2).collect(),
+        );
+        delete_many_matches_one_at_a_time(
+            small(),
+            sequential.clone(),
+            vec![(1, 1), (2, 2), (40, 40)],
+        );
+        let wide: Vec<_> = (1..=800).map(|row| (row, row as u64)).collect();
+        delete_many_matches_one_at_a_time(production(), wide.clone(), wide[100..700].to_vec());
+        delete_many_matches_one_at_a_time(
+            production(),
+            wide.clone(),
+            wide.iter().copied().step_by(3).collect(),
+        );
+        let duplicates: Vec<_> = (1..=500).map(|row| (4, row)).collect();
+        delete_many_matches_one_at_a_time(
+            production(),
+            duplicates.clone(),
+            duplicates[20..400].to_vec(),
+        );
+        delete_many_matches_one_at_a_time(production(), wide.clone(), vec![(1, 1)]);
+        delete_many_matches_one_at_a_time(production(), wide, Vec::new());
+        let mut store = Mem::new();
+        let mut root = 0;
+        for row in 1..=20 {
+            root = insert(&mut store, root, row, row as u64, small()).unwrap();
+        }
+        let before = page_image(&store);
+        let error = delete_many(&mut store, root, &[(9, 99)], small()).unwrap_err();
+        assert!(
+            error.to_string().contains("index entry is missing"),
+            "{error}"
+        );
+        assert_eq!(page_image(&store), before);
+    }
+
+    struct Run {
+        id: u32,
+        entries: Vec<Entry>,
+    }
+
+    fn fill(limits: Limits, entries: &[Entry]) -> (Mem, u32) {
+        let mut store = Mem::new();
+        let mut root = 0;
+        for entry in entries {
+            root = insert(&mut store, root, entry.0, entry.1, limits).unwrap();
+        }
+        (store, root)
+    }
+
+    fn leaf_runs(store: &mut Mem, root: u32) -> Vec<Run> {
+        if root == 0 {
+            return Vec::new();
+        }
+        let mut id = root;
+        for _ in 0..64 {
+            let page = store.read_node(id).unwrap();
+            if page_type(&page).unwrap() == TYPE_INDEX_LEAF {
+                break;
+            }
+            id = decode_internal(&page).unwrap().children[0];
+        }
+        let mut runs = Vec::new();
+        let mut guard = 0;
+        while id != 0 {
+            guard += 1;
+            assert!(guard < 64, "leaf chain");
+            let leaf = decode_leaf(&store.read_node(id).unwrap()).unwrap();
+            let next = leaf.right;
+            runs.push(Run {
+                id,
+                entries: leaf.entries,
+            });
+            id = next;
+        }
+        runs
+    }
+
+    fn drive(
+        store: &mut Mem,
+        mut root: u32,
+        remove: &[Entry],
+        limits: Limits,
+    ) -> Result<u32, DbError> {
+        for entry in remove {
+            root = delete(store, root, entry.0, entry.1, limits)?;
+        }
+        Ok(root)
+    }
+
+    /// Pages, the free list, and the validated entry list match one-at-a-time
+    /// deletion. A missing pair stops both sides on the same error and the
+    /// same pages.
+    fn same_tree(limits: Limits, entries: &[Entry], remove: &[Entry]) {
+        let (mut single, single_root) = fill(limits, entries);
+        let (mut batched, batched_root) = fill(limits, entries);
+        let single_result = drive(&mut single, single_root, remove, limits);
+        let batched_result = delete_many(&mut batched, batched_root, remove, limits);
+        match (single_result, batched_result) {
+            (Ok(left), Ok(right)) => {
+                assert_eq!(left, right);
+                assert_eq!(page_image(&single), page_image(&batched));
+                assert_eq!(single.free, batched.free);
+                assert_eq!(
+                    height(&mut single, left).unwrap(),
+                    height(&mut batched, right).unwrap()
+                );
+                assert_eq!(
+                    validate(&mut single, left, limits).unwrap(),
+                    validate(&mut batched, right, limits).unwrap()
+                );
+            }
+            (Err(left), Err(right)) => {
+                assert_eq!(left.to_string(), right.to_string());
+                assert_eq!(page_image(&single), page_image(&batched));
+                assert_eq!(single.free, batched.free);
+            }
+            (Ok(_), Err(error)) => panic!("batch failed after single deletes succeeded: {error}"),
+            (Err(error), Ok(_)) => panic!("batch succeeded after single deletes failed: {error}"),
+        }
+    }
+
+    fn sequential(count: i64) -> Vec<Entry> {
+        (1..=count).map(|key| (key, key as u64)).collect()
+    }
+
+    #[test]
+    fn grouped_removal_uses_the_loaded_leaf_occupancy() {
+        let limits = small();
+        let entries = sequential(24);
+        let (mut probe, root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut probe, root);
+        assert!(runs.len() > 2, "leaves {}", runs.len());
+        for run in &runs {
+            assert!(
+                (limits.leaf_min..=limits.leaf_max).contains(&run.entries.len()),
+                "leaf {} len {}",
+                run.id,
+                run.entries.len()
+            );
+        }
+        let fat = runs
+            .iter()
+            .find(|run| run.entries.len() > limits.leaf_min)
+            .expect("leaf above the minimum");
+        let keep = limits.leaf_min;
+        let room = fat.entries.len() - keep;
+        same_tree(limits, &entries, &fat.entries[..1]);
+        same_tree(limits, &entries, &fat.entries[..room]);
+        same_tree(limits, &entries, &fat.entries[..room + 1]);
+        if room >= 2 {
+            same_tree(limits, &entries, &fat.entries[..room]);
+        }
+        same_tree(limits, &entries, &[fat.entries[0]]);
+        same_tree(limits, &entries, &[*fat.entries.last().unwrap()]);
+        same_tree(limits, &entries, &fat.entries);
+        same_tree(limits, &entries, &entries);
+        same_tree(limits, &[], &[(1, 1)]);
+        same_tree(limits, &entries[..1], &[]);
+        same_tree(limits, &entries[..1], &entries[..1]);
+        same_tree(limits, &entries[..3], &entries[..2]);
+        same_tree(limits, &entries[..3], &entries[..3]);
+
+        let _guard = crate::storage::profile::enable();
+        let (mut store, root) = fill(limits, &entries);
+        delete_many(&mut store, root, &fat.entries[..room + 1], limits).unwrap();
+        let profile = crate::storage::profile::take();
+        if room >= 2 {
+            assert_eq!(profile.leaf_batches, u64::try_from(room).unwrap());
+            assert_eq!(profile.index_singles, 1);
+        } else {
+            assert_eq!(profile.leaf_batches, 0);
+            assert_eq!(profile.index_singles, u64::try_from(room + 1).unwrap());
+        }
+        let (mut after, root) = fill(limits, &entries);
+        let root = delete_many(&mut after, root, &fat.entries[..room], limits).unwrap();
+        let again = leaf_runs(&mut after, root);
+        let stayed = again.iter().find(|run| {
+            !fat.entries[..room]
+                .iter()
+                .any(|entry| run.entries.contains(entry))
+                && run.entries.len() == keep
+        });
+        assert!(
+            stayed.is_some(),
+            "a leaf should sit on the minimum after removing its spare postings"
+        );
+    }
+
+    #[test]
+    fn borrow_merge_and_root_changes_match_single_deletes() {
+        let limits = small();
+        let entries = sequential(24);
+        let (mut probe, root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut probe, root);
+        assert!(runs.len() >= 3, "leaves {}", runs.len());
+        for run in &runs {
+            same_tree(limits, &entries, &[run.entries[0]]);
+            same_tree(limits, &entries, &[*run.entries.last().unwrap()]);
+            same_tree(limits, &entries, &run.entries);
+        }
+        let mut adjacent = runs[0].entries.clone();
+        adjacent.extend(runs[1].entries.iter().copied());
+        same_tree(limits, &entries, &adjacent);
+        let fat = runs
+            .iter()
+            .find(|run| run.entries.len() >= limits.leaf_min + 2)
+            .expect("leaf with a grouped prefix");
+        let room = fat.entries.len() - limits.leaf_min;
+        let mut grouped_then_fallback = fat.entries[..room].to_vec();
+        grouped_then_fallback.push(fat.entries[room]);
+        same_tree(limits, &entries, &grouped_then_fallback);
+        let tight = runs
+            .iter()
+            .find(|run| run.entries.len() == limits.leaf_min)
+            .expect("leaf at the minimum");
+        let mut fallback_then_grouped = vec![tight.entries[0]];
+        fallback_then_grouped.extend(fat.entries[..room].iter().copied());
+        same_tree(limits, &entries, &fallback_then_grouped);
+        let separator = runs[1].entries[0];
+        same_tree(limits, &entries, &[separator]);
+        same_tree(
+            limits,
+            &entries,
+            &runs[1].entries[..2.min(runs[1].entries.len())],
+        );
+        same_tree(
+            limits,
+            &entries,
+            &[
+                runs[0].entries[0],
+                *runs.last().unwrap().entries.last().unwrap(),
+            ],
+        );
+        same_tree(limits, &entries, &entries[..entries.len() - 1]);
+        let (mut store, root) = fill(limits, &entries);
+        let root = delete_many(&mut store, root, &entries, limits).unwrap();
+        assert_eq!(root, 0);
+        assert_eq!(validate(&mut store, root, limits).unwrap(), Vec::new());
+
+        let limits = production();
+        let wide = sequential(600);
+        let (mut probe, root) = fill(limits, &wide);
+        let runs = leaf_runs(&mut probe, root);
+        assert!(runs.len() > 1, "production leaves {}", runs.len());
+        assert!(height(&mut probe, root).unwrap() >= 2);
+        let fat = runs.iter().max_by_key(|run| run.entries.len()).unwrap();
+        assert!(fat.entries.len() > limits.leaf_min);
+        let room = fat.entries.len() - limits.leaf_min;
+        same_tree(limits, &wide, &fat.entries[..1]);
+        same_tree(limits, &wide, &fat.entries[..room]);
+        same_tree(limits, &wide, &fat.entries[..room + 1]);
+        same_tree(limits, &wide, &[fat.entries[0]]);
+        same_tree(limits, &wide, &[*fat.entries.last().unwrap()]);
+        same_tree(limits, &wide, &runs[0].entries[..1]);
+        same_tree(limits, &wide, &runs[0].entries);
+        same_tree(
+            limits,
+            &wide,
+            &[
+                runs[0].entries[0],
+                *runs.last().unwrap().entries.last().unwrap(),
+            ],
+        );
+    }
+
+    #[test]
+    fn duplicate_extreme_and_repeated_postings_match_single_deletes() {
+        let limits = small();
+        let duplicates: Vec<Entry> = (1..=30).map(|row| (7, row)).collect();
+        same_tree(limits, &duplicates, &duplicates[2..20]);
+        same_tree(limits, &duplicates, &duplicates);
+        let alternating: Vec<Entry> = (1_i64..=20).map(|row| (row % 2, row as u64)).collect();
+        let every_other: Vec<Entry> = alternating.iter().copied().step_by(2).collect();
+        same_tree(limits, &alternating, &every_other);
+        let extremes = vec![
+            (i64::MIN, 1),
+            (i64::MIN, 2),
+            (-4, 3),
+            (0, 4),
+            (0, 5),
+            (9, 6),
+            (i64::MAX, 7),
+            (i64::MAX, 8),
+        ];
+        same_tree(limits, &extremes, &extremes[1..6]);
+        same_tree(limits, &extremes, &[extremes[0], *extremes.last().unwrap()]);
+        same_tree(limits, &duplicates, &[duplicates[3], duplicates[3]]);
+        same_tree(
+            limits,
+            &duplicates,
+            &[duplicates[1], (7, 99), duplicates[4]],
+        );
+        let (mut store, root) = fill(limits, &duplicates);
+        let before = page_image(&store);
+        let error =
+            delete_many(&mut store, root, &[duplicates[0], duplicates[0]], limits).unwrap_err();
+        assert!(
+            error.to_string().contains("index entry is missing"),
+            "{error}"
+        );
+        let (mut single, mut single_root) = fill(limits, &duplicates);
+        single_root = delete(
+            &mut single,
+            single_root,
+            duplicates[0].0,
+            duplicates[0].1,
+            limits,
+        )
+        .unwrap();
+        let second = delete(
+            &mut single,
+            single_root,
+            duplicates[0].0,
+            duplicates[0].1,
+            limits,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), second.to_string());
+        assert_eq!(page_image(&store), page_image(&single));
+        assert_ne!(page_image(&store), before);
+    }
+
+    #[test]
+    fn a_late_tree_error_matches_single_deletes_and_is_not_repaired() {
+        let limits = small();
+        let entries = sequential(20);
+        let (mut probe, root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut probe, root);
+        assert!(runs.len() >= 2);
+        assert!(runs.len() >= 3, "leaves {}", runs.len());
+        let fat = runs.last().unwrap();
+        assert!(
+            fat.entries.len() >= limits.leaf_min + 2,
+            "rightmost leaf len {}",
+            fat.entries.len()
+        );
+        let room = fat.entries.len() - limits.leaf_min;
+        let mut remove = fat.entries[..room].to_vec();
+        let bad = runs[1].id;
+        remove.push(runs[1].entries[0]);
+        let (mut single, single_root) = fill(limits, &entries);
+        let (mut batched, batched_root) = fill(limits, &entries);
+        for store in [&mut single, &mut batched] {
+            let mut page = store.read_node(bad).unwrap();
+            page.as_mut_slice()[0] = 0;
+            page.as_mut_slice()[1] = 0;
+            store.write_node(bad, page).unwrap();
+        }
+        let left = drive(&mut single, single_root, &remove, limits).unwrap_err();
+        let right = delete_many(&mut batched, batched_root, &remove, limits).unwrap_err();
+        assert_eq!(left.to_string(), right.to_string());
+        assert!(right.to_string().contains("corrupt"), "{right}");
+        assert_eq!(page_image(&single), page_image(&batched));
+        assert_eq!(batched.read_node(bad).unwrap().as_slice()[0], 0);
+
+        assert_eq!(runs[0].entries.len(), limits.leaf_min);
+        let (mut single, mut single_root) = fill(limits, &entries);
+        let (mut batched, mut batched_root) = fill(limits, &entries);
+        let spare = runs[1].entries.len() - limits.leaf_min;
+        let trim = &runs[1].entries[runs[1].entries.len() - spare..];
+        single_root = drive(&mut single, single_root, trim, limits).unwrap();
+        batched_root = delete_many(&mut batched, batched_root, trim, limits).unwrap();
+        let right_id = runs[1].id;
+        for store in [&mut single, &mut batched] {
+            let mut page = store.read_node(right_id).unwrap();
+            crate::storage::page::set_next_page(&mut page, 999);
+            store.write_node(right_id, page).unwrap();
+        }
+        let victim = runs[0].entries[0];
+        let left = delete(&mut single, single_root, victim.0, victim.1, limits).unwrap_err();
+        let right = delete_many(&mut batched, batched_root, &[victim], limits).unwrap_err();
+        assert_eq!(left.to_string(), right.to_string());
+        assert!(right.to_string().contains("corrupt"), "{right}");
+        assert_eq!(page_image(&single), page_image(&batched));
+        assert_eq!(
+            crate::storage::page::next_page_of(&batched.read_node(right_id).unwrap()),
+            999
+        );
+
+        let (mut store, root) = fill(limits, &entries);
+        let mut node = decode_internal(&store.read_node(root).unwrap()).unwrap();
+        node.keys[0] = (i64::MIN, 0);
+        store
+            .write_node(root, encode_internal(root, &node).unwrap())
+            .unwrap();
+        let before = page_image(&store);
+        let error = delete_many(&mut store, root, &[runs[0].entries[0]], limits).unwrap_err();
+        assert!(
+            error.to_string().contains("index entry is missing"),
+            "{error}"
+        );
+        assert_eq!(page_image(&store), before);
+
+        let (mut store, root) = fill(limits, &entries);
+        let mut node = decode_internal(&store.read_node(root).unwrap()).unwrap();
+        let routed = *runs.last().unwrap().entries.last().unwrap();
+        let last = node.children.len() - 1;
+        node.children[last] = 999;
+        store
+            .write_node(root, encode_internal(root, &node).unwrap())
+            .unwrap();
+        let before = page_image(&store);
+        let error = delete_many(&mut store, root, &[routed], limits).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(page_image(&store), before);
+
+        let donor = runs
+            .iter()
+            .rev()
+            .find(|run| run.id != runs[0].id && run.entries.len() >= limits.leaf_min + 2)
+            .expect("right-hand leaf with a grouped prefix");
+        let (mut single, single_root) = fill(limits, &entries);
+        let (mut batched, batched_root) = fill(limits, &entries);
+        for store in [&mut single, &mut batched] {
+            let mut page = store.read_node(runs[0].id).unwrap();
+            page.as_mut_slice()[0] = 0;
+            page.as_mut_slice()[1] = 0;
+            store.write_node(runs[0].id, page).unwrap();
+        }
+        let prefix = &donor.entries[..2];
+        let left = drive(&mut single, single_root, prefix, limits).unwrap_err();
+        let right = delete_many(&mut batched, batched_root, prefix, limits).unwrap_err();
+        assert!(left.to_string().contains("corrupt"), "{left}");
+        assert!(right.to_string().contains("corrupt"), "{right}");
+        assert_eq!(batched.read_node(runs[0].id).unwrap().as_slice()[0], 0);
+        let donor_leaf = decode_leaf(&batched.read_node(donor.id).unwrap()).unwrap();
+        assert_eq!(donor_leaf.entries, donor.entries);
     }
 }

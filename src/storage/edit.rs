@@ -164,16 +164,23 @@ impl Editor {
         self.prepared(pager)
     }
 
-    /// Unlink `deleted` and compare `scans`, reusing [`Self::unlink_row`].
+    /// Unlink `deleted` and compare `scans`.
     ///
     /// The ids were captured before compaction. They are checked against the
     /// stored snapshot before any row is removed: a duplicate, a zero, an id
     /// past the counter, or an id that is not stored fails with no page
-    /// marked dirty. Removal starts at the highest index, so earlier indexes
-    /// stay valid. Surviving ids stay in insertion order. `next_row_id` is
+    /// marked dirty. Surviving ids stay in insertion order. `next_row_id` is
     /// left unchanged. `scans` are tables whose stored ids still match memory,
     /// including a delete that matched nothing. Those rows are decoded and
-    /// compared. A survivor of a real delete is not in `scans` and is not cloned.
+    /// compared, which is the check that a stored record still matches memory.
+    /// A survivor of a real delete is not in `scans` and is not cloned.
+    ///
+    /// One deleted row uses the per-row unlink: it cannot share a leaf with
+    /// another deleted posting, and cloning both heap chains is slower than
+    /// one removal. Two or more rows remove the heap slots in one pass.
+    /// Index postings that share a leaf are removed together when that leaf
+    /// stays at its minimum, and the rest use the single-entry delete. A test
+    /// can force the per-row loop.
     pub(crate) fn unlink_deleted(
         mut self,
         pager: &mut Pager,
@@ -188,22 +195,37 @@ impl Editor {
             )));
         }
         self.drop_absent_indexes(pager, indexes)?;
+        let validate_mark = profile::start();
         let positions = if deleted.is_empty() {
             Vec::new()
         } else {
             let live = &self.snapshot.tables[table];
             deleted_positions(live, table, deleted)?
         };
+        profile::add_validate(validate_mark);
         for scan in scans {
             self.sync_stored_rows(pager, scan)?;
         }
-        for index in positions {
-            self.unlink_row(pager, table, index)?;
+        if !positions.is_empty() {
+            if per_row_unlink() || positions.len() == 1 {
+                for index in positions {
+                    self.unlink_row(pager, table, index)?;
+                }
+            } else {
+                self.unlink_batch(pager, table, &positions)?;
+            }
         }
         self.create_missing_indexes(pager, indexes)?;
         self.prepared(pager)
     }
 
+    /// Decode every stored row and rewrite it when memory differs.
+    ///
+    /// A delete that matched nothing still runs this. The decode reports a
+    /// corrupt heap record and a stored value that no longer matches memory.
+    /// The in-memory audit does not read the page, so an empty id list is not
+    /// a reason to skip it. A stored row that already matches does not dirty
+    /// its page.
     fn sync_stored_rows(
         &mut self,
         pager: &mut Pager,
@@ -525,7 +547,10 @@ impl Editor {
         let link = self.snapshot.tables[name].links[index];
         let table_id = self.snapshot.tables[name].table_id;
         let row_id = self.snapshot.tables[name].row_ids[index];
+        let decode_mark = profile::start();
         let old_values = self.row_values(pager, link)?;
+        profile::add_decode(decode_mark);
+        let heap_mark = profile::start();
         let prev = if index == 0 {
             NULL_LINK
         } else {
@@ -558,7 +583,153 @@ impl Editor {
         let catalog_slot = live.catalog_slot;
         self.patch_catalog(pager, catalog_page, catalog_slot, next_row_id, head)?;
         self.maybe_free_heap(link.page)?;
+        profile::add_heap_edit(heap_mark);
+        let index_mark = profile::start();
         self.maintain_indexes(pager, table_id, row_id, Some(&old_values), None)?;
+        profile::add_index_edit(index_mark);
+        Ok(())
+    }
+
+    /// Remove every listed slot, then its postings.
+    ///
+    /// `positions` is the descending stored indexes from [`deleted_positions`].
+    /// Keys are decoded before any slot is cleared. The survivor vectors are
+    /// built in one pass. Neighbor links are patched in that same descending
+    /// order, so a dead cell's leftover bytes match the per-row unlink. Empty
+    /// heap pages are released once, after the survivor list is installed.
+    fn unlink_batch(
+        &mut self,
+        pager: &mut Pager,
+        name: &str,
+        positions: &[usize],
+    ) -> Result<(), DbError> {
+        let decode_mark = profile::start();
+        let (table_id, links, row_ids, next_row_id, catalog_page, catalog_slot) = {
+            let live = &self.snapshot.tables[name];
+            (
+                live.table_id,
+                live.links.clone(),
+                live.row_ids.clone(),
+                live.next_row_id,
+                live.catalog_page,
+                live.catalog_slot,
+            )
+        };
+        let mut doomed = vec![false; links.len()];
+        for &index in positions {
+            doomed[index] = true;
+        }
+        let mut next_alive = vec![links.len(); links.len()];
+        let mut next_index = links.len();
+        for index in (0..links.len()).rev() {
+            next_alive[index] = next_index;
+            if !doomed[index] {
+                next_index = index;
+            }
+        }
+        let ordinals: Vec<(usize, u16)> = self
+            .snapshot
+            .indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, index)| index.table_id == table_id)
+            .map(|(position, index)| (position, index.column_ordinal))
+            .collect();
+        let mut postings = vec![Vec::new(); ordinals.len()];
+        for &index in positions {
+            let values = self.row_values(pager, links[index])?;
+            for (slot, (_, ordinal)) in ordinals.iter().enumerate() {
+                if let Some(key) = integer_at(&values, *ordinal)? {
+                    postings[slot].push((key, row_ids[index]));
+                }
+            }
+        }
+        profile::add_decode(decode_mark);
+
+        let heap_mark = profile::start();
+        for &index in positions {
+            let prev = if index == 0 {
+                NULL_LINK
+            } else {
+                links[index - 1]
+            };
+            let next = if next_alive[index] == links.len() {
+                NULL_LINK
+            } else {
+                links[next_alive[index]]
+            };
+            if prev != NULL_LINK {
+                self.ensure(pager, prev.page)?;
+                let (prev_prev, _) = self.read_links(prev)?;
+                self.patch(pager, prev, prev_prev, next)?;
+            }
+            if next != NULL_LINK {
+                self.ensure(pager, next.page)?;
+                let (_, next_next) = self.read_links(next)?;
+                self.patch(pager, next, prev, next_next)?;
+            }
+            self.delete_cell(pager, links[index])?;
+        }
+        let mut kept_ids = Vec::with_capacity(links.len() - positions.len());
+        let mut kept_links = Vec::with_capacity(links.len() - positions.len());
+        let mut used_pages = HashSet::new();
+        for (index, link) in links.iter().copied().enumerate() {
+            if doomed[index] {
+                continue;
+            }
+            kept_ids.push(row_ids[index]);
+            kept_links.push(link);
+            used_pages.insert(link.page);
+        }
+        let head = kept_links.first().copied().unwrap_or(NULL_LINK);
+        let tail = kept_links.last().copied().unwrap_or(NULL_LINK);
+        {
+            let live = self.snapshot.tables.get_mut(name).expect("table");
+            live.row_ids = kept_ids;
+            live.links = kept_links;
+            live.head = head;
+            live.tail = tail;
+        }
+        self.patch_catalog(pager, catalog_page, catalog_slot, next_row_id, head)?;
+        let mut released = HashSet::new();
+        for &index in positions {
+            let page_id = links[index].page;
+            if used_pages.contains(&page_id) || !released.insert(page_id) {
+                continue;
+            }
+            self.maybe_free_heap(page_id)?;
+        }
+        profile::add_heap_edit(heap_mark);
+
+        let index_mark = profile::start();
+        for (slot, (position, _)) in ordinals.into_iter().enumerate() {
+            self.delete_postings(pager, position, &postings[slot])?;
+        }
+        profile::add_index_edit(index_mark);
+        Ok(())
+    }
+
+    fn delete_postings(
+        &mut self,
+        pager: &mut Pager,
+        position: usize,
+        entries: &[(i64, u64)],
+    ) -> Result<(), DbError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let root = self.snapshot.indexes[position].root;
+        let new_root = {
+            let mut nodes = EditNodes {
+                editor: self,
+                pager,
+            };
+            btree::delete_many(&mut nodes, root, entries, btree::production())?
+        };
+        if new_root != root {
+            self.snapshot.indexes[position].root = new_root;
+            self.rewrite_index_cell(pager, position)?;
+        }
         Ok(())
     }
 
@@ -1331,10 +1502,50 @@ fn directories_needed(unused: usize, capacity: usize) -> usize {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_PER_ROW_UNLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Unlinks one stored index at a time.
+///
+/// The default path removes the same slots in one pass. This guard keeps the
+/// Milestone 29 loop so a test can compare the pages.
+#[cfg(test)]
+pub(crate) struct ForcePerRowUnlink;
+
+#[cfg(test)]
+impl ForcePerRowUnlink {
+    pub(crate) fn new() -> Self {
+        FORCE_PER_ROW_UNLINK.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcePerRowUnlink {
+    fn drop(&mut self) {
+        FORCE_PER_ROW_UNLINK.with(|flag| flag.set(false));
+    }
+}
+
+fn per_row_unlink() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_PER_ROW_UNLINK.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// Stored indexes of `deleted`, highest first.
 ///
-/// Checking finishes before any unlink. A later removal does not change an
-/// earlier index, so the caller can pass these indexes straight to `unlink_row`.
+/// Checking finishes before any unlink. The indexes are unique and sorted so
+/// the per-row loop can remove them from the high end without disturbing an
+/// earlier index. The batched path uses the same indexes and does not shift
+/// the vector once per row.
 fn deleted_positions(
     live: &LiveTable,
     table: &str,

@@ -16,6 +16,8 @@ mod reliability;
 mod store;
 mod wal;
 
+#[cfg(test)]
+pub(crate) use edit::ForcePerRowUnlink;
 pub use page::{MAX_RECORD_LEN, PAGE_SIZE};
 pub(crate) use page::{Page, cell, live_slots, page_id_of, verify};
 #[cfg(test)]
