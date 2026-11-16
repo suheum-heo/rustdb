@@ -1043,9 +1043,9 @@ fn aliases_self_joins_and_illegal_projections_bind_before_the_scan() {
     );
     let error = failure(
         &mut database,
-        "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+        "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name;",
     );
-    assert_eq!(error, "LEFT JOIN is not supported with DISTINCT");
+    assert_eq!(error, "DISTINCT is not supported with GROUP BY");
     assert_eq!(
         rows(
             &mut database,

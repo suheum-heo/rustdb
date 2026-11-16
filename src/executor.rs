@@ -7,17 +7,18 @@
 //!
 //! A plain `SELECT` applies `WHERE`, then `ORDER BY`, then `LIMIT`, then
 //! projection. Its sort keys may name columns that are not in the select list.
-//! `SELECT DISTINCT` is a non-aggregate query on one table or on one
-//! `INNER JOIN`. It projects the chosen columns, then keeps the first copy of
-//! each output row. NULL equals NULL in that comparison. A fingerprint
+//! `SELECT DISTINCT` is a non-aggregate query on one table, one `INNER JOIN`,
+//! or one `LEFT JOIN`. It projects the chosen columns, then keeps the first
+//! copy of each output row. NULL equals NULL in that comparison. A fingerprint
 //! collision still compares every cell. `ORDER BY` names a selected output
 //! column or its alias, and an unselected column is rejected because the
 //! hidden value would be ambiguous after deduplication. `ORDER BY` and
 //! `LIMIT` run after deduplication, and `LIMIT` does not stop the scan. The
 //! distinct rows stay in memory until the query finishes. A distinct join
 //! visits pairs through the same nested, hash, or index path as a plain join
-//! and admits each projected pair immediately. It does not store the joined
-//! rows beside the distinct set. An aggregate query groups after `WHERE` and applies `HAVING`
+//! and admits each projected pair immediately. A distinct left join uses the
+//! same left-join visitor and the same distinct set. It does not store the
+//! joined rows beside that set. An aggregate query groups after `WHERE` and applies `HAVING`
 //! before the sort. An indexed integer comparison on one table may supply
 //! candidate rows first. The original `WHERE` is still applied to those
 //! candidates. Equal keys keep the order produced above because the sort is
@@ -61,7 +62,11 @@
 //! `COUNT(*)` counts a null-extended row. `COUNT`, `SUM`, `AVG`, `MIN`, and
 //! `MAX` of a right column ignore its NULLs, and so do `COUNT(DISTINCT ...)`,
 //! `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)`: a NULL argument is not stored
-//! in the per-group set. `SELECT DISTINCT` stays rejected. A `WHERE` that removes the matches
+//! in the per-group set. `SELECT DISTINCT` admits each surviving logical row's
+//! projection into the same projected-row set as one table, including a
+//! null-extended row that `WHERE` keeps. `GROUP BY`, `HAVING`, and aggregates
+//! stay off `SELECT DISTINCT`.
+//! A `WHERE` that removes the matches
 //! does not add the NULL row. `ON` FALSE and `ON` UNKNOWN do not match,
 //! including `NULL = NULL`. `LIMIT` does not stop that scan. The left hash
 //! table stores positions into the right rows, not copied keys, and it does
@@ -289,7 +294,6 @@ impl Database {
         tail: SelectTail<'_>,
     ) -> Result<StatementResult, DbError> {
         reject_runtime_distinct(from, tail)?;
-        reject_left_join(from, tail)?;
         if tail.distinct {
             return match from {
                 QueryFrom::Table(source) => self.query_table(source, tail),
@@ -301,10 +305,10 @@ impl Database {
                 } => self.query_distinct_join(outer, inner, on, tail),
                 QueryFrom::Join {
                     kind: JoinKind::Left,
-                    ..
-                } => Err(DbError::unsupported(
-                    "LEFT JOIN is not supported with DISTINCT",
-                )),
+                    outer,
+                    inner,
+                    on,
+                } => self.query_distinct_left_join(outer, inner, on, tail),
             };
         }
         if is_aggregate_query(tail.projection, tail.group_by, tail.having, tail.order_by) {
@@ -576,6 +580,54 @@ impl Database {
                 tail.limit,
             ),
         })
+    }
+
+    /// `SELECT DISTINCT` over one `LEFT JOIN`.
+    ///
+    /// The left-join visitor emits each `ON`-true pair and one null-extended
+    /// row. That row is projected and admitted immediately. The joined pair is
+    /// not stored. `ORDER BY` and `LIMIT` run after every logical row, so a
+    /// later comparison or reservation error is not hidden by `LIMIT`.
+    fn query_distinct_left_join(
+        &mut self,
+        outer: &TableRef,
+        inner: &TableRef,
+        on: &Expr,
+        tail: SelectTail<'_>,
+    ) -> Result<StatementResult, DbError> {
+        let prepared = self.prepare_join(
+            outer,
+            inner,
+            on,
+            tail.projection,
+            tail.selection,
+            tail.order_by,
+            true,
+        )?;
+        let path = self.left_access(outer, inner, on)?;
+        let outer_types = declared_types(self.table(&outer.name)?);
+        let inner_types = declared_types(self.table(&inner.name)?);
+        let outputs = prepared.output_indexes.clone();
+        let mut distinct = DistinctRows::new();
+        self.with_copied_side(outer, inner, |outer_rows, inner_rows, _| {
+            consume_left_join(
+                outer_rows,
+                inner_rows,
+                &outer_types,
+                &inner_types,
+                &path,
+                &prepared,
+                |outer_row, inner_row| {
+                    distinct.admit(project_pair(outer_row, inner_row, &outputs)?)
+                },
+            )
+        })?;
+        Ok(finish_distinct_rows(
+            distinct,
+            &prepared.sort_keys,
+            tail.limit,
+            prepared.output_names,
+        ))
     }
 
     /// The left-join strategy `EXPLAIN` and execution share.
@@ -1203,6 +1255,92 @@ impl Database {
         }))
     }
 
+    /// `EXPLAIN` for `SELECT DISTINCT` over one `LEFT JOIN`.
+    ///
+    /// Binding and the schema decide the strategy. This does not hash rows,
+    /// visit pairs, or write storage.
+    fn explain_distinct_left_join(
+        &self,
+        outer: &TableRef,
+        inner: &TableRef,
+        on: &Expr,
+        query: &crate::ast::SelectQuery,
+    ) -> Result<StatementResult, DbError> {
+        let _prepared = self.prepare_join(
+            outer,
+            inner,
+            on,
+            &query.projection,
+            query.selection.as_ref(),
+            &query.order_by,
+            true,
+        )?;
+        let path = self.left_access(outer, inner, on)?;
+        let filter = query
+            .selection
+            .as_ref()
+            .map(|expr| Value::Text(expr.render()))
+            .unwrap_or(Value::Null);
+        let order = if query.order_by.is_empty() {
+            Value::Null
+        } else {
+            Value::Text(
+                query
+                    .order_by
+                    .iter()
+                    .map(render_order_key)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        };
+        let (access, build, predicate, residual) = match path {
+            plan::LeftAccess::NestedLoop => (
+                "LeftNestedLoopJoin",
+                Value::Null,
+                Value::Null,
+                Value::Text(on.render()),
+            ),
+            plan::LeftAccess::Hash {
+                predicate,
+                residual,
+                ..
+            } => (
+                "HashLeftJoin",
+                Value::Text(inner.explain_name()),
+                Value::Text(predicate),
+                residual.map(Value::Text).unwrap_or(Value::Null),
+            ),
+        };
+        Ok(StatementResult::Query(QueryResult {
+            columns: vec![
+                "access".to_string(),
+                "outer".to_string(),
+                "inner".to_string(),
+                "build".to_string(),
+                "predicate".to_string(),
+                "residual".to_string(),
+                "filter".to_string(),
+                "distinct".to_string(),
+                "projection".to_string(),
+                "order_by".to_string(),
+                "limit".to_string(),
+            ],
+            rows: vec![vec![
+                Value::Text(access.to_string()),
+                Value::Text(outer.explain_name()),
+                Value::Text(inner.explain_name()),
+                build,
+                predicate,
+                residual,
+                filter,
+                Value::Text("HashDistinct".to_string()),
+                Value::Text(projection_label(&query.projection)),
+                order,
+                limit_cell(query.limit),
+            ]],
+        }))
+    }
+
     fn explain(&mut self, statement: &Statement) -> Result<StatementResult, DbError> {
         let Statement::Select(query) = statement else {
             return Err(DbError::unsupported("EXPLAIN is only supported for SELECT"));
@@ -1217,7 +1355,6 @@ impl Database {
             distinct: query.distinct,
         };
         reject_runtime_distinct(&query.from, tail)?;
-        reject_left_join(&query.from, tail)?;
         if query.distinct {
             return match &query.from {
                 QueryFrom::Table(source) => self.explain_distinct(source, query),
@@ -1229,10 +1366,10 @@ impl Database {
                 } => self.explain_distinct_join(outer, inner, on, query),
                 QueryFrom::Join {
                     kind: JoinKind::Left,
-                    ..
-                } => Err(DbError::unsupported(
-                    "LEFT JOIN is not supported with DISTINCT",
-                )),
+                    outer,
+                    inner,
+                    on,
+                } => self.explain_distinct_left_join(outer, inner, on, query),
             };
         }
         if is_aggregate_query(
@@ -2426,22 +2563,6 @@ fn text_list(labels: &[String]) -> Value {
     }
 }
 
-fn reject_left_join(from: &QueryFrom, tail: SelectTail<'_>) -> Result<(), DbError> {
-    let QueryFrom::Join {
-        kind: JoinKind::Left,
-        ..
-    } = from
-    else {
-        return Ok(());
-    };
-    if tail.distinct {
-        return Err(DbError::unsupported(
-            "LEFT JOIN is not supported with DISTINCT",
-        ));
-    }
-    Ok(())
-}
-
 fn reject_runtime_distinct(_from: &QueryFrom, tail: SelectTail<'_>) -> Result<(), DbError> {
     if !tail.distinct {
         return Ok(());
@@ -3626,6 +3747,8 @@ fn finish_distinct_rows(
 /// it is first admitted. Text is the clone made by projection; a duplicate
 /// drops that clone and reserves nothing. Memory is one stored tuple per
 /// unique output row, plus one hash and one bucket slot. There is no disk spill.
+/// A `HashMap` that cannot grow aborts the process. That is not returned as a
+/// query error.
 struct DistinctRows {
     buckets: HashMap<u64, Vec<usize>>,
     rows: Vec<Vec<Value>>,
@@ -12120,6 +12243,127 @@ mod tests {
     }
 
     #[test]
+    fn left_select_distinct_matches_nested_and_a_collision() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE users (id INT, name TEXT, active BOOLEAN);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO users VALUES (1, 'Ada', TRUE), (2, 'Ada', TRUE), (4, 'Ada', FALSE), (3, 'Bea', TRUE), (NULL, 'Dee', TRUE);",
+        )
+        .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 10), (1, 10), (1, NULL), (3, 20), (NULL, 5);")
+            .unwrap();
+        let sqls = [
+            "SELECT DISTINCT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+            "SELECT DISTINCT o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+            "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount > 15;",
+            "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id AND FALSE;",
+            "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id AND NULL;",
+            "SELECT DISTINCT u.name, o.amount FROM users u LEFT JOIN orders o ON o.user_id = u.id AND o.amount > 15;",
+            "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id OR o.amount = 5;",
+            "SELECT DISTINCT a.name, b.name FROM users a LEFT JOIN users b ON a.id = b.id;",
+        ];
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            sqls.iter()
+                .map(|sql| query(&mut db, sql).rows)
+                .collect::<Vec<_>>()
+        };
+        let hashed = sqls
+            .iter()
+            .map(|sql| query(&mut db, sql).rows)
+            .collect::<Vec<_>>();
+        assert_eq!(hashed, nested);
+        let collided = {
+            let _force = ForceHashCollision::new();
+            sqls.iter()
+                .map(|sql| query(&mut db, sql).rows)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(collided, nested);
+        assert_eq!(
+            nested[0],
+            vec![
+                vec![Value::Text("Ada".to_string()), Value::Integer(10)],
+                vec![Value::Text("Ada".to_string()), Value::Null],
+                vec![Value::Text("Bea".to_string()), Value::Integer(20)],
+                vec![Value::Text("Dee".to_string()), Value::Null],
+            ]
+        );
+        assert_eq!(
+            nested[1],
+            vec![
+                vec![Value::Integer(10)],
+                vec![Value::Null],
+                vec![Value::Integer(20)],
+            ]
+        );
+        assert_eq!(nested[2], vec![vec![Value::Text("Bea".to_string())]]);
+        assert_eq!(nested[3].len(), 3);
+    }
+
+    #[test]
+    fn a_later_left_distinct_error_is_not_hidden_by_limit() {
+        let dir = crate::test_dir::TestDir::new("left-distinct-rows");
+        let path = dir.join("db");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Bea'), (3, 'Cy');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 10), (2, 20), (3, 30);")
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut wal = path.as_os_str().to_owned();
+        wal.push(".wal");
+        let wal_before = std::fs::read(&wal).unwrap_or_default();
+        replace_cell(&mut db, "orders", 2, 1, Value::Text("later".to_string()));
+        let sql = "SELECT DISTINCT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.amount > 0 LIMIT 1;";
+        assert_join_error(&mut db, sql);
+        let explained = query(&mut db, &format!("EXPLAIN {sql}"));
+        assert_eq!(
+            explained.rows[0][0],
+            Value::Text("HashLeftJoin".to_string())
+        );
+        assert_eq!(
+            explained.rows[0][7],
+            Value::Text("HashDistinct".to_string())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&wal).unwrap_or_default(), wal_before);
+        {
+            let _budget = DistinctReserveBudget::limit(0);
+            let error = db
+                .execute(
+                    "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id LIMIT 1;",
+                )
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("SELECT DISTINCT result is too large"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id ORDER BY u.name;",
+            )
+            .rows,
+            vec![
+                vec![Value::Text("Ada".to_string())],
+                vec![Value::Text("Bea".to_string())],
+                vec![Value::Text("Cy".to_string())],
+            ]
+        );
+    }
+
+    #[test]
     #[ignore = "release profile of DISTINCT aggregates over LEFT JOIN"]
     fn profile_milestone22() {
         let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
@@ -12356,5 +12600,205 @@ mod tests {
             denominator: i64::try_from(u128::from(u64::try_from(count).unwrap_or(0)) / divisor)
                 .unwrap_or(1),
         }
+    }
+
+    #[test]
+    #[ignore = "release profile of SELECT DISTINCT over LEFT JOIN"]
+    fn profile_milestone23() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone23 cpu={cpu} mem_bytes={mem} rustc={rustc} value_bytes={}",
+            std::mem::size_of::<Value>()
+        );
+        for rows in [100_i64, 1_000, 4_000, 10_000] {
+            for shape in ["matched", "few", "duplicates", "none", "nulls"] {
+                let nested = rows <= 4_000 || (rows == 10_000 && shape == "matched");
+                profile_left_rows(rows, rows, shape, nested);
+            }
+        }
+        profile_left_rows(100, 4_000, "matched", true);
+        profile_left_rows(4_000, 100, "matched", true);
+    }
+
+    fn profile_left_rows(users: i64, orders: i64, shape: &str, nested: bool) {
+        let mut database = Database::new();
+        load_left_rows(&mut database, users, orders, shape);
+        let plain = "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;";
+        let distinct =
+            "SELECT DISTINCT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;";
+        let limited = "SELECT DISTINCT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id ORDER BY u.name ASC, o.amount ASC LIMIT 10;";
+        let explained = query(&mut database, &format!("EXPLAIN {distinct}"));
+        assert_eq!(
+            explained.rows[0][0],
+            Value::Text("HashLeftJoin".to_string()),
+            "{shape} {users}x{orders}"
+        );
+        let expect = left_row_totals(users, orders, shape);
+        let (plain_cold, plain_warm, plain_checksum, plain_rows) = time_agg(&mut database, plain);
+        let (cold, warm, checksum, returned) = time_agg(&mut database, distinct);
+        let (limit_cold, limit_warm, limit_checksum, limit_rows) = time_agg(&mut database, limited);
+        assert_eq!(
+            plain_checksum, expect.plain_checksum,
+            "{shape} {users}x{orders}"
+        );
+        assert_eq!(checksum, expect.checksum, "{shape} {users}x{orders}");
+        assert_eq!(
+            limit_checksum, expect.limit_checksum,
+            "{shape} {users}x{orders}"
+        );
+        assert_eq!(plain_rows, expect.inputs);
+        assert_eq!(returned, expect.uniques);
+        assert_eq!(limit_rows, expect.limited);
+        let (nested_plain_warm, nested_warm, nested_limit_warm) = if nested {
+            let _force = ForceNestedJoin::new();
+            let (_, plain_warm, plain_checksum, _) = time_agg(&mut database, plain);
+            let (_, warm, checksum, _) = time_agg(&mut database, distinct);
+            let (_, limit_warm, limit_checksum, _) = time_agg(&mut database, limited);
+            assert_eq!(plain_checksum, expect.plain_checksum);
+            assert_eq!(checksum, expect.checksum);
+            assert_eq!(limit_checksum, expect.limit_checksum);
+            (plain_warm, warm, limit_warm)
+        } else {
+            (0, 0, 0)
+        };
+        let distinct_bytes = distinct_output_bytes(expect.uniques, 2, expect.uniques);
+        println!(
+            "milestone23 shape={shape} users={users} orders={orders} hits={} null_extended={} inputs={} uniques={} returned={returned} limited={} nested_candidates={} distinct_bytes={distinct_bytes} join_bytes=0 plain_hash_cold_us={plain_cold} plain_hash_warm_us={plain_warm} distinct_hash_cold_us={cold} distinct_hash_warm_us={warm} limit_hash_cold_us={limit_cold} limit_hash_warm_us={limit_warm} plain_nested_warm_us={nested_plain_warm} distinct_nested_warm_us={nested_warm} limit_nested_warm_us={nested_limit_warm} plain_checksum={plain_checksum} distinct_checksum={checksum} limit_checksum={limit_checksum}",
+            expect.hits,
+            expect.null_extended,
+            expect.inputs,
+            expect.uniques,
+            expect.limited,
+            i128::from(users) * i128::from(orders)
+        );
+    }
+
+    fn load_left_rows(database: &mut Database, users: i64, orders: i64, shape: &str) {
+        database
+            .execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        database
+            .execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        let mut start = 0_i64;
+        while start < users {
+            let end = (start + 400).min(users);
+            let mut sql = String::from("INSERT INTO users VALUES ");
+            for id in start..end {
+                if id > start {
+                    sql.push(',');
+                }
+                let name = (b'a' + u8::try_from(id % 8).unwrap_or(0)) as char;
+                sql.push_str(&format!("({id}, '{name}')"));
+            }
+            sql.push(';');
+            database.execute(&sql).unwrap();
+            start = end;
+        }
+        start = 0;
+        while start < orders {
+            let end = (start + 400).min(orders);
+            let mut sql = String::from("INSERT INTO orders VALUES ");
+            for id in start..end {
+                if id > start {
+                    sql.push(',');
+                }
+                let (user_id, amount) = left_distinct_order(id, users, shape);
+                match (user_id, amount) {
+                    (Some(user_id), Some(amount)) => {
+                        sql.push_str(&format!("({user_id}, {amount})"));
+                    }
+                    (Some(user_id), None) => sql.push_str(&format!("({user_id}, NULL)")),
+                    (None, Some(amount)) => sql.push_str(&format!("(NULL, {amount})")),
+                    (None, None) => sql.push_str("(NULL, NULL)"),
+                }
+            }
+            sql.push(';');
+            database.execute(&sql).unwrap();
+            start = end;
+        }
+    }
+
+    struct LeftRowTotals {
+        hits: i64,
+        null_extended: i64,
+        inputs: usize,
+        uniques: usize,
+        limited: usize,
+        plain_checksum: i64,
+        checksum: i64,
+        limit_checksum: i64,
+    }
+
+    fn left_row_totals(users: i64, orders: i64, shape: &str) -> LeftRowTotals {
+        let orders = (0..orders)
+            .map(|id| left_distinct_order(id, users, shape))
+            .collect::<Vec<_>>();
+        let mut logical = Vec::new();
+        let mut hits = 0_i64;
+        let mut null_extended = 0_i64;
+        for user in 0..users {
+            let name =
+                Value::Text(((b'a' + u8::try_from(user % 8).unwrap_or(0)) as char).to_string());
+            let mut matched = false;
+            for (user_id, amount) in &orders {
+                if user_id.is_some_and(|id| id == user) {
+                    matched = true;
+                    hits += 1;
+                    logical.push(vec![name.clone(), left_amount_cell(*amount)]);
+                }
+            }
+            if !matched {
+                null_extended += 1;
+                logical.push(vec![name, Value::Null]);
+            }
+        }
+        let mut distinct = Vec::new();
+        for row in &logical {
+            if !distinct.iter().any(|seen| seen == row) {
+                distinct.push(row.clone());
+            }
+        }
+        let mut ordered = distinct.clone();
+        ordered.sort_by(|left, right| {
+            let name = match (&left[0], &right[0]) {
+                (Value::Text(left), Value::Text(right)) => left.cmp(right),
+                (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+                (Value::Null, _) => std::cmp::Ordering::Greater,
+                (_, Value::Null) => std::cmp::Ordering::Less,
+                _ => std::cmp::Ordering::Equal,
+            };
+            name.then_with(|| match (&left[1], &right[1]) {
+                (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
+                (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+                (Value::Null, _) => std::cmp::Ordering::Greater,
+                (_, Value::Null) => std::cmp::Ordering::Less,
+                _ => std::cmp::Ordering::Equal,
+            })
+        });
+        let limited = ordered.len().min(10);
+        LeftRowTotals {
+            hits,
+            null_extended,
+            inputs: logical.len(),
+            uniques: distinct.len(),
+            limited,
+            plain_checksum: checksum_rows(&logical),
+            checksum: checksum_rows(&distinct),
+            limit_checksum: checksum_rows(&ordered[..limited]),
+        }
+    }
+
+    fn left_amount_cell(amount: Option<i64>) -> Value {
+        amount.map(Value::Integer).unwrap_or(Value::Null)
+    }
+
+    fn checksum_rows(rows: &[Vec<Value>]) -> i64 {
+        rows.iter().fold(0_i64, |sum, row| {
+            row.iter()
+                .fold(sum, |sum, cell| sum.wrapping_add(profile_cell(cell)))
+        })
     }
 }

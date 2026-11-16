@@ -548,13 +548,6 @@ fn convert_select(
         .transpose()?;
     let group_by = convert_group_by(&select.group_by)?;
     let having = select.having.as_ref().map(convert_having).transpose()?;
-    if let QueryFrom::Join {
-        kind: JoinKind::Left,
-        ..
-    } = &table
-    {
-        reject_left_join(distinct, &projection, &group_by, having.as_ref(), &order_by)?;
-    }
     if distinct {
         reject_distinct_query(&table, &projection, &group_by, having.as_ref(), &order_by)?;
     }
@@ -581,27 +574,8 @@ fn select_distinct(select: &Select) -> Result<bool, DbError> {
     }
 }
 
-/// `SELECT DISTINCT` stays off a `LEFT JOIN`.
-///
-/// `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, including `COUNT(DISTINCT ...)`,
-/// `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)`, plus `GROUP BY` and `HAVING`,
-/// use the same binding as an `INNER JOIN` aggregate.
-fn reject_left_join(
-    distinct: bool,
-    _projection: &Projection,
-    _group_by: &[SelectColumn],
-    _having: Option<&Expr>,
-    _order_by: &[OrderKey],
-) -> Result<(), DbError> {
-    if distinct {
-        return Err(DbError::unsupported(
-            "LEFT JOIN is not supported with DISTINCT",
-        ));
-    }
-    Ok(())
-}
-
-/// `SELECT DISTINCT` covers one table or one non-aggregate `INNER JOIN`.
+/// `SELECT DISTINCT` covers one table, one non-aggregate `INNER JOIN`, or one
+/// non-aggregate `LEFT JOIN`.
 fn reject_distinct_query(
     _from: &QueryFrom,
     projection: &Projection,
@@ -1644,13 +1618,13 @@ mod tests {
             }
             other => panic!("expected a select, got {other:?}"),
         }
-        let error =
-            parse("SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id;")
-                .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "LEFT JOIN is not supported with DISTINCT"
-        );
+        parse("SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id;")
+            .unwrap();
+        let error = parse(
+            "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name;",
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "DISTINCT is not supported with GROUP BY");
         parse("SELECT COUNT(*) FROM users u LEFT JOIN orders o ON u.id = o.user_id;").unwrap();
         parse(
             "SELECT u.name, COUNT(o.user_id) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name;",

@@ -17,15 +17,16 @@
 //! `HAVING` keeps a group only when it is TRUE. A select-list alias is an
 //! output name, an `ORDER BY` name, and an unqualified `HAVING` name.
 //! `COUNT`, `SUM`, and `AVG` accept `DISTINCT` on one column. `SELECT DISTINCT`
-//! keeps the first copy of each projected row from one non-aggregate table or
-//! from one non-aggregate `INNER JOIN`. A `LEFT JOIN` of two tables keeps
+//! keeps the first copy of each projected row from one non-aggregate table,
+//! one non-aggregate `INNER JOIN`, or one non-aggregate `LEFT JOIN`. A `LEFT JOIN` of two tables keeps
 //! every left row. A same-type column equality hashes the right table. Any
 //! other `ON` uses a nested loop. A left row with no TRUE `ON` match is
 //! returned once, with NULL for each right column. `WHERE` runs after that
 //! extension. `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,
 //! `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)` use the same per-group sets
 //! as a single table and ignore NULL, including a null-extended right column.
-//! `SELECT DISTINCT` stays off that join.
+//! `SELECT DISTINCT` keeps the first copy of each projected logical row,
+//! including a null-extended row. NULL matches NULL in that comparison.
 //! Other filters scan the in-memory table.
 //!
 //! # Example
