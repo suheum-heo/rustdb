@@ -147,6 +147,22 @@ The code calls `File::sync_all` on the log before it modifies the database, and 
 - The mutation campaign is not libFuzzer. It has no coverage report and no per-input timeout. Nightly and `cargo-fuzz` are not installed, so the `fuzz/` binaries were not run.
 - The property tree uses a leaf capacity of 4. Production leaves hold 254 entries. The property test does not measure that occupancy.
 
+## INNER JOIN runtime type errors
+
+`INSERT` rejects a value whose runtime type is not the column's declared type. A test can still place one there by replacing a stored cell. `NULL` is allowed in every column. A ratio is a query result and is not a stored cell.
+
+The nested loop evaluates `ON` for every pair. `AND` and `OR` evaluate both sides, and a comparison of two non-NULL values of different types returns `comparison values have different types`. `NULL` compared with any value is unknown, not a type error. `WHERE` runs only after `ON` is TRUE, so a malformed cell that appears only in `WHERE` is not read when `ON` is not TRUE.
+
+`HashJoin` and `IndexNestedLoopJoin` can prune a pair before that `ON` runs. A NULL probe, a hash miss, and a cross-type key were treated as "no match". `same_cell` returns false for two different runtime types and does not report the comparison error. An index probe of a NULL key returns immediately, and a key with no index entry never sees a residual cell on some other row. Milestone 19 fixed the same hole for `HashLeftJoin`. Milestone 21 applies it to both optimized `INNER JOIN` paths.
+
+Before hashing or probing, execution walks each input once to check row width, then once per `ON` column. The only allocation is that column-index list plus the declared-type vectors. It does not copy rows, build a pair buffer, or write the database or the log. On the 15 Nov 2026 release profile, that walk added 30 µs to a 1,201 µs warm 10,000 by 10,000 hash join. Several smaller shapes were faster with the walk enabled. Those differences are timer noise, not a second join algorithm. When every `ON` cell is NULL or its declared type, the planned hash or index path runs unchanged, including either hash build side. When one cell disagrees, that execution uses the nested loop. An empty input has no bad cell, so it stays on the planned path. An empty side also means the nested loop compares nothing, so a bad cell on the other side is not an error until some pair is formed.
+
+`EXPLAIN` chooses the plan from the schema and the row counts. It does not read cells, so it can still say `HashJoin` or `IndexNestedLoopJoin` for a statement that falls back at execution. It does not modify the database.
+
+A schema-valid index whose leaf is unsorted, whose row id is duplicated, or whose page type is wrong still returns the existing corrupt-index error. The fallback does not run after that error and does not turn it into a successful nested loop. A malformed `ON` cell is a recoverable query error and is detected before the index is read, including when the index is also damaged. A later statement sees the same database. `SELECT` and `EXPLAIN` do not publish a partial row and do not append a log frame.
+
+The check does not look at `WHERE`. Both paths already agree there. It does not change the 64× index threshold, the hash build side, or the index page format.
+
 ## Suggested next reliability work
 
 A libFuzzer campaign, once nightly and `cargo-fuzz` are available, with an artifact kept only when a crash is real. A subprocess that is killed after the log sync and before the database sync would sit closer to a process crash than an injected `Err`, and it would still not be a power-loss test. Checksums on individual WAL frames, rather than one trailer over every frame, would make a torn last frame distinguishable from a damaged commit record.

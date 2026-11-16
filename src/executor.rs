@@ -70,9 +70,12 @@
 //! many rows. Otherwise that equality builds a hash table. Each bucket keeps
 //! one group per distinct key, so a fingerprint collision does not mix keys.
 //! NULL keys are left out. The original `ON` still runs on each matching key.
-//! Equal sizes build the inner table. Matches are emitted in outer insertion
-//! order, then inner insertion order. Any other shape reads the inner table
-//! from front to back. The catalog stores tables in one map, so a path that
+//! A stored `ON` cell that is not NULL and not the column's declared type
+//! uses the nested loop for that execution, on both the hash path and the
+//! index path, so a comparison error is not skipped. `EXPLAIN` still names
+//! the plan chosen from the schema. Equal sizes build the inner table.
+//! Matches are emitted in outer insertion order, then inner insertion order.
+//! Any other shape reads the inner table from front to back. The catalog stores tables in one map, so a path that
 //! needs both inputs copies one of them and borrows the other. A self-join
 //! copies one side for the same reason. The index path copies the outer rows,
 //! because each probe needs to borrow the database mutably. Pairs that fail
@@ -493,6 +496,10 @@ impl Database {
                 // Probes borrow the database, so the outer rows cannot stay borrowed
                 // from the catalog. The copy is not updated.
                 let outer_rows = self.table(&outer.name)?.rows().to_vec();
+                if !self.on_inputs_allow_fast_join(outer, inner, &outer_rows, &prepared.on)? {
+                    let inner_rows = self.copied_inner(outer, inner, &outer_rows)?;
+                    return scan_join(&outer_rows, &inner_rows, prepared, tail.limit);
+                }
                 self.index_nested_loop(&inner.name, &probe, &outer_rows, prepared, tail.limit)
             }
             JoinAccess::HashJoin {
@@ -894,6 +901,10 @@ impl Database {
                     outer_ordinal,
                 };
                 let outer_rows = self.table(&outer.name)?.rows().to_vec();
+                if !self.on_inputs_allow_fast_join(outer, inner, &outer_rows, &prepared.on)? {
+                    let inner_rows = self.copied_inner(outer, inner, &outer_rows)?;
+                    return visit_nested_pairs(&outer_rows, &inner_rows, prepared, visit);
+                }
                 self.visit_index_pairs(&inner.name, &probe, &outer_rows, prepared, visit)
             }
             FeedKind::Hash {
@@ -904,15 +915,27 @@ impl Database {
                     outer_ordinal,
                     inner_ordinal,
                 };
+                let outer_types = declared_types(self.table(&outer.name)?);
+                let inner_types = declared_types(self.table(&inner.name)?);
                 self.with_copied_side(outer, inner, |outer_rows, inner_rows, build_inner| {
-                    visit_hash_pairs(
+                    if on_cells_allow_fast_join(
+                        &outer_types,
+                        &inner_types,
                         outer_rows,
                         inner_rows,
-                        keys,
-                        build_inner,
-                        prepared,
-                        |outer_row, inner_row| visit(outer_row, inner_row),
-                    )
+                        &prepared.on,
+                    ) {
+                        visit_hash_pairs(
+                            outer_rows,
+                            inner_rows,
+                            keys,
+                            build_inner,
+                            prepared,
+                            |outer_row, inner_row| visit(outer_row, inner_row),
+                        )
+                    } else {
+                        visit_nested_pairs(outer_rows, inner_rows, prepared, visit)
+                    }
                 })
             }
             FeedKind::Nested => self.with_copied_side(outer, inner, |outer_rows, inner_rows, _| {
@@ -920,6 +943,47 @@ impl Database {
                     visit(outer_row, inner_row)
                 })
             }),
+        }
+    }
+
+    /// Whether every `ON` cell is NULL or its declared type.
+    ///
+    /// The check reads cells already loaded for the join. It does not copy
+    /// them again and it does not write the database. A mismatch means this
+    /// execution should use the nested loop.
+    fn on_inputs_allow_fast_join(
+        &self,
+        outer: &TableRef,
+        inner: &TableRef,
+        outer_rows: &[Vec<Value>],
+        on: &BoundExpr,
+    ) -> Result<bool, DbError> {
+        let outer_types = declared_types(self.table(&outer.name)?);
+        let inner_types = declared_types(self.table(&inner.name)?);
+        let inner_rows = if outer.name == inner.name {
+            outer_rows
+        } else {
+            self.table(&inner.name)?.rows()
+        };
+        Ok(on_cells_allow_fast_join(
+            &outer_types,
+            &inner_types,
+            outer_rows,
+            inner_rows,
+            on,
+        ))
+    }
+
+    fn copied_inner(
+        &self,
+        outer: &TableRef,
+        inner: &TableRef,
+        outer_rows: &[Vec<Value>],
+    ) -> Result<Vec<Vec<Value>>, DbError> {
+        if outer.name == inner.name {
+            Ok(outer_rows.to_vec())
+        } else {
+            Ok(self.table(&inner.name)?.rows().to_vec())
         }
     }
 
@@ -1825,8 +1889,20 @@ impl Database {
         prepared: PreparedJoin,
         limit: Option<u64>,
     ) -> Result<StatementResult, DbError> {
+        let outer_types = declared_types(self.table(&outer.name)?);
+        let inner_types = declared_types(self.table(&inner.name)?);
         self.with_copied_side(outer, inner, |outer_rows, inner_rows, build_inner| {
-            run_hash_join(outer_rows, inner_rows, keys, build_inner, prepared, limit)
+            if on_cells_allow_fast_join(
+                &outer_types,
+                &inner_types,
+                outer_rows,
+                inner_rows,
+                &prepared.on,
+            ) {
+                run_hash_join(outer_rows, inner_rows, keys, build_inner, prepared, limit)
+            } else {
+                scan_join(outer_rows, inner_rows, prepared, limit)
+            }
         })
     }
 
@@ -3938,6 +4014,25 @@ impl Drop for ForceNestedJoin {
     }
 }
 
+/// Skips the `ON` cell-type check so a profile can time that pass.
+#[cfg(test)]
+struct SkipOnSchemaCheck;
+
+#[cfg(test)]
+impl SkipOnSchemaCheck {
+    fn new() -> Self {
+        SKIP_ON_SCHEMA_CHECK.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for SkipOnSchemaCheck {
+    fn drop(&mut self) {
+        SKIP_ON_SCHEMA_CHECK.with(|flag| flag.set(false));
+    }
+}
+
 /// Bytes occupied by hash-join positions, key groups, and bucket headers.
 ///
 /// This counts one `usize` per stored position, one group header per distinct
@@ -4395,6 +4490,34 @@ fn scan_hash_left_join(
     )
 }
 
+fn declared_types(table: &Table) -> Vec<DataType> {
+    table
+        .schema()
+        .columns()
+        .iter()
+        .map(crate::schema::Column::data_type)
+        .collect()
+}
+
+/// `true` when the hash or index path can prune without hiding a type error.
+///
+/// The check walks each input once for row width, then once per `ON` column.
+/// It allocates the column-index list and does not copy rows or pairs. A test
+/// profile can skip it to measure that pass; production always runs it.
+fn on_cells_allow_fast_join(
+    outer_types: &[DataType],
+    inner_types: &[DataType],
+    outer_rows: &[Vec<Value>],
+    inner_rows: &[Vec<Value>],
+    on: &BoundExpr,
+) -> bool {
+    #[cfg(test)]
+    if SKIP_ON_SCHEMA_CHECK.with(std::cell::Cell::get) {
+        return true;
+    }
+    on_cells_match_schema(outer_types, inner_types, outer_rows, inner_rows, on)
+}
+
 /// True when every `ON` column agrees with its declared type.
 ///
 /// `NULL` is allowed. A missing cell, a ratio, or any other runtime type is
@@ -4761,6 +4884,8 @@ thread_local! {
     /// When set, every non-NULL key hashes to this value.
     static FORCED_HASH: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static FORCE_INDEX_JOIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// When set, the hash and index paths do not precheck `ON` cell types.
+    static SKIP_ON_SCHEMA_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static MATERIALIZE_AGGREGATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `Some(0)` fails the next distinct reservation. `None` does not.
     static DISTINCT_RESERVE_BUDGET: std::cell::Cell<Option<usize>> =
@@ -11073,5 +11198,631 @@ mod tests {
         let mut warm = samples[1..].to_vec();
         warm.sort_unstable();
         (cold, warm[warm.len() / 2], checksum, returned)
+    }
+
+    fn replace_cell(db: &mut Database, table: &str, row: usize, column: usize, value: Value) {
+        let mut rows = db.table(table).unwrap().rows().to_vec();
+        rows[row][column] = value;
+        db.table_mut(table).unwrap().rewrite_all(rows).unwrap();
+    }
+
+    fn join_error(db: &mut Database, sql: &str) -> String {
+        db.execute(sql).unwrap_err().to_string()
+    }
+
+    fn assert_join_error(db: &mut Database, sql: &str) {
+        let hashed = join_error(db, sql);
+        assert!(hashed.contains("different types"), "{sql}: {hashed}");
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            join_error(db, sql)
+        };
+        assert_eq!(hashed, nested, "{sql}");
+        let collided = {
+            let _force = ForceHashCollision::new();
+            join_error(db, sql)
+        };
+        assert_eq!(collided, nested, "{sql}");
+    }
+
+    fn assert_join_rows(db: &mut Database, sql: &str, expected: &[Vec<Value>]) {
+        let hashed = query(db, sql).rows;
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            query(db, sql).rows
+        };
+        let collided = {
+            let _force = ForceHashCollision::new();
+            query(db, sql).rows
+        };
+        assert_eq!(nested, expected, "{sql}");
+        assert_eq!(hashed, expected, "{sql}");
+        assert_eq!(collided, expected, "{sql}");
+    }
+
+    fn shop_users(orders: &str) -> Database {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Bea'), (3, 'Cy'), (NULL, 'Dee');")
+            .unwrap();
+        db.execute(orders).unwrap();
+        db
+    }
+
+    #[test]
+    fn valid_on_cells_stay_on_the_fast_path() {
+        let on = bound_equality();
+        let outer = vec![vec![Value::Integer(1)], vec![Value::Null]];
+        let inner = vec![vec![Value::Integer(1)]];
+        assert!(on_cells_allow_fast_join(
+            &[DataType::Integer],
+            &[DataType::Integer],
+            &outer,
+            &inner,
+            &on
+        ));
+        let bad = vec![vec![Value::Text("later".to_string())]];
+        assert!(!on_cells_allow_fast_join(
+            &[DataType::Integer],
+            &[DataType::Integer],
+            &outer,
+            &bad,
+            &on
+        ));
+        let skipped = {
+            let _skip = SkipOnSchemaCheck::new();
+            on_cells_allow_fast_join(
+                &[DataType::Integer],
+                &[DataType::Integer],
+                &outer,
+                &bad,
+                &on,
+            )
+        };
+        assert!(skipped);
+        assert!(!on_cells_allow_fast_join(
+            &[DataType::Integer],
+            &[DataType::Integer],
+            &outer,
+            &bad,
+            &on
+        ));
+    }
+
+    fn bound_equality() -> BoundExpr {
+        let scope = Scope::try_join(
+            "u",
+            vec![("id".to_string(), DataType::Integer)],
+            "o",
+            vec![("user_id".to_string(), DataType::Integer)],
+        )
+        .unwrap();
+        expr::bind_filter(
+            &Expr::Binary {
+                left: Box::new(Expr::Column {
+                    name: "id".to_string(),
+                    qualifier: Some("u".to_string()),
+                }),
+                op: crate::ast::BinOp::Eq,
+                right: Box::new(Expr::Column {
+                    name: "user_id".to_string(),
+                    qualifier: Some("o".to_string()),
+                }),
+            },
+            &scope,
+            "ON",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn inner_hash_matches_nested_loop_for_valid_rows() {
+        let mut db = shop_users(
+            "INSERT INTO orders VALUES (1, 50), (1, 150), (1, NULL), (2, 10), (NULL, 5);",
+        );
+        let expected = vec![
+            vec![Value::Text("Ada".to_string()), Value::Integer(50)],
+            vec![Value::Text("Ada".to_string()), Value::Integer(150)],
+            vec![Value::Text("Ada".to_string()), Value::Null],
+            vec![Value::Text("Bea".to_string()), Value::Integer(10)],
+        ];
+        assert_join_rows(
+            &mut db,
+            "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id;",
+            &expected,
+        );
+        assert_join_rows(
+            &mut db,
+            "SELECT u.name, o.amount FROM users u JOIN orders o ON o.user_id = u.id;",
+            &expected,
+        );
+        assert_join_rows(
+            &mut db,
+            "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id AND o.amount > 100;",
+            &[vec![Value::Text("Ada".to_string()), Value::Integer(150)]],
+        );
+        assert_join_rows(
+            &mut db,
+            "SELECT COUNT(*), COUNT(o.amount), SUM(o.amount), MIN(o.amount), MAX(o.amount) FROM users u JOIN orders o ON u.id = o.user_id;",
+            &[vec![
+                Value::Integer(4),
+                Value::Integer(3),
+                Value::Integer(210),
+                Value::Integer(10),
+                Value::Integer(150),
+            ]],
+        );
+        let explained = query(
+            &mut db,
+            "EXPLAIN SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+        );
+        assert_eq!(explained.rows[0][0], Value::Text("HashJoin".to_string()));
+        assert_eq!(
+            explained.rows[0][3],
+            Value::Text("u (users)".to_string()),
+            "five orders build the smaller outer table"
+        );
+        let mut fewer = shop_users("INSERT INTO orders VALUES (1, 50), (1, 150);");
+        let explained = query(
+            &mut fewer,
+            "EXPLAIN SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+        );
+        assert_eq!(explained.rows[0][0], Value::Text("HashJoin".to_string()));
+        assert_eq!(explained.rows[0][3], Value::Text("o (orders)".to_string()));
+        assert_join_rows(
+            &mut fewer,
+            "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id;",
+            &[
+                vec![Value::Text("Ada".to_string()), Value::Integer(50)],
+                vec![Value::Text("Ada".to_string()), Value::Integer(150)],
+            ],
+        );
+        let mut empty = shop_users("INSERT INTO orders VALUES (1, 1);");
+        empty.execute("DELETE FROM orders;").unwrap();
+        empty.execute("DELETE FROM users;").unwrap();
+        assert_join_rows(
+            &mut empty,
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+            &[],
+        );
+        let explained = query(
+            &mut empty,
+            "EXPLAIN SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+        );
+        assert_eq!(explained.rows[0][0], Value::Text("HashJoin".to_string()));
+    }
+
+    #[test]
+    fn a_mistyped_inner_key_matches_the_nested_loop_error() {
+        let sqls = [
+            "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id;",
+            "SELECT DISTINCT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+            "SELECT COUNT(*), SUM(o.amount), AVG(o.amount), MIN(o.amount), MAX(o.amount) FROM users u JOIN orders o ON u.id = o.user_id;",
+            "SELECT u.name, COUNT(*) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name HAVING COUNT(*) > 0;",
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id ORDER BY u.name ASC LIMIT 1;",
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id LIMIT 0;",
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id LIMIT 1;",
+            "SELECT u.name FROM users u JOIN orders o ON o.user_id = u.id;",
+        ];
+        let mut build_outer = shop_users(
+            "INSERT INTO orders VALUES (1, 50), (1, 150), (1, NULL), (2, 10), (NULL, 5);",
+        );
+        replace_cell(
+            &mut build_outer,
+            "users",
+            0,
+            0,
+            Value::Text("bad-build".to_string()),
+        );
+        for sql in sqls {
+            assert_join_error(&mut build_outer, sql);
+        }
+        let explained = query(
+            &mut build_outer,
+            "EXPLAIN SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+        );
+        assert_eq!(explained.rows[0][0], Value::Text("HashJoin".to_string()));
+        replace_cell(&mut build_outer, "users", 0, 0, Value::Integer(1));
+        assert_eq!(
+            query(
+                &mut build_outer,
+                "SELECT COUNT(*) FROM users u JOIN orders o ON u.id = o.user_id;",
+            )
+            .rows,
+            vec![vec![Value::Integer(4)]]
+        );
+        replace_cell(
+            &mut build_outer,
+            "orders",
+            4,
+            0,
+            Value::Text("bad-probe".to_string()),
+        );
+        assert_join_error(
+            &mut build_outer,
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id ORDER BY u.name ASC LIMIT 1;",
+        );
+
+        let mut build_inner = shop_users("INSERT INTO orders VALUES (1, 50), (2, 10);");
+        replace_cell(
+            &mut build_inner,
+            "orders",
+            1,
+            0,
+            Value::Text("bad-probe".to_string()),
+        );
+        assert_join_error(
+            &mut build_inner,
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id LIMIT 1;",
+        );
+        replace_cell(&mut build_inner, "orders", 1, 0, Value::Integer(2));
+        replace_cell(
+            &mut build_inner,
+            "users",
+            3,
+            0,
+            Value::Text("bad-outer-probe".to_string()),
+        );
+        assert_join_error(
+            &mut build_inner,
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+        );
+    }
+
+    #[test]
+    fn a_mistyped_residual_is_not_skipped_by_a_hash_miss() {
+        let mut db = shop_users("INSERT INTO orders VALUES (9, 10), (NULL, 5);");
+        replace_cell(&mut db, "orders", 0, 1, Value::Text("later".to_string()));
+        assert_join_error(
+            &mut db,
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id AND o.amount > 0;",
+        );
+        assert_join_error(
+            &mut db,
+            "SELECT COUNT(*) FROM users u JOIN orders o ON u.id = o.user_id AND o.amount > 0 LIMIT 0;",
+        );
+        let mut matched = shop_users("INSERT INTO orders VALUES (1, 50);");
+        replace_cell(
+            &mut matched,
+            "orders",
+            0,
+            1,
+            Value::Text("later".to_string()),
+        );
+        assert_join_error(
+            &mut matched,
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id AND o.amount > 0 ORDER BY u.name ASC LIMIT 1;",
+        );
+        let mut where_only = shop_users("INSERT INTO orders VALUES (9, 10);");
+        replace_cell(
+            &mut where_only,
+            "orders",
+            0,
+            1,
+            Value::Text("later".to_string()),
+        );
+        assert_join_rows(
+            &mut where_only,
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 0;",
+            &[],
+        );
+        replace_cell(&mut where_only, "orders", 0, 0, Value::Integer(1));
+        assert_join_error(
+            &mut where_only,
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 0;",
+        );
+    }
+
+    #[test]
+    fn a_mistyped_self_join_key_matches_the_nested_loop() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Bea');")
+            .unwrap();
+        replace_cell(&mut db, "users", 1, 0, Value::Text("later".to_string()));
+        assert_join_error(
+            &mut db,
+            "SELECT a.name, b.name FROM users a JOIN users b ON a.id = b.id LIMIT 1;",
+        );
+    }
+
+    #[test]
+    fn an_empty_input_does_not_compare_a_mistyped_cell() {
+        let mut db = shop_users("INSERT INTO orders VALUES (1, 50);");
+        db.execute("DELETE FROM orders;").unwrap();
+        replace_cell(&mut db, "users", 0, 0, Value::Text("later".to_string()));
+        assert_join_rows(
+            &mut db,
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+            &[],
+        );
+        let mut other = shop_users("INSERT INTO orders VALUES (1, 50);");
+        other.execute("DELETE FROM users;").unwrap();
+        replace_cell(&mut other, "orders", 0, 0, Value::Text("later".to_string()));
+        assert_join_rows(
+            &mut other,
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+            &[],
+        );
+    }
+
+    #[test]
+    fn a_failed_inner_join_does_not_publish_rows_or_write_the_file() {
+        let dir = crate::test_dir::TestDir::new("m21-atomic");
+        let path = dir.join("db");
+        let wal = {
+            let mut name = path.into_os_string();
+            name.push(".wal");
+            std::path::PathBuf::from(name)
+        };
+        let path = dir.join("db");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        db.execute("CREATE TABLE nums (n INT);").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Bea');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 50), (1, 150);")
+            .unwrap();
+        db.execute("INSERT INTO nums VALUES (7);").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let wal_before = std::fs::read(&wal).unwrap_or_default();
+        replace_cell(&mut db, "orders", 1, 0, Value::Text("later".to_string()));
+        let error = db
+            .execute("SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id LIMIT 1;")
+            .unwrap_err();
+        assert!(error.to_string().contains("different types"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&wal).unwrap_or_default(), wal_before);
+        let explained = query(
+            &mut db,
+            "EXPLAIN SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id;",
+        );
+        assert_eq!(explained.rows[0][0], Value::Text("HashJoin".to_string()));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            query(&mut db, "SELECT n FROM nums;").rows,
+            vec![vec![Value::Integer(7)]]
+        );
+        drop(db);
+        let mut reopened = Database::open(&path).unwrap();
+        assert_eq!(
+            query(
+                &mut reopened,
+                "SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id;",
+            )
+            .rows,
+            vec![
+                vec![Value::Text("Ada".to_string()), Value::Integer(50)],
+                vec![Value::Text("Ada".to_string()), Value::Integer(150)],
+            ]
+        );
+    }
+
+    fn indexed_pair(label: &str) -> (crate::test_dir::TestDir, Database) {
+        let dir = crate::test_dir::TestDir::new(label);
+        let path = dir.join("db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INT, name TEXT);")
+                .unwrap();
+            db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+                .unwrap();
+            db.execute("INSERT INTO users VALUES (1, 'Ada'), (9, 'No'), (NULL, 'Dee');")
+                .unwrap();
+            db.execute("INSERT INTO orders VALUES (1, 50), (2, 10);")
+                .unwrap();
+        }
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_orders_user ON orders (user_id);")
+            .unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn an_index_probe_does_not_skip_a_mistyped_residual() {
+        let (_dir, mut db) = indexed_pair("m21-index-residual");
+        replace_cell(&mut db, "orders", 1, 1, Value::Text("later".to_string()));
+        let joins = [
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id AND o.amount > 0;",
+            "SELECT DISTINCT u.name FROM users u JOIN orders o ON u.id = o.user_id AND o.amount > 0;",
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id AND o.amount > 0 ORDER BY u.name ASC LIMIT 1;",
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id AND o.amount > 0 LIMIT 0;",
+        ];
+        let aggregates = [
+            "SELECT COUNT(*) FROM users u JOIN orders o ON u.id = o.user_id AND o.amount > 0;",
+            "SELECT u.name, COUNT(*) FROM users u JOIN orders o ON u.id = o.user_id AND o.amount > 0 GROUP BY u.name;",
+        ];
+        for sql in joins.iter().copied().chain(aggregates) {
+            let indexed = {
+                let _force = ForceIndexJoin::new();
+                join_error(&mut db, sql)
+            };
+            let nested = {
+                let _force = ForceNestedJoin::new();
+                join_error(&mut db, sql)
+            };
+            assert!(indexed.contains("different types"), "{sql}: {indexed}");
+            assert_eq!(indexed, nested, "{sql}");
+        }
+        for sql in joins {
+            let explained = {
+                let _force = ForceIndexJoin::new();
+                query(&mut db, &format!("EXPLAIN {sql}"))
+            };
+            assert_eq!(
+                explained.rows[0][0],
+                Value::Text("IndexNestedLoopJoin".to_string()),
+                "{sql}"
+            );
+        }
+        for sql in aggregates {
+            let explained = {
+                let _force = ForceIndexJoin::new();
+                query(&mut db, &format!("EXPLAIN {sql}"))
+            };
+            assert_eq!(
+                explained.rows[0][4],
+                Value::Text("IndexNestedLoopJoin".to_string()),
+                "{sql}"
+            );
+        }
+        replace_cell(&mut db, "orders", 1, 1, Value::Integer(10));
+        let restored = {
+            let _force = ForceIndexJoin::new();
+            query(
+                &mut db,
+                "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id AND o.amount > 0;",
+            )
+            .rows
+        };
+        assert_eq!(restored, vec![vec![Value::Text("Ada".to_string())]]);
+    }
+
+    #[test]
+    fn an_index_probe_does_not_skip_a_mistyped_key() {
+        let (_dir, mut db) = indexed_pair("m21-index-key");
+        replace_cell(&mut db, "users", 1, 0, Value::Text("later".to_string()));
+        let sql = "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id;";
+        let indexed = {
+            let _force = ForceIndexJoin::new();
+            join_error(&mut db, sql)
+        };
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            join_error(&mut db, sql)
+        };
+        assert!(indexed.contains("different types"), "{indexed}");
+        assert_eq!(indexed, nested);
+    }
+
+    #[test]
+    #[ignore = "release profile of the INNER JOIN schema check"]
+    fn profile_milestone21() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone21 cpu={cpu} mem_bytes={mem} rustc={rustc} value_bytes={} row_vec_bytes={}",
+            std::mem::size_of::<Value>(),
+            std::mem::size_of::<Vec<Value>>()
+        );
+        for rows in [100_i64, 1_000, 4_000, 10_000] {
+            profile_guard_hash(rows, rows, rows, "equal");
+            profile_guard_hash(rows, rows, 10, "duplicates");
+            let small = (rows / 100).max(1);
+            profile_guard_hash(small, rows, small, "build_outer");
+            profile_guard_hash(rows, small, small, "build_inner");
+            profile_guard_index(rows, rows, rows, "equal");
+            profile_guard_index(rows, rows, 10, "duplicates");
+        }
+    }
+
+    fn profile_guard_hash(users: i64, orders: i64, user_mod: i64, shape: &str) {
+        let mut database = Database::new();
+        load_profile_join(&mut database, users, orders, user_mod);
+        profile_guard(
+            &mut database,
+            "HashJoin",
+            users,
+            orders,
+            user_mod,
+            shape,
+            false,
+        );
+    }
+
+    fn profile_guard_index(users: i64, orders: i64, user_mod: i64, shape: &str) {
+        let dir = crate::test_dir::TestDir::new("profile-m21");
+        let path = dir.join("db");
+        {
+            let mut database = Database::open(&path).unwrap();
+            load_profile_join(&mut database, users, orders, user_mod);
+        }
+        Database::migrate(&path).unwrap();
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE INDEX idx_orders_user ON orders (user_id);")
+            .unwrap();
+        let _force = ForceIndexJoin::new();
+        profile_guard(
+            &mut database,
+            "IndexNestedLoopJoin",
+            users,
+            orders,
+            user_mod,
+            shape,
+            true,
+        );
+    }
+
+    fn profile_guard(
+        database: &mut Database,
+        strategy: &str,
+        users: i64,
+        orders: i64,
+        user_mod: i64,
+        shape: &str,
+        index: bool,
+    ) {
+        let sql = "SELECT u.id, o.amount FROM users u JOIN orders o ON u.id = o.user_id;";
+        let explained = query(database, &format!("EXPLAIN {sql}"));
+        assert_eq!(
+            explained.rows[0][0],
+            Value::Text(strategy.to_string()),
+            "{shape} users={users} orders={orders}"
+        );
+        let (expect, hits) = guard_checksum(users, orders, user_mod);
+        let (cold, warm, checksum, returned) = time_agg(database, sql);
+        assert_eq!(checksum, expect, "{strategy} {shape}");
+        assert_eq!(returned, hits);
+        let (skip_cold, skip_warm, skip_checksum, _) = {
+            let _skip = SkipOnSchemaCheck::new();
+            time_agg(database, sql)
+        };
+        assert_eq!(skip_checksum, expect);
+        let build_inner = orders <= users;
+        let (groups, positions) = if index {
+            (0, 0)
+        } else if build_inner {
+            let groups = usize::try_from(user_mod.min(users).min(orders)).unwrap_or(usize::MAX);
+            (groups, usize::try_from(orders).unwrap_or(usize::MAX))
+        } else {
+            let groups = usize::try_from(users).unwrap_or(usize::MAX);
+            (groups, groups)
+        };
+        let bytes = if index {
+            0
+        } else {
+            hash_table_bytes(groups, positions)
+        };
+        let overhead = i128::from(warm as u64) - i128::from(skip_warm as u64);
+        println!(
+            "milestone21 strategy={strategy} shape={shape} users={users} orders={orders} hits={hits} groups={groups} positions={positions} hash_bytes={bytes} checksum={checksum} check_cold_us={cold} check_warm_us={warm} skip_cold_us={skip_cold} skip_warm_us={skip_warm} overhead_us={overhead}"
+        );
+    }
+
+    fn guard_checksum(users: i64, orders: i64, user_mod: i64) -> (i64, usize) {
+        let mut checksum = 0_i64;
+        let mut hits = 0_usize;
+        for id in 0..orders {
+            let user = id % user_mod;
+            if user >= users {
+                continue;
+            }
+            hits += 1;
+            checksum = checksum.wrapping_add(user);
+            if id % 2 == 1 {
+                checksum = checksum.wrapping_add(id % 5);
+            }
+        }
+        (checksum, hits)
     }
 }

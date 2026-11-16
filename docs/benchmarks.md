@@ -896,3 +896,38 @@ Release profile `profile_milestone20`, 15 Nov 2026. Apple M5, 17179869184 bytes 
 At 10,000 by 10,000, matched `COUNT(*)` is 1,308 µs warm on the hash path and 653,345 µs warm on the nested loop, 499.5×. It examines 10,000 key hits against 100,000,000 pairs and the checksum is 10,000. `COUNT(o.amount)` is 479.4×, `GROUP BY` name is 404.1×, and the four-aggregate query is 463.4×. The unmatched `COUNT(*)` is 920.9×: the hash probe finds no key, and each of the 10,000 null-extended rows still increments `COUNT(*)`. `COUNT(o.amount)` on that input checksums to 0. Square matched `COUNT(*)` speedups are 3.8×, 46.6×, 203.0×, and 499.5× at 100, 1,000, 4,000, and 10,000. The nested loop still examines every pair. A duplicate key that matches every left row still walks that bucket, so this is not a linear worst case.
 
 `where` on 100 by 4,000 feeds 0 logical rows. `COUNT(*)` returns one row whose checksum is 0, and `GROUP BY` returns no groups. Every user had an `ON` match, and `WHERE` removed those pairs without adding a null-extended row. `residual` on 4,000 by 4,000 keeps 1,999 matches and 2,001 null-extended rows, 4,000 aggregate inputs, and `COUNT(*)` is 416.5×. The hash table is unchanged from Milestone 19: the right table is the build side, and aggregation does not add a pair buffer. Checksums for square matched `COUNT(*)` are 100, 1,000, 4,000, and 10,000. Square matched `SUM`/`AVG`/`MIN`/`MAX` checksums are 5,150; 501,500; 8,006,000; and 50,015,000.
+
+## Milestone 21 INNER JOIN schema check
+
+Release profile `profile_milestone21`, 15 Nov 2026. Apple M5, 17179869184 bytes of memory, `rustc 1.100.0 (0ef1bc386 2026-11-09)`. `Value` is 32 bytes and a row vector header is 24 bytes. The statement is `SELECT u.id, o.amount FROM users u JOIN orders o ON u.id = o.user_id`. User ids are `0..users`. An order id `n` stores `user_id = n % user_mod` and `amount = NULL` when `n` is even, otherwise `n % 5`. `equal` uses `user_mod = users`. `duplicates` uses `user_mod = 10`. `build_outer` uses `users = rows / 100` and `orders = rows`, so the hash table is built from the outer table. `build_inner` uses `orders = rows / 100`. The index rows are the same data with `CREATE INDEX` on `orders(user_id)` and the test forcing the index probe.
+
+`check` is the production path, which walks each input once for row width and then once per `ON` column before hashing or probing. `skip` is the same binary with that walk disabled. Both returned the same checksum and the same row count. The checksum is an independent sum of the matched user id and the non-NULL amount. It is not taken from the hash table. Square `equal` checksums are 5,050; 500,500; 8,002,000; and 50,005,000. `hits` is that match count. `hash_bytes` is the existing position-and-group estimate for the hash table. It is not process RSS, and the schema walk does not add a pair buffer. The walk allocates the column-index list and the declared-type vectors. Overhead is `check` warm minus `skip` warm. A negative number means the checked sample was faster. That is ordinary timer noise, not a speedup from the extra walk.
+
+| Strategy | Shape | Users | Orders | Hits | Hash bytes | Check cold | Check warm | Skip cold | Skip warm | Overhead |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HashJoin | equal | 100 | 100 | 100 | 7,200 | 52 µs | 31 µs | 28 µs | 29 µs | 2 µs |
+| HashJoin | duplicates | 100 | 100 | 100 | 1,440 | 25 µs | 24 µs | 22 µs | 22 µs | 2 µs |
+| HashJoin | build_outer | 1 | 100 | 100 | 72 | 31 µs | 16 µs | 16 µs | 17 µs | -1 µs |
+| HashJoin | build_inner | 100 | 1 | 1 | 72 | 13 µs | 12 µs | 11 µs | 11 µs | 1 µs |
+| IndexNestedLoopJoin | equal | 100 | 100 | 100 | 0 | 226 µs | 117 µs | 110 µs | 111 µs | 6 µs |
+| IndexNestedLoopJoin | duplicates | 100 | 100 | 100 | 0 | 225 µs | 143 µs | 146 µs | 142 µs | 1 µs |
+| HashJoin | equal | 1,000 | 1,000 | 1,000 | 72,000 | 271 µs | 241 µs | 237 µs | 235 µs | 6 µs |
+| HashJoin | duplicates | 1,000 | 1,000 | 1,000 | 8,640 | 167 µs | 151 µs | 129 µs | 131 µs | 20 µs |
+| HashJoin | build_outer | 10 | 1,000 | 1,000 | 720 | 127 µs | 95 µs | 93 µs | 110 µs | -15 µs |
+| HashJoin | build_inner | 1,000 | 10 | 10 | 720 | 35 µs | 34 µs | 32 µs | 32 µs | 2 µs |
+| IndexNestedLoopJoin | equal | 1,000 | 1,000 | 1,000 | 0 | 1,624 µs | 1,232 µs | 1,129 µs | 992 µs | 240 µs |
+| IndexNestedLoopJoin | duplicates | 1,000 | 1,000 | 1,000 | 0 | 1,914 µs | 1,442 µs | 1,419 µs | 1,268 µs | 174 µs |
+| HashJoin | equal | 4,000 | 4,000 | 4,000 | 288,000 | 625 µs | 559 µs | 660 µs | 529 µs | 30 µs |
+| HashJoin | duplicates | 4,000 | 4,000 | 4,000 | 32,640 | 413 µs | 362 µs | 336 µs | 328 µs | 34 µs |
+| HashJoin | build_outer | 40 | 4,000 | 4,000 | 2,880 | 289 µs | 242 µs | 243 µs | 242 µs | 0 µs |
+| HashJoin | build_inner | 4,000 | 40 | 40 | 2,880 | 92 µs | 90 µs | 81 µs | 85 µs | 5 µs |
+| IndexNestedLoopJoin | equal | 4,000 | 4,000 | 4,000 | 0 | 4,205 µs | 3,160 µs | 2,920 µs | 2,912 µs | 248 µs |
+| IndexNestedLoopJoin | duplicates | 4,000 | 4,000 | 4,000 | 0 | 5,500 µs | 4,529 µs | 4,227 µs | 4,294 µs | 235 µs |
+| HashJoin | equal | 10,000 | 10,000 | 10,000 | 720,000 | 1,304 µs | 1,201 µs | 1,156 µs | 1,171 µs | 30 µs |
+| HashJoin | duplicates | 10,000 | 10,000 | 10,000 | 80,640 | 842 µs | 778 µs | 748 µs | 751 µs | 27 µs |
+| HashJoin | build_outer | 100 | 10,000 | 10,000 | 7,200 | 621 µs | 579 µs | 564 µs | 551 µs | 28 µs |
+| HashJoin | build_inner | 10,000 | 100 | 100 | 7,200 | 268 µs | 243 µs | 260 µs | 234 µs | 9 µs |
+| IndexNestedLoopJoin | equal | 10,000 | 10,000 | 10,000 | 0 | 9,994 µs | 7,837 µs | 7,817 µs | 7,835 µs | 2 µs |
+| IndexNestedLoopJoin | duplicates | 10,000 | 10,000 | 10,000 | 0 | 13,558 µs | 11,551 µs | 11,470 µs | 11,418 µs | 133 µs |
+
+On the 10,000 by 10,000 hash join the schema walk added 30 µs to a 1,201 µs warm run. The same shape's index probe differed by 2 µs. Several smaller shapes were faster with the walk enabled, including -15 µs on the 10 by 1,000 hash join. The 240 µs and 248 µs index gaps at 1,000 and 4,000 do not continue at 10,000, so they are not a stable cost of the walk. The hash table size is unchanged from the earlier estimate. Valid rows stay on the planned path.

@@ -8,7 +8,9 @@
 //! original `WHERE`. An `INNER JOIN` probes an integer index on the inner
 //! table when `ON` has a matching equality and the inner table is empty-probed
 //! or more than 64 times the outer table. Every other equality of two scalar
-//! columns builds an in-memory hash table on the smaller input.
+//! columns builds an in-memory hash table on the smaller input. A stored `ON`
+//! cell that is not NULL and not its declared type uses the nested loop for
+//! that execution. `EXPLAIN` still names the plan chosen from the schema.
 //! Other joins walk both tables in insertion order. A `SELECT` can `GROUP BY`
 //! columns of one table, one `INNER JOIN`, or one `LEFT JOIN` and compute
 //! `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`. `AVG` is an exact ratio and is not stored.
