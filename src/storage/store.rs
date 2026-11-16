@@ -104,6 +104,16 @@ impl Store {
         self.fence.clone()
     }
 
+    /// Remember an outcome that must not be treated as a confirmed rollback.
+    ///
+    /// The first fence wins. A later undo failure does not replace a commit
+    /// fence, and a commit fence is not cleared by rollback.
+    pub(crate) fn fence_with(&mut self, error: DbError) {
+        if self.fence.is_none() {
+            self.fence = Some(error);
+        }
+    }
+
     pub(crate) fn format_version(&self) -> u32 {
         self.state.version
     }

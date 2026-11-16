@@ -1210,3 +1210,49 @@ Updating every row at 100,000 is 208,142 µs selective and 211,072 µs full. Bot
 At 100 rows the warm times sit inside the WAL and neither path is consistently faster. At 1,000 rows a one-row update is 10,062 µs versus 11,852 µs, and the compare is 38 µs versus 660 µs. The gap is real and still smaller than one sync. At 10,000 rows the one-row update is 12,001 µs versus 18,855 µs. Updating every row at 10,000 is 29,110 µs versus 28,774 µs, the same 574,096 WAL bytes, so the full-table case does not get faster.
 
 The selective path reduces the rows decoded during publish and the bytes staged for the replacement. It does not reduce WAL bytes when the same pages are dirty, and it does not remove the pre-statement undo clone or the equality walk. An update of every row still rewrites those heap pages. Injected errors are not a power-loss test.
+
+## Milestone 27 selective UPDATE undo
+
+16 Nov 2026, Apple M5, 17179869184 bytes of memory, rustc 1.100.0. `Value` is 32 bytes and `Vec<Value>` is 24 bytes. The ignored test is `profile_milestone27`. It copies one database per size and runs three paths: the row journal, the Milestone 26 full-table undo snapshot, and the full-rewrite publish guard. The journal and the snapshot use the same selective publish. The rewrite guard is checked for the same affected-row count, checksum, WAL bytes, and page counts. It is not timed. Samples are 6 below 100,000 rows and 3 at 100,000. Cold is the first sample. Warm is the median of the rest. Rollback is one injected failure, not a median. Injected errors are not a power-loss test.
+
+`undo_bytes` is `entries * 8 + entries * columns * 32`. `snapshot_bytes` is that cell array for every heap row, plus `rows * 8` for the row-id vector and `rows * 24` for the per-row `Vec` headers. Neither figure is process RSS. Neither includes the heap bytes of a `TEXT` value or the row-id map. Allocation counts were not instrumented, and peak RSS was not measured. A zero-match update stores no journal entries. An update of every row stores one entry per row. On this schema the all-row journal is `rows * 136` bytes and the snapshot estimate is `rows * 160` bytes. The 2,400,000 byte gap at 100,000 rows is those `Vec` headers. The real snapshot also clones the position map, which this estimate leaves out.
+
+| Rows | Workload | Entries | Undo bytes | Snapshot bytes | WAL bytes | Heap | Index | Frames | Checksum |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100,000 | miss | 0 | 0 | 16,000,000 | 0 | 0 | 0 | 0 | 5,001,088,890 |
+| 100,000 | one | 1 | 136 | 16,000,000 | 8,296 | 1 | 0 | 2 | 5,001,088,889 |
+| 100,000 | ten | 10 | 1,360 | 16,000,000 | 8,296 | 1 | 0 | 2 | 5,001,088,880 |
+| 100,000 | duplicates | 10,000 | 1,360,000 | 16,000,000 | 5,768,796 | 1,406 | 0 | 1,407 | 5,001,040,001 |
+| 100,000 | key | 1 | 136 | 16,000,000 | 20,596 | 1 | 3 | 5 | 5,001,088,888 |
+| 100,000 | grow | 1 | 136 | 16,000,000 | 12,396 | 2 | 0 | 3 | 5,001,089,088 |
+| 100,000 | shrink | 1 | 136 | 16,000,000 | 8,296 | 1 | 0 | 2 | 5,001,088,889 |
+| 100,000 | relocate | 1 | 136 | 16,000,000 | 12,396 | 2 | 0 | 3 | 5,001,092,088 |
+| 100,000 | many | 100,000 | 13,600,000 | 16,000,000 | 5,772,896 | 1,407 | 0 | 1,408 | 5,000,600,000 |
+| 100,000 | noop | 1 | 136 | 16,000,000 | 0 | 0 | 0 | 0 | 5,001,088,890 |
+| 100,000 | rollback | 1 | 136 | 16,000,000 | 0 durable | 0 | 0 | 0 | 5,001,088,890 restored |
+
+The journal and the snapshot wrote the same WAL and the same heap and index pages on every workload, at every size. Checksums matched across the journal, the snapshot, and the full-rewrite guard. Rollback left the database file unchanged. Its encoded log was 8,264 bytes and was not synced. The checksum above is the 100,000-row database before that failed statement. The retry then matches the one-row update, checksum 5,001,088,889. The indexed-key update dirties fewer index pages on the smaller trees: 1 page at 100 rows (12,396 WAL bytes) and 2 pages at 1,000 and 10,000 (16,496 WAL bytes).
+
+Warm latency, journal then snapshot, in microseconds:
+
+| Rows | Workload | Journal | Snapshot | Undo capture | Snapshot clone | Discover | Validate | Stage | Apply |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100,000 | miss | 2,452 | 6,215 | 0 | 2,725 | 160 | 155 | 0 | 0 |
+| 100,000 | one | 14,943 | 20,115 | 0 | 2,329 | 151 | 146 | 0 | 0 |
+| 100,000 | ten | 15,815 | 17,366 | 3 | 2,332 | 909 | 0 | 0 | 1 |
+| 100,000 | duplicates | 153,223 | 155,685 | 782 | 2,691 | 1,227 | 287 | 1,150 | 499 |
+| 100,000 | key | 15,944 | 19,200 | 0 | 3,024 | 171 | 165 | 0 | 0 |
+| 100,000 | grow | 16,166 | 20,042 | 1 | 2,523 | 165 | 159 | 0 | 0 |
+| 100,000 | shrink | 16,027 | 20,070 | 0 | 2,618 | 273 | 159 | 0 | 0 |
+| 100,000 | relocate | 14,996 | 20,821 | 0 | 2,529 | 189 | 182 | 0 | 0 |
+| 100,000 | many | 211,227 | 207,646 | 5,975 | 2,668 | 6,499 | 0 | 0 | 4,203 |
+| 100,000 | noop | 3,335 | 7,110 | 1 | 2,334 | 521 | 511 | 0 | 0 |
+| 100,000 | rollback | 3,502 | 7,584 | 5 | 2,433 | 147 | 142 | 0 | 0 |
+
+Discover, validate, stage, apply, and the two capture times are the untimed statement. Rollback's total is that one sample. At 100,000 rows a miss is 2,452 µs with the journal and 6,215 µs with the snapshot. Both write 0 WAL bytes. The snapshot clone is 2,725 µs and the journal stores nothing. A no-op assignment is 3,335 µs versus 7,110 µs, again with 0 WAL bytes, and the journal is 136 bytes against a 16,000,000 byte snapshot estimate. The precommit failure is 3,502 µs versus 7,584 µs. A one-row name change is 14,943 µs versus 20,115 µs, and both logs are 8,296 bytes. The durable write did not get smaller. Ten rows stay on that same 8,296 byte log.
+
+Updating every row is 211,227 µs with the journal and 207,646 µs with the snapshot. Both dirty 1,407 heap pages and write 5,772,896 WAL bytes. Capturing 100,000 images took 5,975 µs. Cloning the table took 2,668 µs. The journal is smaller by the estimate above and slower to build, and the statement does not get faster. The 10,000 duplicate-key rows are 153,223 µs versus 155,685 µs with the same 5,768,796 WAL bytes. Growing a name onto another page and relocating a 3,200 character name both dirty 2 heap pages and write 12,396 WAL bytes. The indexed-key change writes 20,596 bytes and 3 index pages on both paths.
+
+At 100 rows the warm updates sit inside the WAL, about 10–12 ms, and neither undo path is consistently faster. A miss is 7 µs versus 11 µs. At 1,000 rows a miss is 45 µs versus 126 µs and a no-op is 43 µs versus 98 µs. A one-row update is 11,926 µs versus 11,027 µs, inside the noise of one sync. At 10,000 rows a miss is 165 µs versus 537 µs, a no-op is 250 µs versus 590 µs, and a one-row update is 10,978 µs versus 12,063 µs. Updating every row at 10,000 is 30,042 µs versus 29,847 µs with the same 574,096 WAL bytes.
+
+The journal removes the full-table clone from a selective `UPDATE` that does not match every row. It does not reduce WAL bytes when the same pages are dirty, and it does not remove the equality walk. An update of every row still journals the table and still rewrites those heap pages. `DELETE` and `INSERT` still snapshot the table. Peak RSS was not measured, so this run does not claim a smaller process.

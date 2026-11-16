@@ -33,8 +33,10 @@
 //! scan the heap. The index and the WAL change only inside the existing
 //! publish of that statement. An `UPDATE` publishes the matched rows through
 //! that commit and does not compare the other heap values. A larger record
-//! relocates with the existing page editor. The undo clone of the table still
-//! happens before the statement. `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,
+//! relocates with the existing page editor. Before that publish, the statement
+//! saves the previous images of the matched rows and restores them if the
+//! commit fails before the log sync. `INSERT` and `DELETE` still snapshot the
+//! table. `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,
 //! `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)` use the same per-group sets
 //! as a single table and ignore NULL, including a null-extended right column.
 //! `SELECT DISTINCT` keeps the first copy of each projected logical row,
