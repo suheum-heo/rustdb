@@ -808,6 +808,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Heap rows are schema-valid, so the index probe still runs. The nested
+    /// loop would return the matching names. A corrupt leaf must not be
+    /// replaced by that success.
+    #[test]
+    fn a_schema_valid_corrupt_index_is_not_replaced_by_the_nested_loop() {
+        let (dir, mut database) = joined_index("m21-keep-corrupt");
+        database
+            .patch_root_leaf_entry("idx_orders_user", 0, Some(30), None)
+            .unwrap();
+        let nested = {
+            let _force = crate::executor::ForceNestedJoin::new();
+            database
+                .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
+                .unwrap()
+        };
+        let crate::StatementResult::Query(nested) = &nested[0] else {
+            panic!("expected a query");
+        };
+        assert_eq!(nested.rows.len(), 3, "{:?}", nested.rows);
+        let error = {
+            let _force = crate::executor::ForceIndexJoin::new();
+            database
+                .execute("SELECT users.name FROM users JOIN orders ON users.id = orders.user_id;")
+                .unwrap_err()
+        };
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_join_probe_rejects_a_corrupt_index_page() {
         let (dir, mut database) = joined_index("bad-page");
