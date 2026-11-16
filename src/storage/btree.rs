@@ -57,6 +57,18 @@ pub(crate) trait Nodes {
     fn free_node(&mut self, id: u32) -> Result<(), DbError>;
 }
 
+fn alloc_page(store: &mut dyn Nodes) -> Result<u32, DbError> {
+    let id = store.alloc_node()?;
+    super::profile::note_page_alloc();
+    Ok(id)
+}
+
+fn free_page(store: &mut dyn Nodes, id: u32) -> Result<(), DbError> {
+    store.free_node(id)?;
+    super::profile::note_page_free();
+    Ok(())
+}
+
 #[derive(Clone)]
 struct Leaf {
     entries: Vec<Entry>,
@@ -103,7 +115,7 @@ pub(crate) fn insert(
     }
     let entry = (key, row_id);
     if root == 0 {
-        let id = store.alloc_node()?;
+        let id = alloc_page(store)?;
         let leaf = Leaf {
             entries: vec![entry],
             left: 0,
@@ -117,7 +129,7 @@ pub(crate) fn insert(
         Inserted::Split {
             separator, right, ..
         } => {
-            let id = store.alloc_node()?;
+            let id = alloc_page(store)?;
             let node = Internal {
                 keys: vec![separator],
                 children: vec![root, right],
@@ -139,35 +151,39 @@ pub(crate) fn delete(
     if root == 0 {
         return Err(missing());
     }
+    super::profile::note_descent();
     super::profile::note_index_single();
     match delete_at(store, root, (key, row_id), true, limits, 0)? {
         Removed::Empty => {
-            store.free_node(root)?;
+            free_page(store, root)?;
             Ok(0)
         }
         Removed::Present { .. } | Removed::Underfull { .. } => Ok(root),
         Removed::Collapsed { child, .. } => {
-            store.free_node(root)?;
+            free_page(store, root)?;
             Ok(child)
         }
     }
 }
 
-/// Delete `entries` in order. The final pages match calling [`delete`] once
-/// per entry.
+/// Delete `entries` in order.
 ///
-/// A run that sits in one leaf and leaves that leaf at or above its minimum is
-/// removed in one rewrite. The ancestors on that path are rewritten once, with
-/// the same separator a series of single deletes would finish on. A removal
-/// that would go under the minimum, borrow, or merge uses [`delete`], so the
-/// tree shape does not change. A missing pair returns the same error as
-/// [`delete`] and does not continue.
+/// A run that sits in one freshly decoded leaf and leaves that leaf at or
+/// above its minimum is removed in one rewrite. One posting, and any run that
+/// would not underflow, still uses [`delete`]. A run that would drop the leaf
+/// below its minimum is removed by repacking the sibling span that holds the
+/// verified prefix, then rebuilding internal pages over the surviving leaves.
+/// The prefix stops at the first missing or repeated pair, and that error is
+/// the same as [`delete`]. A test can force the grouped path for every run.
 pub(crate) fn delete_many(
     store: &mut dyn Nodes,
     mut root: u32,
     entries: &[Entry],
     limits: Limits,
 ) -> Result<u32, DbError> {
+    if grouped_only() {
+        return delete_grouped(store, root, entries, limits);
+    }
     let mut cursor = 0;
     while cursor < entries.len() {
         if root == 0 {
@@ -208,12 +224,696 @@ pub(crate) fn delete_many(
             super::profile::note_leaf_batch(u64::try_from(take).unwrap_or(u64::MAX));
             rewrite_leaf_path(store, &path, leaf_id, &removed, minimum_changed)?;
             cursor += take;
+        } else if run > room {
+            let (new_root, taken) =
+                bulk_rebalance(store, root, &entries[cursor..], leaf_id, run, limits)?;
+            if taken == 0 {
+                root = delete(store, root, entries[cursor].0, entries[cursor].1, limits)?;
+                cursor += 1;
+            } else {
+                root = new_root;
+                cursor += taken;
+            }
         } else {
             root = delete(store, root, entries[cursor].0, entries[cursor].1, limits)?;
             cursor += 1;
         }
     }
     Ok(root)
+}
+
+/// Milestone 30 deletion. A safe shared-leaf run is rewritten once. Every
+/// underflow still calls [`delete`].
+fn delete_grouped(
+    store: &mut dyn Nodes,
+    mut root: u32,
+    entries: &[Entry],
+    limits: Limits,
+) -> Result<u32, DbError> {
+    let mut cursor = 0;
+    while cursor < entries.len() {
+        if root == 0 {
+            return Err(missing());
+        }
+        let (path, leaf_id) = path_to_leaf(store, root, entries[cursor])?;
+        let leaf = decode_leaf(&store.read_node(leaf_id)?)?;
+        let mut claimed = vec![false; leaf.entries.len()];
+        let mut run = 0;
+        while cursor + run < entries.len() {
+            let wanted = entries[cursor + run];
+            let Some(slot) = leaf
+                .entries
+                .iter()
+                .enumerate()
+                .position(|(index, entry)| !claimed[index] && *entry == wanted)
+            else {
+                break;
+            };
+            claimed[slot] = true;
+            run += 1;
+        }
+        if run == 0 {
+            return Err(missing());
+        }
+        let is_root = leaf_id == root;
+        let keep = if is_root { 1 } else { limits.leaf_min.max(1) };
+        let room = leaf.entries.len().saturating_sub(keep);
+        let take = run.min(room);
+        if take >= 2 {
+            let old_first = leaf.entries[0];
+            let mut removed = leaf;
+            remove_leaf_entries(&mut removed, &entries[cursor..cursor + take])?;
+            let minimum_changed = removed.entries[0] != old_first;
+            super::profile::note_leaf_batch(u64::try_from(take).unwrap_or(u64::MAX));
+            rewrite_leaf_path(store, &path, leaf_id, &removed, minimum_changed)?;
+            cursor += take;
+        } else {
+            root = delete(store, root, entries[cursor].0, entries[cursor].1, limits)?;
+            cursor += 1;
+        }
+    }
+    Ok(root)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_GROUPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Use the Milestone 30 grouped delete for every run in this thread.
+#[cfg(test)]
+pub(crate) struct ForceGroupedDelete;
+
+#[cfg(test)]
+impl ForceGroupedDelete {
+    pub(crate) fn new() -> Self {
+        FORCE_GROUPED.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceGroupedDelete {
+    fn drop(&mut self) {
+        FORCE_GROUPED.with(|flag| flag.set(false));
+    }
+}
+
+fn grouped_only() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_GROUPED.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+struct Hit {
+    entry: Entry,
+    leaf: u32,
+}
+
+struct Loaded {
+    id: u32,
+    entries: Vec<Entry>,
+    left: u32,
+    right: u32,
+}
+
+/// Remove a verified prefix that would underflow, by repacking its leaf span.
+///
+/// `taken == 0` means the prefix has one posting. The caller uses [`delete`]
+/// and the tree is unchanged. A longer prefix is checked in request order and
+/// stops before a missing or repeated pair. The existing tree is validated
+/// before any page is written. A corrupt page, including one outside the
+/// deleted key range, returns the corrupt error and leaves the store as it
+/// was. The rebuilt tree uses the same leaf and internal page encodings.
+fn bulk_rebalance(
+    store: &mut dyn Nodes,
+    root: u32,
+    entries: &[Entry],
+    seed_leaf: u32,
+    seed_count: usize,
+    limits: Limits,
+) -> Result<(u32, usize), DbError> {
+    let hits = collect_hits(store, root, entries, seed_leaf, seed_count)?;
+    if hits.len() < 2 {
+        return Ok((root, 0));
+    }
+    let mut span = load_span(store, &hits)?;
+    let min_leaf = limits.leaf_min.max(1);
+    let mut took_left = false;
+    let mut took_right = false;
+    let survivors = loop {
+        let survivors = survivor_entries(&span, &hits)?;
+        let whole = span_covers_tree(&span);
+        if whole || survivors.len() >= min_leaf {
+            break survivors;
+        }
+        if !took_left && span[0].left != 0 {
+            absorb_neighbor(store, &mut span, true)?;
+            took_left = true;
+            continue;
+        }
+        if !took_right && span.last().is_some_and(|leaf| leaf.right != 0) {
+            absorb_neighbor(store, &mut span, false)?;
+            took_right = true;
+            continue;
+        }
+        return Err(corrupt(span[0].id));
+    };
+    let whole = span_covers_tree(&span);
+    // Reject a tree that is already corrupt before this rebuild writes a
+    // page. The walk visits every leaf and internal page, so a damaged page
+    // outside the deleted keys fails here. A one-posting delete does not.
+    validate(store, root, limits)?;
+    let old_height = height(store, root)?;
+    let old_internals = internal_ids(store, root)?;
+    let old_chain = leaf_chain(store, root)?;
+    let packed = pack_entries(&survivors, limits, whole)?;
+    let span_ids: HashSet<u32> = span.iter().map(|leaf| leaf.id).collect();
+    let mut prefix = Vec::new();
+    let mut suffix = Vec::new();
+    let mut seen_span = false;
+    let mut passed_span = false;
+    for leaf in &old_chain {
+        if span_ids.contains(&leaf.id) {
+            if passed_span {
+                return Err(corrupt(leaf.id));
+            }
+            seen_span = true;
+        } else if seen_span {
+            passed_span = true;
+            suffix.push((leaf.id, leaf.entries[0]));
+        } else {
+            prefix.push((leaf.id, leaf.entries[0]));
+        }
+    }
+    if !seen_span {
+        return Err(corrupt(root));
+    }
+    if packed.is_empty() && (!prefix.is_empty() || !suffix.is_empty()) {
+        return Err(DbError::Internal(
+            "bulk deletion emptied a span that is not the whole tree".to_string(),
+        ));
+    }
+    let old_ids: Vec<u32> = span.iter().map(|leaf| leaf.id).collect();
+    // Every replacement page is reserved before a leaf is rewritten. An id
+    // that is already in this tree, including a live page left on the free
+    // list, fails here and no leaf image is replaced.
+    let mut reserved: HashSet<u32> = old_chain.iter().map(|leaf| leaf.id).collect();
+    reserved.extend(old_internals.iter().copied());
+    let mut new_ids = Vec::with_capacity(packed.len());
+    for index in 0..packed.len() {
+        if index < old_ids.len() {
+            new_ids.push(old_ids[index]);
+        } else {
+            new_ids.push(alloc_fresh(store, &mut reserved)?);
+        }
+    }
+    let chain_len = prefix.len() + packed.len() + suffix.len();
+    let internal_count = internal_page_count(chain_len, limits)?;
+    let mut internal_pool = Vec::with_capacity(internal_count);
+    for _ in 0..internal_count {
+        internal_pool.push(alloc_fresh(store, &mut reserved)?);
+    }
+    let scratch = u64::try_from(hits.len() + survivors.len())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(16);
+    let merged = old_ids.len().saturating_sub(new_ids.len());
+    for (index, entries) in packed.iter().enumerate() {
+        let id = new_ids[index];
+        let left = if index == 0 {
+            prefix.last().map(|(id, _)| *id).unwrap_or(0)
+        } else {
+            new_ids[index - 1]
+        };
+        let right = if index + 1 == new_ids.len() {
+            suffix.first().map(|(id, _)| *id).unwrap_or(0)
+        } else {
+            new_ids[index + 1]
+        };
+        let leaf = Leaf {
+            entries: entries.clone(),
+            left,
+            right,
+        };
+        store.write_node(id, encode_leaf(id, &leaf)?)?;
+    }
+    if let Some(&(id, _)) = prefix.last() {
+        let mut leaf = decode_leaf(&store.read_node(id)?)?;
+        let right = new_ids
+            .first()
+            .copied()
+            .or_else(|| suffix.first().map(|(id, _)| *id))
+            .unwrap_or(0);
+        if leaf.right != right {
+            leaf.right = right;
+            store.write_node(id, encode_leaf(id, &leaf)?)?;
+        }
+    }
+    if let Some(&(id, _)) = suffix.first() {
+        let mut leaf = decode_leaf(&store.read_node(id)?)?;
+        let left = new_ids
+            .last()
+            .copied()
+            .or_else(|| prefix.last().map(|(id, _)| *id))
+            .unwrap_or(0);
+        if leaf.left != left {
+            leaf.left = left;
+            store.write_node(id, encode_leaf(id, &leaf)?)?;
+        }
+    }
+    let mut chain = prefix;
+    for (index, entries) in packed.iter().enumerate() {
+        chain.push((new_ids[index], entries[0]));
+    }
+    chain.extend(suffix);
+    let new_root = build_levels(store, &chain, limits, &internal_pool)?;
+    let new_height = height(store, new_root)?;
+    let new_internals = if new_root == 0 {
+        Vec::new()
+    } else {
+        internal_ids(store, new_root)?
+    };
+    let removed_internal = old_internals.len().saturating_sub(new_internals.len());
+    let mut live: HashSet<u32> = chain.iter().map(|(id, _)| *id).collect();
+    live.extend(new_internals.iter().copied());
+    let mut doomed = HashSet::new();
+    for id in old_ids.into_iter().skip(new_ids.len()).chain(old_internals) {
+        if live.contains(&id) || !doomed.insert(id) {
+            return Err(DbError::Internal(format!(
+                "bulk deletion tried to free page {id} twice"
+            )));
+        }
+        free_page(store, id)?;
+    }
+    validate(store, new_root, limits)
+        .map_err(|error| DbError::Internal(format!("rebuilt index failed validation: {error}")))?;
+    super::profile::note_scratch(scratch);
+    super::profile::note_bulk_span();
+    super::profile::note_leaf_redistribution();
+    if merged > 0 {
+        super::profile::note_leaf_merges(u64::try_from(merged).unwrap_or(u64::MAX));
+    }
+    if removed_internal > 0 {
+        super::profile::note_internal_merges(u64::try_from(removed_internal).unwrap_or(u64::MAX));
+    }
+    if new_height < old_height {
+        super::profile::note_root_contractions(u64::from(old_height - new_height));
+    }
+    Ok((new_root, hits.len()))
+}
+
+fn collect_hits(
+    store: &mut dyn Nodes,
+    root: u32,
+    entries: &[Entry],
+    seed_leaf: u32,
+    seed_count: usize,
+) -> Result<Vec<Hit>, DbError> {
+    let mut hits = Vec::new();
+    let mut claimed = HashSet::new();
+    for entry in entries.iter().copied().take(seed_count) {
+        if !claimed.insert(entry) {
+            break;
+        }
+        hits.push(Hit {
+            entry,
+            leaf: seed_leaf,
+        });
+    }
+    let mut index = hits.len();
+    while index < entries.len() {
+        let entry = entries[index];
+        if !claimed.insert(entry) {
+            break;
+        }
+        let (_path, leaf_id) = path_to_leaf(store, root, entry)?;
+        let leaf = decode_leaf(&store.read_node(leaf_id)?)?;
+        if !leaf.entries.contains(&entry) {
+            break;
+        }
+        hits.push(Hit {
+            entry,
+            leaf: leaf_id,
+        });
+        index += 1;
+    }
+    Ok(hits)
+}
+
+fn load_span(store: &mut dyn Nodes, hits: &[Hit]) -> Result<Vec<Loaded>, DbError> {
+    let min = hits
+        .iter()
+        .min_by(|left, right| cmp_entry(left.entry, right.entry))
+        .ok_or_else(|| corrupt(0))?;
+    let max = hits
+        .iter()
+        .max_by(|left, right| cmp_entry(left.entry, right.entry))
+        .ok_or_else(|| corrupt(0))?;
+    let mut span = Vec::new();
+    let mut seen = HashSet::new();
+    let mut id = min.leaf;
+    loop {
+        if !seen.insert(id) || span.len() > 1_000_000 {
+            return Err(corrupt(id));
+        }
+        let leaf = load_leaf(store, id)?;
+        let right = leaf.right;
+        span.push(leaf);
+        if id == max.leaf {
+            break;
+        }
+        if right == 0 {
+            return Err(corrupt(id));
+        }
+        id = right;
+    }
+    for hit in hits {
+        if !seen.contains(&hit.leaf) {
+            return Err(corrupt(hit.leaf));
+        }
+    }
+    for pair in span.windows(2) {
+        if pair[0].right != pair[1].id || pair[1].left != pair[0].id {
+            return Err(corrupt(pair[1].id));
+        }
+    }
+    Ok(span)
+}
+
+fn absorb_neighbor(
+    store: &mut dyn Nodes,
+    span: &mut Vec<Loaded>,
+    left_side: bool,
+) -> Result<(), DbError> {
+    let (id, edge) = if left_side {
+        (span[0].left, span[0].id)
+    } else {
+        let edge = span.last().ok_or_else(|| corrupt(0))?;
+        (edge.right, edge.id)
+    };
+    if id == 0 || span.iter().any(|leaf| leaf.id == id) {
+        return Err(corrupt(edge));
+    }
+    let leaf = load_leaf(store, id)?;
+    if left_side {
+        if leaf.right != edge {
+            return Err(corrupt(id));
+        }
+        span.insert(0, leaf);
+    } else {
+        if leaf.left != edge {
+            return Err(corrupt(id));
+        }
+        span.push(leaf);
+    }
+    Ok(())
+}
+
+fn span_covers_tree(span: &[Loaded]) -> bool {
+    span.first().is_some_and(|leaf| leaf.left == 0)
+        && span.last().is_some_and(|leaf| leaf.right == 0)
+}
+
+fn survivor_entries(span: &[Loaded], hits: &[Hit]) -> Result<Vec<Entry>, DbError> {
+    let mut need: HashSet<Entry> = hits.iter().map(|hit| hit.entry).collect();
+    let mut out = Vec::new();
+    for leaf in span {
+        for entry in &leaf.entries {
+            if need.remove(entry) {
+                continue;
+            }
+            out.push(*entry);
+        }
+    }
+    if need.is_empty() {
+        Ok(out)
+    } else {
+        Err(corrupt(span.first().map(|leaf| leaf.id).unwrap_or(0)))
+    }
+}
+
+fn pack_entries(
+    entries: &[Entry],
+    limits: Limits,
+    root_may_be_short: bool,
+) -> Result<Vec<Vec<Entry>>, DbError> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let max = limits.leaf_max;
+    let min = limits.leaf_min.max(1);
+    if max < min {
+        return Err(DbError::Internal(
+            "leaf occupancy limits are inverted".to_string(),
+        ));
+    }
+    if entries.len() <= max && (root_may_be_short || entries.len() >= min) {
+        return Ok(vec![entries.to_vec()]);
+    }
+    if entries.len() < min {
+        return Err(DbError::Internal(
+            "bulk deletion left a non-root leaf short of its minimum".to_string(),
+        ));
+    }
+    let mut count = entries.len().div_ceil(max);
+    let max_count = entries.len() / min;
+    if max_count == 0 {
+        return Err(DbError::Internal(
+            "bulk deletion cannot pack the surviving leaves".to_string(),
+        ));
+    }
+    count = count.min(max_count).max(1);
+    let base = entries.len() / count;
+    let extra = entries.len() % count;
+    if base < min || base > max || (extra > 0 && base + 1 > max) {
+        return Err(DbError::Internal(
+            "bulk deletion cannot pack the surviving leaves".to_string(),
+        ));
+    }
+    let mut packed = Vec::with_capacity(count);
+    let mut cursor = 0;
+    for index in 0..count {
+        let len = if index < extra { base + 1 } else { base };
+        packed.push(entries[cursor..cursor + len].to_vec());
+        cursor += len;
+    }
+    Ok(packed)
+}
+
+fn alloc_fresh(store: &mut dyn Nodes, reserved: &mut HashSet<u32>) -> Result<u32, DbError> {
+    let id = alloc_page(store)?;
+    if id == 0 || !reserved.insert(id) {
+        return Err(corrupt(id));
+    }
+    Ok(id)
+}
+
+fn build_levels(
+    store: &mut dyn Nodes,
+    leaves: &[(u32, Entry)],
+    limits: Limits,
+    pool: &[u32],
+) -> Result<u32, DbError> {
+    if leaves.is_empty() {
+        if pool.is_empty() {
+            return Ok(0);
+        }
+        return Err(DbError::Internal(
+            "bulk deletion reserved internal pages for an empty tree".to_string(),
+        ));
+    }
+    if leaves.len() == 1 {
+        if pool.is_empty() {
+            return Ok(leaves[0].0);
+        }
+        return Err(DbError::Internal(
+            "bulk deletion reserved internal pages for a root leaf".to_string(),
+        ));
+    }
+    let mut level = leaves.to_vec();
+    let mut cursor = 0;
+    loop {
+        let groups = pack_children(&level, limits)?;
+        let mut next = Vec::with_capacity(groups.len());
+        for group in groups {
+            let Some(id) = pool.get(cursor).copied() else {
+                return Err(DbError::Internal(
+                    "bulk deletion ran out of internal pages".to_string(),
+                ));
+            };
+            cursor += 1;
+            let keys: Vec<Entry> = group.iter().skip(1).map(|(_, minimum)| *minimum).collect();
+            let children: Vec<u32> = group.iter().map(|(id, _)| *id).collect();
+            let node = Internal { keys, children };
+            store.write_node(id, encode_internal(id, &node)?)?;
+            next.push((id, group[0].1));
+        }
+        if next.len() == 1 {
+            if cursor != pool.len() {
+                return Err(DbError::Internal(
+                    "bulk deletion reserved unused internal pages".to_string(),
+                ));
+            }
+            return Ok(next[0].0);
+        }
+        level = next;
+    }
+}
+
+fn internal_page_count(leaves: usize, limits: Limits) -> Result<usize, DbError> {
+    if leaves <= 1 {
+        return Ok(0);
+    }
+    let mut level = leaves;
+    let mut pages = 0;
+    loop {
+        let groups = child_group_count(level, limits)?;
+        pages += groups;
+        if groups == 1 {
+            return Ok(pages);
+        }
+        level = groups;
+        if pages > 1_000_000 {
+            return Err(DbError::Internal(
+                "bulk deletion internal fanout did not shrink".to_string(),
+            ));
+        }
+    }
+}
+
+fn child_group_count(children: usize, limits: Limits) -> Result<usize, DbError> {
+    let max_children = limits.internal_max.saturating_add(1);
+    let min_children = limits.internal_min.max(1).saturating_add(1);
+    if children < 2 || max_children < min_children {
+        return Err(DbError::Internal(
+            "bulk deletion cannot pack the internal level".to_string(),
+        ));
+    }
+    if children <= max_children {
+        return Ok(1);
+    }
+    let mut count = children.div_ceil(max_children);
+    let max_count = children / min_children;
+    if max_count == 0 {
+        return Err(DbError::Internal(
+            "bulk deletion cannot pack the internal level".to_string(),
+        ));
+    }
+    count = count.min(max_count).max(1);
+    let base = children / count;
+    let extra = children % count;
+    if base < min_children || base > max_children || (extra > 0 && base + 1 > max_children) {
+        return Err(DbError::Internal(
+            "bulk deletion cannot pack the internal level".to_string(),
+        ));
+    }
+    Ok(count)
+}
+
+fn pack_children(
+    children: &[(u32, Entry)],
+    limits: Limits,
+) -> Result<Vec<Vec<(u32, Entry)>>, DbError> {
+    let max_children = limits.internal_max.saturating_add(1);
+    let min_children = limits.internal_min.max(1).saturating_add(1);
+    if children.len() < 2 || max_children < min_children {
+        return Err(DbError::Internal(
+            "bulk deletion cannot pack the internal level".to_string(),
+        ));
+    }
+    if children.len() <= max_children {
+        return Ok(vec![children.to_vec()]);
+    }
+    let mut count = children.len().div_ceil(max_children);
+    let max_count = children.len() / min_children;
+    if max_count == 0 {
+        return Err(DbError::Internal(
+            "bulk deletion cannot pack the internal level".to_string(),
+        ));
+    }
+    count = count.min(max_count).max(1);
+    let base = children.len() / count;
+    let extra = children.len() % count;
+    if base < min_children || base > max_children || (extra > 0 && base + 1 > max_children) {
+        return Err(DbError::Internal(
+            "bulk deletion cannot pack the internal level".to_string(),
+        ));
+    }
+    let mut packed = Vec::with_capacity(count);
+    let mut cursor = 0;
+    for index in 0..count {
+        let len = if index < extra { base + 1 } else { base };
+        packed.push(children[cursor..cursor + len].to_vec());
+        cursor += len;
+    }
+    Ok(packed)
+}
+
+fn load_leaf(store: &mut dyn Nodes, id: u32) -> Result<Loaded, DbError> {
+    let leaf = decode_leaf(&store.read_node(id)?)?;
+    Ok(Loaded {
+        id,
+        entries: leaf.entries,
+        left: leaf.left,
+        right: leaf.right,
+    })
+}
+
+fn leaf_chain(store: &mut dyn Nodes, root: u32) -> Result<Vec<Loaded>, DbError> {
+    if root == 0 {
+        return Ok(Vec::new());
+    }
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    let mut id = leftmost_leaf(store, root)?;
+    let mut previous = 0;
+    while id != 0 {
+        if !seen.insert(id) || chain.len() > 1_000_000 {
+            return Err(corrupt(id));
+        }
+        let leaf = load_leaf(store, id)?;
+        if leaf.left != previous {
+            return Err(corrupt(id));
+        }
+        previous = id;
+        id = leaf.right;
+        chain.push(leaf);
+    }
+    Ok(chain)
+}
+
+fn internal_ids(store: &mut dyn Nodes, root: u32) -> Result<Vec<u32>, DbError> {
+    let mut ids = Vec::new();
+    if root != 0 {
+        collect_internal(store, root, &mut ids, 0)?;
+    }
+    Ok(ids)
+}
+
+fn collect_internal(
+    store: &mut dyn Nodes,
+    id: u32,
+    ids: &mut Vec<u32>,
+    depth: u32,
+) -> Result<(), DbError> {
+    if depth >= MAX_DEPTH || ids.contains(&id) {
+        return Err(corrupt(id));
+    }
+    let page = store.read_node(id)?;
+    if page_type(&page)? == TYPE_INDEX_LEAF {
+        return Ok(());
+    }
+    ids.push(id);
+    let node = decode_internal(&page)?;
+    for child in node.children {
+        collect_internal(store, child, ids, depth + 1)?;
+    }
+    Ok(())
 }
 
 /// Row ids for one integer key, in row-id order.
@@ -567,7 +1267,7 @@ fn insert_at(
             store.write_node(id, encode_leaf(id, &leaf)?)?;
             return Ok(Inserted::Fit { minimum });
         }
-        let right_id = store.alloc_node()?;
+        let right_id = alloc_page(store)?;
         let split_at = limits.leaf_max / 2;
         let right_entries = leaf.entries.split_off(split_at);
         let separator = right_entries[0];
@@ -637,7 +1337,7 @@ fn split_internal(
     let right_children = node.children.split_off(promote + 1);
     node.keys.pop();
     let left_min = subtree_min(store, node.children[0])?;
-    let right_id = store.alloc_node()?;
+    let right_id = alloc_page(store)?;
     let right = Internal {
         keys: right_keys,
         children: right_children,
@@ -785,7 +1485,7 @@ fn rebalance_leaf(
         parent.keys.remove(index);
         parent.children.remove(index + 1);
         store.write_node(id, encode_leaf(id, &leaf)?)?;
-        store.free_node(right_id)?;
+        free_page(store, right_id)?;
         return Ok(());
     }
     let left_id = parent.children[index - 1];
@@ -801,7 +1501,7 @@ fn rebalance_leaf(
     parent.keys.remove(index - 1);
     parent.children.remove(index);
     store.write_node(left_id, encode_leaf(left_id, &left)?)?;
-    store.free_node(id)?;
+    free_page(store, id)?;
     Ok(())
 }
 
@@ -848,7 +1548,7 @@ fn rebalance_internal(
         parent.keys.remove(index);
         parent.children.remove(index + 1);
         store.write_node(id, encode_internal(id, &node)?)?;
-        store.free_node(right_id)?;
+        free_page(store, right_id)?;
         return Ok(());
     }
     let left_id = parent.children[index - 1];
@@ -859,7 +1559,7 @@ fn rebalance_internal(
     parent.keys.remove(index - 1);
     parent.children.remove(index);
     store.write_node(left_id, encode_internal(left_id, &left)?)?;
-    store.free_node(id)?;
+    free_page(store, id)?;
     Ok(())
 }
 
@@ -868,6 +1568,7 @@ fn path_to_leaf(
     root: u32,
     probe: Entry,
 ) -> Result<(Vec<(u32, usize)>, u32), DbError> {
+    super::profile::note_descent();
     let mut path = Vec::new();
     let mut id = root;
     for _ in 0..MAX_DEPTH {
@@ -1233,6 +1934,7 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, HashMap};
 
+    #[derive(Clone)]
     struct Mem {
         pages: HashMap<u32, Page>,
         next: u32,
@@ -1692,12 +2394,12 @@ mod tests {
             single_root = delete(&mut single, single_root, entry.0, entry.1, limits).unwrap();
         }
         batched_root = delete_many(&mut batched, batched_root, &remove, limits).unwrap();
-        assert_eq!(single_root, batched_root);
-        assert_eq!(page_image(&single), page_image(&batched));
-        assert_eq!(single.free, batched.free);
         let single_entries = validate(&mut single, single_root, limits).unwrap();
         let batched_entries = validate(&mut batched, batched_root, limits).unwrap();
         assert_eq!(single_entries, batched_entries);
+        assert_eq!(single_entries, reference_delete(&entries, &remove).unwrap());
+        assert_pages(&mut batched, batched_root);
+        assert_pages(&mut single, single_root);
     }
 
     #[test]
@@ -1773,7 +2475,7 @@ mod tests {
         let mut guard = 0;
         while id != 0 {
             guard += 1;
-            assert!(guard < 64, "leaf chain");
+            assert!(guard < 1_000_000, "leaf chain");
             let leaf = decode_leaf(&store.read_node(id).unwrap()).unwrap();
             let next = leaf.right;
             runs.push(Run {
@@ -1797,36 +2499,95 @@ mod tests {
         Ok(root)
     }
 
-    /// Pages, the free list, and the validated entry list match one-at-a-time
-    /// deletion. A missing pair stops both sides on the same error and the
-    /// same pages.
+    /// Logical posting lists match one-at-a-time deletion, the Milestone 30
+    /// grouped delete, and a sorted vector that never calls the tree. A bulk
+    /// repack may use different pages. Both success paths must validate, and
+    /// the bulk free list must not overlap a live page or name a page twice.
     fn same_tree(limits: Limits, entries: &[Entry], remove: &[Entry]) {
+        let reference = reference_delete(entries, remove);
         let (mut single, single_root) = fill(limits, entries);
+        let (mut grouped, grouped_root) = fill(limits, entries);
         let (mut batched, batched_root) = fill(limits, entries);
         let single_result = drive(&mut single, single_root, remove, limits);
+        let grouped_result = delete_grouped(&mut grouped, grouped_root, remove, limits);
         let batched_result = delete_many(&mut batched, batched_root, remove, limits);
-        match (single_result, batched_result) {
-            (Ok(left), Ok(right)) => {
-                assert_eq!(left, right);
-                assert_eq!(page_image(&single), page_image(&batched));
-                assert_eq!(single.free, batched.free);
-                assert_eq!(
-                    height(&mut single, left).unwrap(),
-                    height(&mut batched, right).unwrap()
-                );
-                assert_eq!(
-                    validate(&mut single, left, limits).unwrap(),
-                    validate(&mut batched, right, limits).unwrap()
-                );
+        match (&single_result, &grouped_result, &batched_result, &reference) {
+            (Ok(left), Ok(middle), Ok(right), Ok(expect)) => {
+                let single_entries = validate(&mut single, *left, limits).unwrap();
+                let grouped_entries = validate(&mut grouped, *middle, limits).unwrap();
+                let batched_entries = validate(&mut batched, *right, limits).unwrap();
+                assert_eq!(single_entries, *expect);
+                assert_eq!(grouped_entries, *expect);
+                assert_eq!(batched_entries, *expect);
+                assert_pages(&mut batched, *right);
+                if let Some(absent) = absent_key(expect) {
+                    assert!(
+                        find_equal(&mut batched, *right, absent).unwrap().is_empty(),
+                        "{absent}"
+                    );
+                }
+                if let Some(key) = expect.first().map(|entry| entry.0) {
+                    let found = find_equal(&mut batched, *right, key).unwrap();
+                    let want: Vec<_> = expect
+                        .iter()
+                        .filter(|entry| entry.0 == key)
+                        .map(|entry| entry.1)
+                        .collect();
+                    assert_eq!(found, want);
+                }
             }
-            (Err(left), Err(right)) => {
+            (Err(left), Err(middle), Err(right), Err(expect)) => {
+                assert_eq!(left.to_string(), middle.to_string());
                 assert_eq!(left.to_string(), right.to_string());
-                assert_eq!(page_image(&single), page_image(&batched));
-                assert_eq!(single.free, batched.free);
+                assert!(right.to_string().contains(expect), "{right}");
             }
-            (Ok(_), Err(error)) => panic!("batch failed after single deletes succeeded: {error}"),
-            (Err(error), Ok(_)) => panic!("batch succeeded after single deletes failed: {error}"),
+            _ => panic!(
+                "outcomes diverged single={single_result:?} grouped={grouped_result:?} bulk={batched_result:?} reference={reference:?}"
+            ),
         }
+    }
+
+    /// Page bytes match one-at-a-time deletion. Used when the run cannot
+    /// underflow, so bulk repack does not run.
+    fn same_pages(limits: Limits, entries: &[Entry], remove: &[Entry]) {
+        let (mut single, single_root) = fill(limits, entries);
+        let (mut batched, batched_root) = fill(limits, entries);
+        let left = drive(&mut single, single_root, remove, limits).unwrap();
+        let right = delete_many(&mut batched, batched_root, remove, limits).unwrap();
+        assert_eq!(left, right);
+        assert_eq!(page_image(&single), page_image(&batched));
+        assert_eq!(single.free, batched.free);
+    }
+
+    fn reference_delete(entries: &[Entry], remove: &[Entry]) -> Result<Vec<Entry>, &'static str> {
+        let mut list = entries.to_vec();
+        list.sort_by(|left, right| cmp_entry(*left, *right));
+        for entry in remove {
+            match list.binary_search_by(|item| cmp_entry(*item, *entry)) {
+                Ok(index) => {
+                    list.remove(index);
+                }
+                Err(_) => return Err("index entry is missing"),
+            }
+        }
+        Ok(list)
+    }
+
+    fn absent_key(entries: &[Entry]) -> Option<i64> {
+        let mut keys: Vec<i64> = entries.iter().map(|entry| entry.0).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let mut candidate = i64::MIN;
+        for key in keys {
+            if candidate != key {
+                return Some(candidate);
+            }
+            if candidate == i64::MAX {
+                return None;
+            }
+            candidate += 1;
+        }
+        Some(candidate)
     }
 
     fn sequential(count: i64) -> Vec<Entry> {
@@ -1855,7 +2616,11 @@ mod tests {
         let keep = limits.leaf_min;
         let room = fat.entries.len() - keep;
         same_tree(limits, &entries, &fat.entries[..1]);
+        same_pages(limits, &entries, &fat.entries[..1]);
         same_tree(limits, &entries, &fat.entries[..room]);
+        if room >= 2 {
+            same_pages(limits, &entries, &fat.entries[..room]);
+        }
         same_tree(limits, &entries, &fat.entries[..room + 1]);
         if room >= 2 {
             same_tree(limits, &entries, &fat.entries[..room]);
@@ -1877,9 +2642,10 @@ mod tests {
         if room >= 2 {
             assert_eq!(profile.leaf_batches, u64::try_from(room).unwrap());
             assert_eq!(profile.index_singles, 1);
+            assert_eq!(profile.bulk_spans, 0);
         } else {
             assert_eq!(profile.leaf_batches, 0);
-            assert_eq!(profile.index_singles, u64::try_from(room + 1).unwrap());
+            assert!(profile.bulk_spans > 0 || profile.index_singles > 0);
         }
         let (mut after, root) = fill(limits, &entries);
         let root = delete_many(&mut after, root, &fat.entries[..room], limits).unwrap();
@@ -1957,7 +2723,12 @@ mod tests {
         assert!(fat.entries.len() > limits.leaf_min);
         let room = fat.entries.len() - limits.leaf_min;
         same_tree(limits, &wide, &fat.entries[..1]);
+        same_pages(limits, &wide, &fat.entries[..1]);
         same_tree(limits, &wide, &fat.entries[..room]);
+        if room >= 2 {
+            same_pages(limits, &wide, &fat.entries[..room]);
+            same_pages(limits, &wide, &fat.entries[..room + 1]);
+        }
         same_tree(limits, &wide, &fat.entries[..room + 1]);
         same_tree(limits, &wide, &[fat.entries[0]]);
         same_tree(limits, &wide, &[*fat.entries.last().unwrap()]);
@@ -2135,5 +2906,967 @@ mod tests {
         assert_eq!(batched.read_node(runs[0].id).unwrap().as_slice()[0], 0);
         let donor_leaf = decode_leaf(&batched.read_node(donor.id).unwrap()).unwrap();
         assert_eq!(donor_leaf.entries, donor.entries);
+    }
+
+    #[test]
+    fn bulk_rebalance_preserves_postings_occupancy_and_links() {
+        let limits = small();
+        let entries = sequential(40);
+        let (mut probe, root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut probe, root);
+        assert!(runs.len() >= 4, "leaves {}", runs.len());
+        assert!(height(&mut probe, root).unwrap() >= 2);
+        let tight: Vec<Entry> = runs
+            .iter()
+            .filter(|run| run.entries.len() == limits.leaf_min)
+            .take(3)
+            .flat_map(|run| run.entries.iter().copied())
+            .collect();
+        assert!(tight.len() >= limits.leaf_min * 2, "tight {}", tight.len());
+        same_tree(limits, &entries, &tight[..1]);
+        same_tree(limits, &entries, &tight[..2]);
+        same_tree(limits, &entries, &tight);
+        same_tree(limits, &entries, &runs[0].entries);
+        let mut consecutive = runs[0].entries.clone();
+        consecutive.extend(runs[1].entries.iter().copied());
+        consecutive.extend(runs[2].entries.iter().copied());
+        same_tree(limits, &entries, &consecutive);
+        same_tree(limits, &entries, &entries[..entries.len() - 1]);
+        same_tree(limits, &entries, &entries);
+        let duplicates: Vec<Entry> = (1..=24).map(|row| (3, row)).collect();
+        same_tree(limits, &duplicates, &duplicates[4..18]);
+        same_tree(limits, &duplicates, &duplicates);
+        let extremes = vec![
+            (i64::MIN, 1),
+            (i64::MIN, u64::MAX),
+            (-1, 2),
+            (0, 3),
+            (0, 4),
+            (1, 5),
+            (i64::MAX, 6),
+            (i64::MAX, 7),
+        ];
+        same_tree(limits, &extremes, &extremes[1..7]);
+        same_tree(limits, &extremes, &[extremes[0], extremes[3], extremes[7]]);
+
+        let _guard = crate::storage::profile::enable();
+        let (mut store, root) = fill(limits, &entries);
+        let before = height(&mut store, root).unwrap();
+        let root = delete_many(&mut store, root, &tight, limits).unwrap();
+        let profile = crate::storage::profile::take();
+        assert!(profile.bulk_spans > 0, "{profile:?}");
+        assert!(profile.descents > 0, "{profile:?}");
+        assert_eq!(profile.index_singles, 0, "{profile:?}");
+        let got = validate(&mut store, root, limits).unwrap();
+        let expect = reference_delete(&entries, &tight).unwrap();
+        assert_eq!(got, expect);
+        assert_pages(&mut store, root);
+        let after = height(&mut store, root).unwrap();
+        assert!(after <= before, "height {before} -> {after}");
+        let runs = leaf_runs(&mut store, root);
+        for run in &runs {
+            let root_leaf = runs.len() == 1;
+            if root_leaf {
+                assert!(!run.entries.is_empty());
+            } else {
+                assert!(
+                    (limits.leaf_min..=limits.leaf_max).contains(&run.entries.len()),
+                    "leaf {} len {}",
+                    run.id,
+                    run.entries.len()
+                );
+            }
+        }
+
+        let (mut store, root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut store, root);
+        let tight_run = runs
+            .iter()
+            .find(|run| run.entries.len() == limits.leaf_min)
+            .expect("minimum leaf");
+        let distant = runs
+            .iter()
+            .rev()
+            .find(|run| run.id != tight_run.id)
+            .expect("another leaf")
+            .id;
+        let mut page = store.read_node(distant).unwrap();
+        page.as_mut_slice()[0] = 0;
+        page.as_mut_slice()[1] = 0;
+        store.write_node(distant, page).unwrap();
+        let before = page_image(&store);
+        let remove = tight_run.entries.clone();
+        let error = delete_many(&mut store, root, &remove, limits).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(page_image(&store), before);
+        let (mut one, one_root) = fill(limits, &entries);
+        let one_runs = leaf_runs(&mut one, one_root);
+        let mut page = one.read_node(one_runs.last().unwrap().id).unwrap();
+        page.as_mut_slice()[0] = 0;
+        page.as_mut_slice()[1] = 0;
+        one.write_node(one_runs.last().unwrap().id, page).unwrap();
+        let victim = one_runs[0].entries[0];
+        let error = delete_many(&mut one, one_root, &[victim], limits);
+        assert!(error.is_ok() || error.unwrap_err().to_string().contains("corrupt"));
+
+        let mut missing = tight[..2].to_vec();
+        missing.push((99, 99));
+        same_tree(limits, &entries, &missing);
+    }
+
+    fn kept_window(entries: &[Entry], keep: usize) -> Vec<Entry> {
+        let start = (entries.len() - keep) / 2;
+        entries[start..start + keep].to_vec()
+    }
+
+    fn without(entries: &[Entry], keep: &[Entry]) -> Vec<Entry> {
+        let kept: HashSet<Entry> = keep.iter().copied().collect();
+        entries
+            .iter()
+            .copied()
+            .filter(|entry| !kept.contains(entry))
+            .collect()
+    }
+
+    /// Delete a key-ordered set that starts in a minimum leaf and reaches both
+    /// ends, so the span is the whole tree.
+    fn rebuild_keep(limits: Limits, total: i64, keep: usize) -> (Mem, u32, Vec<Entry>) {
+        let entries = sequential(total);
+        assert!(keep < entries.len());
+        let kept = if keep == 0 {
+            Vec::new()
+        } else {
+            kept_window(&entries, keep)
+        };
+        let remove = without(&entries, &kept);
+        assert_eq!(remove.first().map(|entry| entry.0), Some(1));
+        assert_eq!(remove.last().map(|entry| entry.0), Some(total));
+        let (mut store, root) = fill(limits, &entries);
+        let root = delete_many(&mut store, root, &remove, limits).unwrap();
+        (store, root, kept)
+    }
+
+    fn assert_built(store: &mut Mem, root: u32, limits: Limits, expect: &[Entry]) {
+        if root == 0 {
+            assert!(expect.is_empty());
+            assert!(store.pages.is_empty());
+            assert_pages(store, root);
+            assert_eq!(height(store, root).unwrap(), 0);
+            return;
+        }
+        let got = validate(store, root, limits).unwrap();
+        assert_eq!(got, expect);
+        assert_pages(store, root);
+        let runs = leaf_runs(store, root);
+        assert!(!runs.is_empty());
+        let mut previous = 0;
+        let mut flat = Vec::new();
+        let mut leaf_ids = HashSet::new();
+        for (index, run) in runs.iter().enumerate() {
+            assert!(leaf_ids.insert(run.id), "leaf {} twice", run.id);
+            let page = store.read_node(run.id).unwrap();
+            assert_eq!(read_u32(page.as_slice(), OFF_ID), run.id);
+            assert_eq!(page_type(&page).unwrap(), TYPE_INDEX_LEAF);
+            let leaf = decode_leaf(&page).unwrap();
+            assert_eq!(leaf.left, previous, "left sibling of {}", run.id);
+            let right = if index + 1 == runs.len() {
+                0
+            } else {
+                runs[index + 1].id
+            };
+            assert_eq!(leaf.right, right, "right sibling of {}", run.id);
+            assert!(
+                leaf.entries.len() <= limits.leaf_max,
+                "leaf {} len {}",
+                run.id,
+                leaf.entries.len()
+            );
+            if runs.len() == 1 {
+                assert!(!leaf.entries.is_empty());
+                assert_eq!(root, run.id);
+            } else {
+                assert!(
+                    leaf.entries.len() >= limits.leaf_min,
+                    "leaf {} len {}",
+                    run.id,
+                    leaf.entries.len()
+                );
+            }
+            flat.extend(leaf.entries);
+            previous = run.id;
+        }
+        assert_eq!(flat, expect);
+        let mut seen = HashSet::new();
+        let mut child_refs = HashSet::new();
+        let depth = walk_internals(store, root, true, limits, &mut seen, &mut child_refs);
+        assert_eq!(height(store, root).unwrap(), depth);
+        for run in &runs {
+            assert!(seen.contains(&run.id), "leaf {} is unreachable", run.id);
+        }
+        assert!(store.free.iter().all(|id| !seen.contains(id)));
+        assert!(store.free.iter().all(|id| *id != root));
+    }
+
+    fn walk_internals(
+        store: &mut Mem,
+        id: u32,
+        is_root: bool,
+        limits: Limits,
+        seen: &mut HashSet<u32>,
+        child_refs: &mut HashSet<u32>,
+    ) -> u32 {
+        assert!(seen.insert(id), "page {id} is reachable twice");
+        let page = store.read_node(id).unwrap();
+        assert_eq!(read_u32(page.as_slice(), OFF_ID), id);
+        if page_type(&page).unwrap() == TYPE_INDEX_LEAF {
+            return 1;
+        }
+        let node = decode_internal(&page).unwrap();
+        assert!(!node.keys.is_empty(), "internal {id} has no separator");
+        assert_eq!(node.children.len(), node.keys.len() + 1);
+        assert!(node.keys.len() <= limits.internal_max);
+        if is_root {
+            assert!(
+                node.children.len() >= 2,
+                "root {id} has {} children",
+                node.children.len()
+            );
+        } else {
+            assert!(
+                node.keys.len() >= limits.internal_min,
+                "internal {id} has {} separators",
+                node.keys.len()
+            );
+        }
+        for pair in node.keys.windows(2) {
+            assert!(cmp_entry(pair[0], pair[1]) == std::cmp::Ordering::Less);
+        }
+        let mut depth = 0;
+        for (index, child) in node.children.iter().copied().enumerate() {
+            assert!(
+                child_refs.insert(child),
+                "child {child} is referenced twice"
+            );
+            assert_ne!(child, id);
+            assert!(store.pages.contains_key(&child), "child {child} is missing");
+            let child_depth = walk_internals(store, child, false, limits, seen, child_refs);
+            if index == 0 {
+                depth = child_depth;
+            } else {
+                assert_eq!(child_depth, depth);
+                let minimum = leaf_minimum(store, child);
+                assert_eq!(node.keys[index - 1], minimum, "separator of child {child}");
+            }
+        }
+        depth + 1
+    }
+
+    fn leaf_minimum(store: &mut Mem, mut id: u32) -> Entry {
+        for _ in 0..64 {
+            let page = store.read_node(id).unwrap();
+            if page_type(&page).unwrap() == TYPE_INDEX_LEAF {
+                return decode_leaf(&page).unwrap().entries[0];
+            }
+            id = decode_internal(&page).unwrap().children[0];
+        }
+        panic!("child chain");
+    }
+
+    fn lengths_of(store: &mut Mem, root: u32) -> Vec<usize> {
+        leaf_runs(store, root)
+            .iter()
+            .map(|run| run.entries.len())
+            .collect()
+    }
+
+    #[test]
+    fn bulk_leaf_occupancy_hits_every_boundary() {
+        let limits = small();
+        let entries = sequential(40);
+        let (mut probe, root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut probe, root);
+        assert!(runs.len() >= 8, "leaves {}", runs.len());
+        assert!(runs.iter().any(|run| run.entries.len() == limits.leaf_min));
+        let one = runs
+            .iter()
+            .find(|run| run.entries.len() == limits.leaf_min && run.id != runs[0].id)
+            .expect("middle minimum leaf");
+        let one_pos = runs.iter().position(|run| run.id == one.id).unwrap();
+        assert!(one_pos + 1 < runs.len());
+        same_tree(limits, &entries, &one.entries);
+        let (mut store, root) = fill(limits, &entries);
+        let root = delete_many(&mut store, root, &one.entries, limits).unwrap();
+        assert_built(
+            &mut store,
+            root,
+            limits,
+            &reference_delete(&entries, &one.entries).unwrap(),
+        );
+
+        let two = {
+            let mut keys = runs[one_pos].entries.clone();
+            keys.extend(runs[one_pos + 1].entries.iter().copied());
+            keys
+        };
+        same_tree(limits, &entries, &two);
+        let (mut store, root) = fill(limits, &entries);
+        let root = delete_many(&mut store, root, &two, limits).unwrap();
+        assert_built(
+            &mut store,
+            root,
+            limits,
+            &reference_delete(&entries, &two).unwrap(),
+        );
+
+        let three = {
+            let start = runs
+                .windows(3)
+                .position(|group| group.iter().all(|run| run.entries.len() == limits.leaf_min))
+                .expect("three minimum leaves");
+            let mut keys = Vec::new();
+            for run in &runs[start..start + 3] {
+                keys.extend(run.entries.iter().copied());
+            }
+            keys
+        };
+        let (mut store, root) = fill(limits, &entries);
+        let root = delete_many(&mut store, root, &three, limits).unwrap();
+        assert_built(
+            &mut store,
+            root,
+            limits,
+            &reference_delete(&entries, &three).unwrap(),
+        );
+        assert!(
+            lengths_of(&mut store, root)
+                .iter()
+                .all(|len| { *len >= limits.leaf_min && *len <= limits.leaf_max })
+        );
+
+        assert_eq!(runs[0].entries.len(), limits.leaf_min);
+        let (mut store, root) = fill(limits, &entries);
+        let root = delete_many(&mut store, root, &runs[0].entries, limits).unwrap();
+        assert_built(
+            &mut store,
+            root,
+            limits,
+            &reference_delete(&entries, &runs[0].entries).unwrap(),
+        );
+
+        let mut model = entries.clone();
+        let (mut store, mut root) = fill(limits, &entries);
+        loop {
+            let last = leaf_runs(&mut store, root).last().unwrap().entries.clone();
+            if last.len() == limits.leaf_min {
+                root = delete_many(&mut store, root, &last, limits).unwrap();
+                for entry in &last {
+                    model.retain(|kept| kept != entry);
+                }
+                assert_built(&mut store, root, limits, &model);
+                break;
+            }
+            let victim = *last.last().unwrap();
+            root = delete(&mut store, root, victim.0, victim.1, limits).unwrap();
+            model.retain(|kept| *kept != victim);
+        }
+
+        let (mut store, root, _) = rebuild_keep(limits, 40, 9);
+        assert_eq!(lengths_of(&mut store, root), vec![3, 3, 3]);
+        assert_built(&mut store, root, limits, &kept_window(&sequential(40), 9));
+
+        let cases = [
+            (1_usize, vec![1_usize]),
+            (2, vec![2]),
+            (3, vec![3]),
+            (4, vec![4]),
+            (5, vec![3, 2]),
+            (6, vec![3, 3]),
+            (7, vec![4, 3]),
+            (8, vec![4, 4]),
+            (10, vec![4, 3, 3]),
+        ];
+        for (keep, lengths) in cases {
+            let (mut store, root, kept) = rebuild_keep(limits, 40, keep);
+            assert_eq!(lengths_of(&mut store, root), lengths, "keep {keep}");
+            assert_built(&mut store, root, limits, &kept);
+            if lengths.len() == 1 {
+                assert_eq!(height(&mut store, root).unwrap(), 1);
+                assert_eq!(root, leaf_runs(&mut store, root)[0].id);
+            }
+        }
+        let (mut store, root, _) = rebuild_keep(limits, 40, 0);
+        assert_built(&mut store, root, limits, &[]);
+
+        let limits = production();
+        let production_cases = [
+            (126_usize, vec![126_usize]),
+            (127, vec![127]),
+            (128, vec![128]),
+            (253, vec![253]),
+            (254, vec![254]),
+            (255, vec![128, 127]),
+            (381, vec![191, 190]),
+            (634, vec![212, 211, 211]),
+        ];
+        for (keep, lengths) in production_cases {
+            let (mut store, root, kept) = rebuild_keep(limits, 700, keep);
+            assert_eq!(lengths_of(&mut store, root), lengths, "keep {keep}");
+            assert_built(&mut store, root, limits, &kept);
+            let root_leaf = lengths.len() == 1;
+            for len in &lengths {
+                assert!(*len <= limits.leaf_max);
+                if root_leaf {
+                    assert!(*len >= 1);
+                } else {
+                    assert!(*len >= limits.leaf_min, "{len}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_internal_rebuild_covers_fanout_and_height() {
+        let limits = small();
+        let (mut store, root, kept) = rebuild_keep(limits, 48, 5);
+        assert_eq!(lengths_of(&mut store, root), vec![3, 2]);
+        assert_eq!(height(&mut store, root).unwrap(), 2);
+        let node = decode_internal(&store.read_node(root).unwrap()).unwrap();
+        assert_eq!(node.children.len(), 2);
+        assert_eq!(node.keys.len(), 1);
+        assert!(node.keys.len() < limits.internal_min);
+        assert_built(&mut store, root, limits, &kept);
+
+        let (mut store, root, kept) = rebuild_keep(limits, 48, 24);
+        assert_eq!(lengths_of(&mut store, root), vec![4, 4, 4, 4, 4, 4]);
+        assert_eq!(height(&mut store, root).unwrap(), 2);
+        let node = decode_internal(&store.read_node(root).unwrap()).unwrap();
+        assert_eq!(node.children.len(), 6);
+        assert_eq!(node.keys.len(), limits.internal_max);
+        assert_built(&mut store, root, limits, &kept);
+
+        let (mut store, root, kept) = rebuild_keep(limits, 48, 25);
+        assert_eq!(lengths_of(&mut store, root), vec![4, 4, 4, 4, 3, 3, 3]);
+        assert_eq!(height(&mut store, root).unwrap(), 3);
+        let root_node = decode_internal(&store.read_node(root).unwrap()).unwrap();
+        assert_eq!(root_node.children.len(), 2);
+        let mut child_fanout = Vec::new();
+        for child in &root_node.children {
+            let node = decode_internal(&store.read_node(*child).unwrap()).unwrap();
+            child_fanout.push(node.children.len());
+            assert!(node.keys.len() >= limits.internal_min);
+        }
+        assert_eq!(child_fanout, vec![4, 3]);
+        assert_built(&mut store, root, limits, &kept);
+        let old_internal: HashSet<u32> = internal_ids(&mut store, root)
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        let runs = leaf_runs(&mut store, root);
+        assert_eq!(runs.last().unwrap().entries.len(), 3);
+        let mut remove = runs.last().unwrap().entries[..2].to_vec();
+        remove.push(runs[0].entries[0]);
+        let _guard = crate::storage::profile::enable();
+        let root = delete_many(&mut store, root, &remove, limits).unwrap();
+        let profile = crate::storage::profile::take();
+        assert!(profile.root_contractions >= 1, "{profile:?}");
+        assert!(profile.bulk_spans >= 1, "{profile:?}");
+        let expect = reference_delete(&kept, &remove).unwrap();
+        assert_eq!(height(&mut store, root).unwrap(), 2);
+        assert_eq!(internal_ids(&mut store, root).unwrap().len(), 1);
+        assert_built(&mut store, root, limits, &expect);
+        assert!(old_internal.iter().all(|id| !store.pages.contains_key(id)));
+
+        let runs = leaf_runs(&mut store, root);
+        let short = runs
+            .iter()
+            .find(|run| run.entries.len() < limits.leaf_min + 2)
+            .expect("tight leaf");
+        let mut rest = short.entries.clone();
+        for run in &runs {
+            for entry in &run.entries {
+                if !rest.contains(entry) {
+                    rest.push(*entry);
+                }
+            }
+        }
+        let root = delete_many(&mut store, root, &rest, limits).unwrap();
+        assert_built(&mut store, root, limits, &[]);
+        assert!(!store.free.is_empty());
+
+        let (mut store, root, kept) = rebuild_keep(limits, 48, 4);
+        assert_eq!(lengths_of(&mut store, root), vec![4]);
+        assert_eq!(height(&mut store, root).unwrap(), 1);
+        assert_built(&mut store, root, limits, &kept);
+
+        let (mut wide, wide_root) = fill(production(), &sequential(52_000));
+        let tall = height(&mut wide, wide_root).unwrap();
+        assert!(tall >= 3, "height {tall}");
+        let first = leaf_runs(&mut wide, wide_root)[0].entries.clone();
+        assert_eq!(first.len(), production().leaf_min);
+        let root = delete_many(&mut wide, wide_root, &first, production()).unwrap();
+        let expect = reference_delete(&sequential(52_000), &first).unwrap();
+        assert_built(&mut wide, root, production(), &expect);
+        assert!(height(&mut wide, root).unwrap() >= 3);
+        let internals = internal_ids(&mut wide, root).unwrap();
+        assert!(internals.len() >= 2, "internals {}", internals.len());
+        for id in &internals {
+            if *id == root {
+                continue;
+            }
+            let node = decode_internal(&wide.read_node(*id).unwrap()).unwrap();
+            assert!(node.keys.len() >= production().internal_min);
+            assert!(node.keys.len() <= production().internal_max);
+        }
+        let before_pages = wide.pages.len();
+        let remove: Vec<Entry> = (expect[0].0..=40_000)
+            .map(|key| (key, key as u64))
+            .collect();
+        let root = delete_many(&mut wide, root, &remove, production()).unwrap();
+        let expect = reference_delete(&expect, &remove).unwrap();
+        assert_built(&mut wide, root, production(), &expect);
+        assert!(height(&mut wide, root).unwrap() < tall);
+        assert!(wide.pages.len() < before_pages);
+        let remaining = expect.clone();
+        let root = delete_many(&mut wide, root, &remaining, production()).unwrap();
+        assert_built(&mut wide, root, production(), &[]);
+        let freed = wide.free.clone();
+        let next = wide.next;
+        let mut root = 0;
+        for key in 1..=40 {
+            root = insert(&mut wide, root, key, key as u64, production()).unwrap();
+        }
+        assert_eq!(wide.next, next);
+        assert!(freed.iter().any(|id| wide.pages.contains_key(id)));
+        assert_built(
+            &mut wide,
+            root,
+            production(),
+            &(1..=40).map(|key| (key, key as u64)).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn bulk_reuses_pages_and_keeps_the_free_list_disjoint() {
+        let limits = small();
+        let entries = sequential(36);
+        let (mut store, mut root) = fill(limits, &entries);
+        let mut model = entries.clone();
+        let mut high = store.next;
+        for cycle in 0..5 {
+            let runs = leaf_runs(&mut store, root);
+            let mut remove = runs[0].entries.clone();
+            remove.extend(runs[1].entries.iter().copied());
+            let old_internal = internal_ids(&mut store, root).unwrap();
+            root = delete_many(&mut store, root, &remove, limits).unwrap();
+            for entry in &remove {
+                model.retain(|kept| kept != entry);
+            }
+            assert_built(&mut store, root, limits, &model);
+            assert!(
+                old_internal
+                    .iter()
+                    .all(|id| !store.pages.contains_key(id) && store.free.contains(id))
+            );
+            let reused = store.free.clone();
+            assert!(!reused.is_empty());
+            for entry in &remove {
+                root = insert(&mut store, root, entry.0, entry.1, limits).unwrap();
+                model.push(*entry);
+            }
+            model.sort_by(|left, right| cmp_entry(*left, *right));
+            assert_built(&mut store, root, limits, &model);
+            assert!(reused.iter().any(|id| store.pages.contains_key(id)));
+            if cycle == 0 {
+                high = store.next;
+            } else {
+                assert_eq!(store.next, high);
+            }
+        }
+        let ceiling = store.next;
+        for _ in 0..3 {
+            let runs = leaf_runs(&mut store, root);
+            let remove = runs[0].entries.clone();
+            root = delete_many(&mut store, root, &remove, limits).unwrap();
+            for entry in &remove {
+                root = insert(&mut store, root, entry.0, entry.1, limits).unwrap();
+            }
+            assert_built(&mut store, root, limits, &model);
+        }
+        assert_eq!(store.next, ceiling);
+
+        let (mut store, root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut store, root);
+        let live = runs[0].id;
+        let victim = runs
+            .iter()
+            .find(|run| run.entries.len() == limits.leaf_min && run.id != live)
+            .expect("minimum leaf")
+            .entries
+            .clone();
+        let before = page_image(&store);
+        store.free.push(live);
+        let error = delete_many(&mut store, root, &victim, limits).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(page_image(&store), before);
+
+        let (mut store, root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut store, root);
+        let victim = runs
+            .iter()
+            .find(|run| run.entries.len() == limits.leaf_min)
+            .expect("minimum leaf")
+            .entries
+            .clone();
+        let before = page_image(&store);
+        store.free.push(90_000);
+        store.free.push(90_000);
+        let error = delete_many(&mut store, root, &victim, limits).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(page_image(&store), before);
+    }
+
+    #[test]
+    fn bulk_rejects_preexisting_corruption_without_writing() {
+        let limits = small();
+        let entries = sequential(24);
+        let (mut probe, root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut probe, root);
+        let tight = runs
+            .iter()
+            .find(|run| run.entries.len() == limits.leaf_min)
+            .unwrap()
+            .entries
+            .clone();
+
+        let mut missing = tight.clone();
+        missing.insert(0, (99, 99));
+        let (mut store, root) = fill(limits, &entries);
+        let before = page_image(&store);
+        let error = delete_many(&mut store, root, &missing, limits).unwrap_err();
+        assert!(
+            error.to_string().contains("index entry is missing"),
+            "{error}"
+        );
+        assert_eq!(page_image(&store), before);
+
+        let (mut store, root) = fill(limits, &entries);
+        let mut page = store.read_node(runs[0].id).unwrap();
+        page.as_mut_slice()[0] = 0;
+        store.write_node(runs[0].id, page).unwrap();
+        let before = page_image(&store);
+        let error = delete_many(&mut store, root, &tight, limits).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(page_image(&store), before);
+        let (mut one, one_root) = fill(limits, &entries);
+        let one_runs = leaf_runs(&mut one, one_root);
+        let mut page = one.read_node(one_runs[0].id).unwrap();
+        page.as_mut_slice()[0] = 0;
+        one.write_node(one_runs[0].id, page).unwrap();
+        let victim = *one_runs.last().unwrap().entries.last().unwrap();
+        let single = delete_many(&mut one, one_root, &[victim], limits);
+        assert!(single.is_ok() || single.unwrap_err().to_string().contains("corrupt"));
+
+        let (mut store, root) = fill(limits, &entries);
+        let right = runs.last().unwrap().id;
+        let mut page = store.read_node(right).unwrap();
+        page.as_mut_slice()[0] = 0;
+        store.write_node(right, page).unwrap();
+        let before = page_image(&store);
+        let error = delete_many(&mut store, root, &tight, limits).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(page_image(&store), before);
+
+        let (mut store, root) = fill(limits, &entries);
+        let mut page = store.read_node(runs[1].id).unwrap();
+        crate::storage::page::set_next_page(&mut page, 999);
+        store.write_node(runs[1].id, page).unwrap();
+        let before = page_image(&store);
+        let error = delete_many(&mut store, root, &tight, limits).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(page_image(&store), before);
+
+        let (mut store, root) = fill(limits, &entries);
+        let mut node = decode_internal(&store.read_node(root).unwrap()).unwrap();
+        node.children[0] = 999;
+        store
+            .write_node(root, encode_internal(root, &node).unwrap())
+            .unwrap();
+        let before = page_image(&store);
+        let error = delete_many(&mut store, root, &tight, limits).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(page_image(&store), before);
+
+        let (mut store, root) = fill(limits, &entries);
+        let mut node = decode_internal(&store.read_node(root).unwrap()).unwrap();
+        // A separator above every probe still routes the leftmost leaf to the
+        // left child. The whole-tree check then rejects the separator. A probe
+        // that the separator sends to the wrong child stops as a missing entry
+        // before that walk, which is why i64::MIN is not used here.
+        node.keys[0] = (i64::MAX, 0);
+        store
+            .write_node(root, encode_internal(root, &node).unwrap())
+            .unwrap();
+        let before = page_image(&store);
+        let error = delete_many(&mut store, root, &runs[0].entries, limits).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(page_image(&store), before);
+
+        let (mut store, root) = fill(limits, &entries);
+        let mut page = store.read_node(root).unwrap();
+        page.as_mut_slice()[0] = 0;
+        store.write_node(root, page).unwrap();
+        let before = page_image(&store);
+        let error = delete_many(&mut store, root, &tight, limits).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(page_image(&store), before);
+
+        let error = encode_leaf(
+            1,
+            &Leaf {
+                entries: vec![(1, 1); LEAF_MAX + 1],
+                left: 0,
+                right: 0,
+            },
+        )
+        .err()
+        .expect("oversized leaf");
+        assert!(error.to_string().contains("capacity"), "{error}");
+        let error = encode_internal(
+            1,
+            &Internal {
+                keys: vec![(1, 1); INTERNAL_MAX + 1],
+                children: vec![1; INTERNAL_MAX + 2],
+            },
+        )
+        .err()
+        .expect("oversized internal node");
+        assert!(error.to_string().contains("capacity"), "{error}");
+    }
+
+    struct Faulty {
+        inner: Mem,
+        fail_alloc: bool,
+        fail_leaf: bool,
+        fail_internal: bool,
+        fail_free: bool,
+        fail_read_after_leaf: bool,
+        leaf_writes: u32,
+    }
+
+    impl Nodes for Faulty {
+        fn read_node(&mut self, id: u32) -> Result<Page, DbError> {
+            if self.fail_read_after_leaf && self.leaf_writes > 0 {
+                return Err(corrupt(id));
+            }
+            self.inner.read_node(id)
+        }
+        fn write_node(&mut self, id: u32, page: Page) -> Result<(), DbError> {
+            let kind = page_type(&page)?;
+            if kind == TYPE_INDEX_LEAF {
+                if self.fail_leaf {
+                    return Err(DbError::Storage("injected leaf write failure".to_string()));
+                }
+                self.leaf_writes += 1;
+            }
+            if kind == TYPE_INDEX_INTERNAL && self.fail_internal {
+                return Err(DbError::Storage(
+                    "injected internal write failure".to_string(),
+                ));
+            }
+            self.inner.write_node(id, page)
+        }
+        fn alloc_node(&mut self) -> Result<u32, DbError> {
+            if self.fail_alloc {
+                return Err(DbError::Storage(
+                    "database page id space is exhausted".to_string(),
+                ));
+            }
+            self.inner.alloc_node()
+        }
+        fn free_node(&mut self, id: u32) -> Result<(), DbError> {
+            if self.fail_free {
+                return Err(DbError::Storage("injected free failure".to_string()));
+            }
+            self.inner.free_node(id)
+        }
+    }
+
+    #[test]
+    fn bulk_faults_after_reconstruction_starts_do_not_report_success() {
+        let limits = small();
+        let entries = sequential(24);
+        let (base, root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut base.clone(), root);
+        let remove = runs
+            .iter()
+            .find(|run| run.entries.len() == limits.leaf_min)
+            .unwrap()
+            .entries
+            .clone();
+        let before = page_image(&base);
+
+        let mut alloc = Faulty {
+            inner: base.clone(),
+            fail_alloc: true,
+            fail_leaf: false,
+            fail_internal: false,
+            fail_free: false,
+            fail_read_after_leaf: false,
+            leaf_writes: 0,
+        };
+        let error = delete_many(&mut alloc, root, &remove, limits).unwrap_err();
+        assert!(error.to_string().contains("exhausted"), "{error}");
+        assert_eq!(page_image(&alloc.inner), before);
+
+        let mut leaf = Faulty {
+            inner: base.clone(),
+            fail_alloc: false,
+            fail_leaf: true,
+            fail_internal: false,
+            fail_free: false,
+            fail_read_after_leaf: false,
+            leaf_writes: 0,
+        };
+        let error = delete_many(&mut leaf, root, &remove, limits).unwrap_err();
+        assert!(error.to_string().contains("leaf write"), "{error}");
+        assert_eq!(page_image(&leaf.inner), before);
+
+        let mut internal = Faulty {
+            inner: base.clone(),
+            fail_alloc: false,
+            fail_leaf: false,
+            fail_internal: true,
+            fail_free: false,
+            fail_read_after_leaf: false,
+            leaf_writes: 0,
+        };
+        let error = delete_many(&mut internal, root, &remove, limits).unwrap_err();
+        assert!(error.to_string().contains("internal write"), "{error}");
+
+        let mut relink = Faulty {
+            inner: base.clone(),
+            fail_alloc: false,
+            fail_leaf: false,
+            fail_internal: false,
+            fail_free: false,
+            fail_read_after_leaf: true,
+            leaf_writes: 0,
+        };
+        let error = delete_many(&mut relink, root, &remove, limits).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+
+        let mut free = Faulty {
+            inner: base.clone(),
+            fail_alloc: false,
+            fail_leaf: false,
+            fail_internal: false,
+            fail_free: true,
+            fail_read_after_leaf: false,
+            leaf_writes: 0,
+        };
+        let error = delete_many(&mut free, root, &remove, limits).unwrap_err();
+        assert!(error.to_string().contains("free"), "{error}");
+    }
+
+    #[test]
+    fn bulk_then_ordinary_edits_keep_order_and_pages() {
+        let limits = small();
+        let (mut store, mut root, mut model) = rebuild_keep(limits, 40, 9);
+        assert_built(&mut store, root, limits, &model);
+        for (key, row) in [(i64::MIN, 100_u64), (i64::MAX, 101), (4, 102), (4, 4)] {
+            if model.contains(&(key, row)) {
+                continue;
+            }
+            root = insert(&mut store, root, key, row, limits).unwrap();
+            model.push((key, row));
+            model.sort_by(|left, right| cmp_entry(*left, *right));
+            assert_built(&mut store, root, limits, &model);
+        }
+        let duplicate = find_equal(&mut store, root, 4).unwrap();
+        let mut ordered = duplicate.clone();
+        ordered.sort_unstable();
+        assert_eq!(duplicate, ordered);
+        let victim = model[0];
+        root = delete(&mut store, root, victim.0, victim.1, limits).unwrap();
+        model.retain(|entry| *entry != victim);
+        assert_built(&mut store, root, limits, &model);
+        let runs = leaf_runs(&mut store, root);
+        let fat = runs
+            .iter()
+            .find(|run| run.entries.len() >= limits.leaf_min + 2)
+            .or_else(|| runs.iter().find(|run| run.entries.len() >= 2))
+            .unwrap();
+        let grouped = fat.entries[..2].to_vec();
+        root = delete_many(&mut store, root, &grouped, limits).unwrap();
+        for entry in &grouped {
+            model.retain(|kept| kept != entry);
+        }
+        assert_built(&mut store, root, limits, &model);
+        if model.len() >= 2 {
+            root = delete_many(&mut store, root, &model, limits).unwrap();
+            assert_built(&mut store, root, limits, &[]);
+        }
+    }
+
+    #[test]
+    fn bulk_matches_the_reference_for_recorded_seeds() {
+        let seeds = [0x31A1_u64, 0x31B2, 0x31C3, 0x31D4];
+        for seed in seeds {
+            for (limits, count) in [(small(), 48_i64), (production(), 400)] {
+                let mut state = seed;
+                let mut entries = Vec::new();
+                for row in 1..=count {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let key = match state % 11 {
+                        0 => i64::MIN,
+                        1 => i64::MAX,
+                        2 => state as i64,
+                        3 => -(state as i64).saturating_abs(),
+                        4 | 5 => (state as i64 % 5) - 2,
+                        _ => (state as i64 % 80) - 20,
+                    };
+                    let entry = (key, row as u64);
+                    if !entries.contains(&entry) {
+                        entries.push(entry);
+                    }
+                }
+                let mut ordered = entries.clone();
+                ordered.sort_by(|left, right| cmp_entry(*left, *right));
+                same_tree(limits, &entries, &[]);
+                same_tree(limits, &entries, &ordered[..1]);
+                same_tree(
+                    limits,
+                    &entries,
+                    &ordered.iter().copied().step_by(2).collect::<Vec<_>>(),
+                );
+                same_tree(limits, &entries, &ordered[..ordered.len() / 2]);
+                same_tree(limits, &entries, &ordered);
+                let mut alternating = Vec::new();
+                for (index, entry) in ordered.iter().copied().enumerate() {
+                    if index % 2 == 0 {
+                        alternating.push(entry);
+                    }
+                }
+                same_tree(limits, &entries, &alternating);
+                let (mut store, mut root) = fill(limits, &entries);
+                let mut model = ordered.clone();
+                for _ in 0..3 {
+                    let half = model.len() / 2;
+                    let remove = model[..half.max(2).min(model.len())].to_vec();
+                    if remove.len() < 2 {
+                        break;
+                    }
+                    root = delete_many(&mut store, root, &remove, limits).unwrap();
+                    let expect = reference_delete(&model, &remove).unwrap();
+                    assert_built(&mut store, root, limits, &expect);
+                    for entry in &remove {
+                        root = insert(&mut store, root, entry.0, entry.1, limits).unwrap();
+                    }
+                    model.sort_by(|left, right| cmp_entry(*left, *right));
+                    assert_built(&mut store, root, limits, &model);
+                }
+            }
+        }
     }
 }

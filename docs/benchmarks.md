@@ -1396,3 +1396,34 @@ A miss is 16,112 µs on the batched path and 16,130 µs on the per-row path. It 
 At 10,000 rows a half delete is 46,248 µs versus 45,985 µs, and publish is 30,630 µs versus 31,509 µs. The per-row heap pass is 8,834 µs there, so the vector shift has not yet dominated. Deleting every row is 50,439 µs versus 63,027 µs. The duplicate-key delete is 30,788 µs versus 33,019 µs. A miss decodes all 10,000 rows and writes nothing. At 1,000 rows and at 100 rows the warm deletes sit inside the log sync, about 11–17 ms, on both paths.
 
 The batched path removes the repeated vector shift and the repeated free-page scan, and it rewrites a leaf once when several postings can leave without a borrow. One deleted row keeps the per-row unlink. The batched path does not reduce WAL bytes. It does not skip the no-match decode. A unique-key delete that empties leaves is still limited by one borrow or merge per posting. Peak RSS was not measured.
+
+## Milestone 31 bulk B+ tree deletion
+
+16 Nov 2026, Apple M5, 17179869184 bytes of memory, rustc 1.100.0. The ignored test is `profile_milestone31`. It builds one database per size with seed `0x3100`: ids `1..=rows`, `active` true on even ids, `bucket` NULL when `(seed + id)` is divisible by 5 and otherwise that value modulo 4, and an 80-byte name when `id` is divisible by 11. Indexes are `idx_users_id` and `idx_users_bucket`. At 100,000 rows each workload is the median of three fresh database copies. Smaller sizes are one sample. `bulk` is the new delete. `grouped` forces the Milestone 30 path, which still rewrites a safe leaf once and deletes an underflowing posting one at a time. Both use the same heap unlink. This is not a power-loss test.
+
+`scratch` is the key-vector bytes the span rebuild records. It is not the heap estimate from Milestone 30 and it is not RSS. `descents` counts root-to-leaf walks. A one-row delete never rebuilds a span. At 100 rows the tree is one leaf, so the span rebuild does not run and the two paths seal the same log.
+
+Times are microseconds. Index time is posting removal. The log size is the bytes appended for that statement. Structural counters matched on every 100,000-row sample.
+
+| rows | workload | bulk | grouped | bulk index | grouped index | bulk singles | grouped singles | spans | merges | bulk WAL | grouped WAL |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100,000 | one | 20,174 | 19,892 | 14 | 12 | 1 | 1 | 0 | 0 | 36,996 | 36,996 |
+| 100,000 | sparse | 202,760 | 221,556 | 16,296 | 36,191 | 0 | 10,265 | 1 | 471 | 9,581,796 | 9,565,396 |
+| 100,000 | duplicates | 231,225 | 238,731 | 31,279 | 40,149 | 0 | 10,459 | 2 | 628 | 10,262,396 | 10,237,796 |
+| 100,000 | half | 232,966 | 354,010 | 68,162 | 206,559 | 0 | 55,603 | 2 | 825 | 7,101,296 | 6,170,596 |
+| 100,000 | all | 387,365 | 482,039 | 132,146 | 227,037 | 246 | 80,255 | 2 | 1,414 | 12,168,896 | 12,168,896 |
+| 100,000 | alternating | 295,703 | 405,097 | 65,986 | 183,745 | 61 | 50,133 | 2 | 982 | 11,537,496 | 10,897,896 |
+| 100,000 | consecutive | 147,911 | 174,085 | 35,396 | 87,274 | 0 | 24,096 | 2 | 529 | 4,555,196 | 3,136,596 |
+| 100,000 | wide | 245,363 | 270,558 | 17,280 | 41,492 | 69 | 12,146 | 2 | 768 | 12,181,196 | 12,164,796 |
+
+At 100,000 rows the half delete is the case Milestone 30 left on the single-entry path. The grouped run still removes 55,603 postings one at a time and spends 206,559 µs in the index. The span rebuild removes those with 0 single-entry deletes, 2 span repacks, 825 leaf merges, 11 internal merges, and 1 root contraction. Index time is 68,162 µs. The statement is 232,966 µs versus 354,010 µs. Heap time stays about 16.6 ms on both, because the heap unlink did not change. The log grows from 6,170,596 bytes to 7,101,296 bytes: the repacked leaves and the new internal pages are dirty. That extra 930,700 bytes does not cancel the index saving. The id index stays height 3, 396 pages versus 397. The half delete allocates 4 index pages and frees 840.
+
+The half delete still walks from the root 89,911 times. That check is what keeps a missing posting ordered before a later corrupt page. The scratch for the span is 1,924,176 bytes. The grouped path does not build it.
+
+Alternating keys drop the id index from height 3 and 397 pages to height 2 and 198 pages, because the survivors are packed to the leaf maximum instead of the 127-entry split shape. Index time is 65,986 µs versus 183,745 µs. The log grows from 10,897,896 bytes to 11,537,496 bytes. The statement is 295,703 µs versus 405,097 µs. Consecutive keys keep height 3 and 594 pages. Index time is 35,396 µs versus 87,274 µs, and the log grows from 3,136,596 bytes to 4,555,196 bytes. The statement is 147,911 µs versus 174,085 µs, so the larger log gives back about half of the index saving and the statement is still faster.
+
+Deleting every row spends 132,146 µs in the index versus 227,037 µs. Both logs are 12,168,896 bytes and both trees are empty. 246 postings still use the single-entry delete, against 80,255 on the grouped path. Those are the postings left after the verified prefix stops at the last entries of a leaf. The rebuild frees 1,429 pages and allocates none. Sparse NULL-bucket rows and duplicate bucket 1 are faster in the index and write a slightly larger log. The wide-name delete is 17,280 µs versus 41,492 µs in the index.
+
+A one-row delete does not rebuild a span. At 100,000 rows it is 20,174 µs versus 19,892 µs, with the same 36,996-byte log. The difference is the log sync, not the tree. At 100 rows every workload is inside that sync, about 11–13 ms, and the logs match. At 1,000 rows the half index is 1,005 µs versus 1,787 µs. At 10,000 rows it is 5,204 µs versus 18,251 µs, and the statement is 30,381 µs versus 41,899 µs.
+
+The span rebuild is not faster on every workload. A one-row delete and a 100-row tree do not use it. On a consecutive delete the extra log is large enough to return part of the index saving, and the statement is still faster. No cost heuristic was added to skip the rebuild. Peak RSS was not measured. The no-match decode is unchanged.

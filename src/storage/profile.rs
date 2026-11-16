@@ -42,6 +42,33 @@ pub(crate) struct Profile {
     /// Postings removed by the single-entry index delete.
     #[cfg_attr(not(test), allow(dead_code))]
     pub index_singles: u64,
+    /// Root-to-leaf descents during index deletion.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub descents: u64,
+    /// Leaf spans repacked by bulk deletion.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub leaf_redistributions: u64,
+    /// Leaves removed by a bulk merge.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub leaf_merges: u64,
+    /// Internal pages removed when a bulk rebuild shrinks that level.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub internal_merges: u64,
+    /// Levels lost when a bulk rebuild shortens the tree.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub root_contractions: u64,
+    /// Index pages allocated during a tree edit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub pages_allocated: u64,
+    /// Index pages freed during a tree edit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub pages_freed: u64,
+    /// Bulk span rebuilds.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub bulk_spans: u64,
+    /// Bytes of the posting vectors built for one bulk rebuild.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub scratch_bytes: u64,
 }
 
 #[cfg(test)]
@@ -68,6 +95,15 @@ thread_local! {
         wal_bytes: 0,
         leaf_batches: 0,
         index_singles: 0,
+        descents: 0,
+        leaf_redistributions: 0,
+        leaf_merges: 0,
+        internal_merges: 0,
+        root_contractions: 0,
+        pages_allocated: 0,
+        pages_freed: 0,
+        bulk_spans: 0,
+        scratch_bytes: 0,
     }) };
 }
 
@@ -133,6 +169,58 @@ pub(crate) fn note_index_single() {
             profile.index_singles = profile.index_singles.saturating_add(1);
             data.set(profile);
         });
+    }
+}
+
+pub(crate) fn note_descent() {
+    note_u64(|profile| &mut profile.descents, 1);
+}
+
+pub(crate) fn note_leaf_redistribution() {
+    note_u64(|profile| &mut profile.leaf_redistributions, 1);
+}
+
+pub(crate) fn note_leaf_merges(count: u64) {
+    note_u64(|profile| &mut profile.leaf_merges, count);
+}
+
+pub(crate) fn note_internal_merges(count: u64) {
+    note_u64(|profile| &mut profile.internal_merges, count);
+}
+
+pub(crate) fn note_root_contractions(count: u64) {
+    note_u64(|profile| &mut profile.root_contractions, count);
+}
+
+pub(crate) fn note_page_alloc() {
+    note_u64(|profile| &mut profile.pages_allocated, 1);
+}
+
+pub(crate) fn note_page_free() {
+    note_u64(|profile| &mut profile.pages_freed, 1);
+}
+
+pub(crate) fn note_bulk_span() {
+    note_u64(|profile| &mut profile.bulk_spans, 1);
+}
+
+pub(crate) fn note_scratch(bytes: u64) {
+    note_u64(|profile| &mut profile.scratch_bytes, bytes);
+}
+
+fn note_u64(slot: fn(&mut Profile) -> &mut u64, amount: u64) {
+    #[cfg(test)]
+    if ENABLED.with(std::cell::Cell::get) {
+        DATA.with(|data| {
+            let mut profile = data.get();
+            let current = *slot(&mut profile);
+            *slot(&mut profile) = current.saturating_add(amount);
+            data.set(profile);
+        });
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (slot, amount);
     }
 }
 
