@@ -35,8 +35,10 @@
 //! that commit and does not compare the other heap values. A larger record
 //! relocates with the existing page editor. Before that publish, the statement
 //! saves the previous images of the matched rows and restores them if the
-//! commit fails before the log sync. `INSERT` and `DELETE` still snapshot the
-//! table. `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,
+//! commit fails before the log sync. A `DELETE` saves each removed row's
+//! image and original position and puts that row back, with the same id, if
+//! the commit fails before the log sync. `INSERT` still snapshots the table.
+//! `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,
 //! `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)` use the same per-group sets
 //! as a single table and ignore NULL, including a null-extended right column.
 //! `SELECT DISTINCT` keeps the first copy of each projected logical row,

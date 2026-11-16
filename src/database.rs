@@ -29,6 +29,12 @@ pub struct Database {
     /// means it matched nothing. A second capture refuses to replace images
     /// that are already saved.
     update_undo: Option<UpdateJournal>,
+    /// Removed rows for the current selective `DELETE`.
+    ///
+    /// `None` means this statement did not capture a journal. An empty journal
+    /// is a delete that matched nothing. The images are not enough on their
+    /// own: each entry also keeps the position the row had before compaction.
+    delete_undo: Option<DeleteJournal>,
 }
 
 /// Previous images of the rows one `UPDATE` is about to replace.
@@ -38,11 +44,34 @@ pub struct Database {
 /// the committed store changes only after checkpoint succeeds. Restoring these
 /// images therefore restores the in-memory database. Heap relocation and index
 /// maintenance happen on editor copies and are discarded when publish fails
-/// before that commit. `INSERT`, `DELETE`, and DDL still snapshot the table
-/// because they change that structure.
+/// before that commit. `INSERT` and DDL still snapshot the structures they
+/// change. `DELETE` journals the rows it removes because compaction also
+/// changes order and the row-id map.
 struct UpdateJournal {
     table: String,
     rows: Vec<(u64, Vec<Value>)>,
+}
+
+/// One row a `DELETE` removed, in the order it had before compaction.
+struct DeletedRow {
+    position: usize,
+    row_id: u64,
+    values: Vec<Value>,
+}
+
+/// Previous images and positions for one selective `DELETE`.
+///
+/// The journal is statement-local and is not a WAL record. `next_row_id` is
+/// recorded so restore can reject a counter change; `DELETE` does not advance
+/// it. `applied` is set only after compaction. A capture that never compacts
+/// is discarded instead of spliced back over rows that are still present.
+/// Index maintenance stays on the editor copy until checkpoint succeeds.
+struct DeleteJournal {
+    table: String,
+    rows: Vec<DeletedRow>,
+    heap_rows: usize,
+    next_row_id: u64,
+    applied: bool,
 }
 
 /// What `capture_update_undo` kept, before byte estimates.
@@ -66,13 +95,15 @@ pub(crate) enum DurableChange {
     Create(String),
     /// `DROP TABLE` removed these names.
     Drop(Vec<String>),
-    /// `INSERT` or `DELETE` changed this table.
+    /// `INSERT` changed this table.
     ///
-    /// A test can also force `UPDATE` through this path so the old full-table
-    /// snapshot stays available for comparison.
+    /// A test can also force `UPDATE` or `DELETE` through this path so the old
+    /// full-table snapshot stays available for comparison.
     Write(String),
     /// `UPDATE` will restore the row journal captured during install.
     Update,
+    /// `DELETE` will restore the row journal captured before compaction.
+    Delete,
     /// `CREATE INDEX` or `DROP INDEX` changed the index list.
     Index,
 }
@@ -109,6 +140,12 @@ pub(crate) enum Undo {
     /// The images live on the database, not in this value, because the matched
     /// rows are not known when the statement starts.
     Selective,
+    /// Restore the `DELETE` journal captured before any row was removed.
+    ///
+    /// The removed rows live on the database. Their ids are not known when the
+    /// statement starts, and restoring them has to put them back at the
+    /// positions compaction closed.
+    Delete,
 }
 
 impl Database {
@@ -121,6 +158,7 @@ impl Database {
             store: None,
             selective: None,
             update_undo: None,
+            delete_undo: None,
         }
     }
 
@@ -143,6 +181,7 @@ impl Database {
             store: Some(store),
             selective: None,
             update_undo: None,
+            delete_undo: None,
         })
     }
 
@@ -195,6 +234,7 @@ impl Database {
                 None => Undo::None,
             },
             DurableChange::Update => Undo::Selective,
+            DurableChange::Delete => Undo::Delete,
             DurableChange::Index => Undo::Indexes(self.indexes.clone()),
         }
     }
@@ -272,6 +312,108 @@ impl Database {
         self.update_undo = None;
     }
 
+    /// Save the current images and positions of `targets` before compaction.
+    ///
+    /// `snapshot` skips the journal because the caller already cloned the
+    /// table. `targets` are stable row ids. Duplicate and missing ids return
+    /// before the journal is stored and before any row is removed. Reserving
+    /// the entry list is a query error. Cloning a row uses the process
+    /// allocator; an out-of-memory abort there is not a query error, and it
+    /// still happens before the first removal. `next_row_id` is stored and not
+    /// changed.
+    pub(crate) fn capture_delete_undo(
+        &mut self,
+        table_name: &str,
+        targets: &[u64],
+        snapshot: bool,
+    ) -> Result<CapturedUndo, DbError> {
+        let table = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.to_string()))?;
+        let heap_rows = table.rows().len();
+        let width = table.schema().len();
+        let next_row_id = table.next_row_id();
+        if snapshot {
+            return Ok(CapturedUndo {
+                entries: 0,
+                snapshot: true,
+                heap_rows,
+                width,
+            });
+        }
+        if self.delete_undo.is_some() {
+            return Err(DbError::Internal(
+                "undo journal already holds original rows".to_string(),
+            ));
+        }
+        let mut saved = Vec::new();
+        saved.try_reserve(targets.len()).map_err(|_| {
+            DbError::Internal("undo journal could not reserve its entries".to_string())
+        })?;
+        let mut seen = HashSet::new();
+        seen.try_reserve(targets.len()).map_err(|_| {
+            DbError::Internal("undo journal could not reserve its entries".to_string())
+        })?;
+        let mut previous = None;
+        for row_id in targets {
+            if !seen.insert(*row_id) {
+                return Err(DbError::Internal(format!(
+                    "delete lists row {row_id} twice in '{table_name}'"
+                )));
+            }
+            let Some(position) = table.position(*row_id) else {
+                return Err(DbError::Internal(format!(
+                    "delete target {row_id} is not in '{table_name}'"
+                )));
+            };
+            if previous.is_some_and(|seen: usize| position <= seen) {
+                return Err(DbError::Internal(format!(
+                    "delete target {row_id} is out of order in '{table_name}'"
+                )));
+            }
+            previous = Some(position);
+            let Some(image) = table.rows().get(position) else {
+                return Err(DbError::Internal(format!(
+                    "delete target {row_id} is not in '{table_name}'"
+                )));
+            };
+            saved.push(DeletedRow {
+                position,
+                row_id: *row_id,
+                values: image.clone(),
+            });
+        }
+        self.delete_undo = Some(DeleteJournal {
+            table: table_name.to_string(),
+            rows: saved,
+            heap_rows,
+            next_row_id,
+            applied: false,
+        });
+        Ok(CapturedUndo {
+            entries: targets.len(),
+            snapshot: false,
+            heap_rows,
+            width,
+        })
+    }
+
+    /// Mark the delete journal as the compaction that restore must invert.
+    ///
+    /// A snapshot path has no journal. Calling this is then a no-op.
+    pub(crate) fn mark_delete_undo_applied(&mut self) -> Result<(), DbError> {
+        let Some(journal) = self.delete_undo.as_mut() else {
+            return Ok(());
+        };
+        journal.applied = true;
+        Ok(())
+    }
+
+    pub(crate) fn clear_delete_undo(&mut self) {
+        self.delete_undo = None;
+    }
+
     /// Restore a journal captured before install.
     ///
     /// `required` is for a publish failure: the journal must exist, including
@@ -313,6 +455,102 @@ impl Database {
         Ok(())
     }
 
+    /// Restore a delete journal captured before compaction.
+    ///
+    /// `required` is for a publish failure: the journal must exist and
+    /// compaction must have run, including a delete that removed nothing. An
+    /// apply error before compaction passes `false` and drops the unused
+    /// journal. The restored vectors replace the table only after every slot
+    /// is filled. A failure before that puts the journal back, leaves the
+    /// compacted rows in place, fences a stored database, and does not report
+    /// a confirmed rollback.
+    pub(crate) fn restore_delete_journal(&mut self, required: bool) -> Result<(), DbError> {
+        let applied = match self.delete_undo.as_ref() {
+            None => {
+                if required {
+                    return Err(self.fence_uncertain("the journal is missing"));
+                }
+                return Ok(());
+            }
+            Some(journal) => journal.applied,
+        };
+        if !applied {
+            if required {
+                return Err(self.fence_uncertain("the journal was not applied"));
+            }
+            self.delete_undo = None;
+            return Ok(());
+        }
+        #[cfg(test)]
+        if fail_undo_restore() {
+            return Err(self.fence_uncertain("restore was forced to fail"));
+        }
+        let check = match self.delete_undo.as_ref() {
+            None => Err("the journal is missing".to_string()),
+            Some(journal) => match self.tables.get(&journal.table) {
+                None => Err("the table is missing".to_string()),
+                Some(table) => {
+                    if table.next_row_id() != journal.next_row_id {
+                        Err("the row-id counter changed".to_string())
+                    } else if table.rows().len() + journal.rows.len() != journal.heap_rows {
+                        Err("the table length changed".to_string())
+                    } else {
+                        let pairs: Vec<(usize, u64)> = journal
+                            .rows
+                            .iter()
+                            .map(|row| (row.position, row.row_id))
+                            .collect();
+                        table
+                            .check_delete_restore(&pairs)
+                            .map_err(|error| error.to_string())
+                    }
+                }
+            },
+        };
+        if let Err(detail) = check {
+            return Err(self.fence_uncertain(&detail));
+        }
+        let Some(mut journal) = self.delete_undo.take() else {
+            return Err(self.fence_uncertain("the journal is missing"));
+        };
+        let mut rows = Vec::new();
+        if rows.try_reserve(journal.rows.len()).is_err() {
+            self.delete_undo = Some(journal);
+            return Err(self.fence_uncertain("undo journal could not reserve its entries"));
+        }
+        for row in journal.rows.drain(..) {
+            rows.push((row.position, row.row_id, row.values));
+        }
+        let table_name = journal.table.clone();
+        let Some(table) = self.tables.get_mut(&table_name) else {
+            journal.rows = rows
+                .into_iter()
+                .map(|(position, row_id, values)| DeletedRow {
+                    position,
+                    row_id,
+                    values,
+                })
+                .collect();
+            self.delete_undo = Some(journal);
+            return Err(self.fence_uncertain("the table is missing"));
+        };
+        if let Err(error) = table.restore_deleted(&mut rows) {
+            if !rows.is_empty() {
+                journal.rows = rows
+                    .into_iter()
+                    .map(|(position, row_id, values)| DeletedRow {
+                        position,
+                        row_id,
+                        values,
+                    })
+                    .collect();
+                self.delete_undo = Some(journal);
+            }
+            return Err(self.fence_uncertain(&error.to_string()));
+        }
+        Ok(())
+    }
+
     fn fence_uncertain(&mut self, detail: &str) -> DbError {
         let error = DbError::Storage(format!(
             "undo could not restore the statement ({detail}); the outcome is unknown and this is not a confirmed rollback. Reopen the file before running another statement."
@@ -325,18 +563,30 @@ impl Database {
 
     pub(crate) fn rollback(&mut self, undo: Undo) -> Result<(), DbError> {
         self.selective = None;
-        if !matches!(undo, Undo::Selective) {
-            self.update_undo = None;
-        }
         match undo {
-            Undo::None => Ok(()),
-            Undo::Selective => self.restore_update_journal(true),
+            Undo::None => {
+                self.update_undo = None;
+                self.delete_undo = None;
+                Ok(())
+            }
+            Undo::Selective => {
+                self.delete_undo = None;
+                self.restore_update_journal(true)
+            }
+            Undo::Delete => {
+                self.update_undo = None;
+                self.restore_delete_journal(true)
+            }
             Undo::Remove { table, indexes } => {
+                self.update_undo = None;
+                self.delete_undo = None;
                 self.tables.remove(&table);
                 self.indexes = indexes;
                 Ok(())
             }
             Undo::Restore { tables, indexes } => {
+                self.update_undo = None;
+                self.delete_undo = None;
                 for table in tables {
                     self.tables.insert(table.name().to_string(), table);
                 }
@@ -344,11 +594,15 @@ impl Database {
                 Ok(())
             }
             Undo::Replace { table, indexes } => {
+                self.update_undo = None;
+                self.delete_undo = None;
                 self.tables.insert(table.name().to_string(), table);
                 self.indexes = indexes;
                 Ok(())
             }
             Undo::Indexes(indexes) => {
+                self.update_undo = None;
+                self.delete_undo = None;
                 self.indexes = indexes;
                 Ok(())
             }
@@ -637,7 +891,10 @@ thread_local! {
     static FAIL_UNDO_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Counts `INSERT`, `DELETE`, and forced full-table `UPDATE` snapshots.
+/// Counts table clones taken for undo.
+///
+/// `INSERT` still clones. `UPDATE` and `DELETE` clone only when a test forces
+/// the full snapshot.
 #[cfg(test)]
 pub(crate) fn reset_table_snapshots() {
     TABLE_SNAPSHOTS.with(|count| count.set(0));
