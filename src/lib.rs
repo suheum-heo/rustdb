@@ -46,8 +46,12 @@
 //! leaves are rebuilt in the same commit. A run that is strictly increasing or
 //! strictly decreasing is checked along the leaf chain after one root descent.
 //! Publish hands postings over in descending stored order, which is decreasing
-//! for an indexed `id`. A run that changes direction, a repeated posting, and
-//! a test that forces the older check still descend once per posting. One posting, and any run that stays
+//! for an indexed `id`. A run that changes direction is checked against a
+//! temporary map of the validated postings when the remaining descents would
+//! read more pages than the largest tree of this height. A repeated posting,
+//! a map that is not worth building, a map that cannot be reserved, and a
+//! test that forces the older check still descend once per posting. An
+//! allocator abort is process-level and is not a query error. One posting, and any run that stays
 //! at the minimum, still uses the earlier delete. A test can force that
 //! grouped path. The rebuilt pages can differ from deleting one posting at a
 //! time. A delete that matches nothing still audits
