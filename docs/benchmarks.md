@@ -1032,3 +1032,81 @@ At 10,000 by 10,000 matched rows, plain hash warm is 1,333 µs, plain index warm
 The index is not uniformly faster than the hash. Equal sizes stay on the hash: at 10,000 by 10,000 the hash warm time is lower for every shape in this run. At 10,000 by 100, outside the size rule, hash warm is 525 µs and index warm is 5,812 µs. That is 10,000 probes visiting 100 entries.
 
 The 100 by 10,000 case is inside the size rule: 100 probes visit 10,000 entries. One sample in the table has hash warm 681 µs and index warm 750 µs. Seven fresh databases, each reporting the median of five warm runs, gave hash medians 656, 706, 708, 781, 834, 906, and 1,109 µs, and index medians 755, 771, 804, 809, 827, 834, and 882 µs. The median of those medians is 781 µs for the hash and 809 µs for the index. The index was faster on 4 of the 7 databases and slower on 3. The ranges overlap. This does not support treating the index as faster than the hash at 100 by 10,000. It does support keeping the hash when the right table is not much larger than the left, and it does not support replacing every hash left join with an index probe.
+
+## Milestone 25 indexed UPDATE and DELETE
+
+Release profile `profile_milestone25`, rerun 15 Nov 2026 after the heap equality check. Apple M5, 17179869184 bytes of memory, `rustc 1.100.0 (0ef1bc386 2026-11-09)`. `Value` is 32 bytes. Each size loads `id` from 0 through `rows - 1`, name `n{id}`, `active` TRUE, and `bucket = id % 10`, then creates `idx_users_bucket` and `idx_users_id` in that catalog order. The index database uses the mutation planner, including the heap walk that requires every row with the chosen integer to have a posting. The scan database runs the same SQL with the heap scan forced. The checksum is `SELECT id, name, active, bucket` after the untimed statement and, where the workload has one, its restore. The two databases matched on every row below. Loading the tables is outside the timer.
+
+Below 100,000 rows there are six timed samples. At 100,000 there are three. Cold is the first sample. Warm is the median of the rest: the middle of five, or the upper of two. `point`, `duplicates`, and `residual` assign `name`. The untimed statement assigns `'n'`. Timed samples alternate `'m'` and `'n'`, so every timed sample changes a cell and writes the WAL. `key` sets `id = -1` and then restores `id = 1` outside the timer. `delete_one` deletes `id = 1` and reinserts that row outside the timer. `delete_many` deletes `bucket = 1` (10% of the rows) and reinserts those rows outside the timer. `miss` matches nothing.
+
+`probe`, `validate`, `filter`, `stage`, and `apply` come from that untimed index execution, not from the timed median. `probe` is the B+ tree lookup. `validate` is the heap walk that builds the equality set and compares it with the index. `filter` is the original `WHERE` on that set. `stage` builds the replacement. `apply` is only the in-memory `rewrite_all` or `retain_indexes`. `discover` in the profile log is `probe + validate + filter`. `staged_bytes` is `modified * 8 + staged_rows * 4 * 32`: one `u64` per matched row id, plus the staged image at 32 bytes per cell. `UPDATE` stages every heap row. `DELETE` stages the survivors. The equality walk does not copy rows. It keeps one `usize` per matching position until the comparison finishes. None of these figures is process RSS.
+
+`wal` is WAL write, WAL sync, database write, database sync, and WAL clear on the indexed database. `publish` is `Editor::apply`, which includes the heap compare and index maintenance. `compare` is the `same_values` time inside that apply. Index maintenance is not a separate timer; for an `UPDATE`, `publish - compare` is the remainder and includes the changed record plus any index edit. A `DELETE` takes the unlink path, so `compare` and `compares` stay 0 and `publish` is the unlink plus index maintenance. `compares` is the last indexed sample. An `UPDATE` compares every heap row, including a miss that writes nothing.
+
+| Workload | Rows | Index cold | Index warm | Scan cold | Scan warm | WAL warm | Publish warm | Compare warm |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| point | 100 | 11,575 µs | 12,008 µs | 11,050 µs | 10,048 µs | 11,443 µs | 277 µs | 102 µs |
+| miss | 100 | 99 µs | 83 µs | 87 µs | 79 µs | 0 µs | 30 µs | 21 µs |
+| duplicates | 100 | 10,815 µs | 12,013 µs | 9,837 µs | 10,984 µs | 11,365 µs | 294 µs | 91 µs |
+| residual | 100 | 10,804 µs | 11,000 µs | 11,112 µs | 11,088 µs | 10,489 µs | 230 µs | 92 µs |
+| key | 100 | 11,921 µs | 9,022 µs | 8,924 µs | 10,108 µs | 8,515 µs | 285 µs | 89 µs |
+| delete_one | 100 | 12,963 µs | 12,022 µs | 12,841 µs | 11,947 µs | 11,249 µs | 417 µs | 0 µs |
+| delete_many | 100 | 12,933 µs | 12,288 µs | 13,039 µs | 11,996 µs | 11,500 µs | 435 µs | 0 µs |
+| point | 1,000 | 12,757 µs | 12,926 µs | 11,952 µs | 11,836 µs | 10,820 µs | 956 µs | 743 µs |
+| miss | 1,000 | 984 µs | 456 µs | 452 µs | 450 µs | 0 µs | 176 µs | 113 µs |
+| duplicates | 1,000 | 9,810 µs | 11,078 µs | 11,048 µs | 12,911 µs | 9,126 µs | 1,680 µs | 654 µs |
+| residual | 1,000 | 12,598 µs | 12,914 µs | 12,055 µs | 12,205 µs | 11,354 µs | 887 µs | 683 µs |
+| key | 1,000 | 13,046 µs | 13,991 µs | 13,032 µs | 13,900 µs | 11,386 µs | 995 µs | 664 µs |
+| delete_one | 1,000 | 11,989 µs | 13,113 µs | 11,455 µs | 13,012 µs | 11,355 µs | 620 µs | 0 µs |
+| delete_many | 1,000 | 13,020 µs | 13,920 µs | 12,993 µs | 13,170 µs | 11,358 µs | 1,547 µs | 0 µs |
+| point | 10,000 | 15,913 µs | 17,022 µs | 16,817 µs | 17,919 µs | 9,980 µs | 4,941 µs | 4,489 µs |
+| miss | 10,000 | 2,890 µs | 2,872 µs | 3,022 µs | 2,913 µs | 0 µs | 1,141 µs | 732 µs |
+| duplicates | 10,000 | 29,091 µs | 28,016 µs | 25,872 µs | 27,976 µs | 11,002 µs | 11,475 µs | 4,284 µs |
+| residual | 10,000 | 16,026 µs | 16,800 µs | 17,033 µs | 17,080 µs | 9,695 µs | 4,921 µs | 4,466 µs |
+| key | 10,000 | 17,104 µs | 17,974 µs | 15,804 µs | 16,959 µs | 10,548 µs | 5,245 µs | 4,598 µs |
+| delete_one | 10,000 | 13,059 µs | 14,170 µs | 15,027 µs | 15,097 µs | 10,499 µs | 906 µs | 0 µs |
+| delete_many | 10,000 | 24,876 µs | 23,931 µs | 23,988 µs | 24,059 µs | 10,768 µs | 9,218 µs | 0 µs |
+| point | 100,000 | 75,998 µs | 76,878 µs | 75,191 µs | 74,061 µs | 10,749 µs | 47,188 µs | 43,834 µs |
+| miss | 100,000 | 31,276 µs | 31,297 µs | 31,990 µs | 32,726 µs | 0 µs | 12,093 µs | 7,976 µs |
+| duplicates | 100,000 | 187,950 µs | 187,826 µs | 183,442 µs | 183,723 µs | 14,774 µs | 115,422 µs | 43,599 µs |
+| residual | 100,000 | 74,597 µs | 77,898 µs | 79,551 µs | 76,550 µs | 10,781 µs | 47,205 µs | 43,657 µs |
+| key | 100,000 | 76,440 µs | 77,103 µs | 76,836 µs | 75,282 µs | 10,756 µs | 46,413 µs | 42,052 µs |
+| delete_one | 100,000 | 32,944 µs | 34,327 µs | 34,809 µs | 34,083 µs | 9,561 µs | 2,971 µs | 0 µs |
+| delete_many | 100,000 | 306,258 µs | 298,810 µs | 295,015 µs | 294,386 µs | 13,669 µs | 243,863 µs | 0 µs |
+
+| Workload | Rows | Probe | Validate | Filter | Stage | Apply | Staged bytes | Checksum |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| point | 100 | 75 µs | 0 µs | 0 µs | 21 µs | 4 µs | 12,808 | 5,789 |
+| miss | 100 | 56 µs | 0 µs | 0 µs | 6 µs | 4 µs | 12,800 | 5,790 |
+| duplicates | 100 | 47 µs | 0 µs | 1 µs | 10 µs | 4 µs | 12,880 | 5,771 |
+| residual | 100 | 47 µs | 0 µs | 1 µs | 8 µs | 4 µs | 12,808 | 5,789 |
+| key | 100 | 44 µs | 0 µs | 1 µs | 7 µs | 4 µs | 12,808 | 5,788 |
+| delete_one | 100 | 54 µs | 0 µs | 1 µs | 5 µs | 12 µs | 12,680 | 5,785 |
+| delete_many | 100 | 59 µs | 1 µs | 1 µs | 5 µs | 10 µs | 11,600 | 5,281 |
+| point | 1,000 | 83 µs | 2 µs | 1 µs | 71 µs | 40 µs | 128,008 | 508,889 |
+| miss | 1,000 | 76 µs | 1 µs | 0 µs | 56 µs | 38 µs | 128,000 | 508,890 |
+| duplicates | 1,000 | 59 µs | 1 µs | 2 µs | 47 µs | 16 µs | 128,800 | 508,601 |
+| residual | 1,000 | 82 µs | 1 µs | 1 µs | 71 µs | 33 µs | 128,008 | 508,889 |
+| key | 1,000 | 118 µs | 1 µs | 1 µs | 58 µs | 36 µs | 128,008 | 508,888 |
+| delete_one | 1,000 | 95 µs | 3 µs | 1 µs | 29 µs | 117 µs | 127,880 | 508,885 |
+| delete_many | 1,000 | 90 µs | 3 µs | 6 µs | 28 µs | 100 µs | 116,000 | 458,701 |
+| point | 10,000 | 59 µs | 13 µs | 0 µs | 278 µs | 182 µs | 1,280,008 | 50,098,889 |
+| miss | 10,000 | 64 µs | 16 µs | 0 µs | 247 µs | 186 µs | 1,280,000 | 50,098,890 |
+| duplicates | 10,000 | 292 µs | 23 µs | 37 µs | 379 µs | 198 µs | 1,288,000 | 50,095,001 |
+| residual | 10,000 | 75 µs | 15 µs | 0 µs | 290 µs | 175 µs | 1,280,008 | 50,098,889 |
+| key | 10,000 | 61 µs | 10 µs | 0 µs | 276 µs | 184 µs | 1,280,008 | 50,098,888 |
+| delete_one | 10,000 | 62 µs | 15 µs | 0 µs | 61 µs | 532 µs | 1,279,880 | 50,098,885 |
+| delete_many | 10,000 | 290 µs | 16 µs | 17 µs | 86 µs | 452 µs | 1,160,000 | 45,096,001 |
+| point | 100,000 | 100 µs | 254 µs | 0 µs | 3,627 µs | 1,938 µs | 12,800,008 | 5,001,088,889 |
+| miss | 100,000 | 108 µs | 309 µs | 0 µs | 2,345 µs | 2,044 µs | 12,800,000 | 5,001,088,890 |
+| duplicates | 100,000 | 3,171 µs | 442 µs | 277 µs | 3,854 µs | 1,860 µs | 12,880,000 | 5,001,040,001 |
+| residual | 100,000 | 555 µs | 307 µs | 1 µs | 2,704 µs | 2,571 µs | 12,800,008 | 5,001,088,889 |
+| key | 100,000 | 98 µs | 173 µs | 0 µs | 2,695 µs | 2,049 µs | 12,800,008 | 5,001,088,888 |
+| delete_one | 100,000 | 126 µs | 448 µs | 1 µs | 523 µs | 5,570 µs | 12,799,880 | 5,001,088,885 |
+| delete_many | 100,000 | 3,133 µs | 503 µs | 290 µs | 948 µs | 5,165 µs | 11,600,000 | 4,501,050,001 |
+
+At 100,000 rows a point update is 76,878 µs indexed and 74,061 µs scanned. The probe is 100 µs and the heap equality check is 254 µs. The WAL warm time is 10,749 µs. Publish warm is 47,188 µs, of which the heap compare is 43,834 µs, and that compare visits all 100,000 rows. Staging the replacement is 3,627 µs. A miss writes no WAL: indexed warm 31,297 µs, scanned warm 32,726 µs, probe 108 µs, validate 309 µs. Changing the indexed key is 77,103 µs indexed and 75,282 µs scanned. The index edit sits in the few milliseconds of publish that remain after the compare.
+
+Deleting one row at 100,000 is 34,327 µs indexed and 34,083 µs scanned. The value compare is 0. Publish warm is 2,971 µs, the WAL warm time is 9,561 µs, and the equality check is 448 µs. Deleting the 10,000 rows with `bucket = 1` is 298,810 µs indexed and 294,386 µs scanned. Publish warm is 243,863 µs and the WAL warm time is 13,669 µs. The probe for those 10,000 candidates is 3,133 µs and the equality check is 503 µs. Updating the same 10,000 rows is 187,826 µs indexed and 183,723 µs scanned.
+
+The equality check is visible and small next to publish and the WAL. At 100,000 rows it stays under 510 µs on every workload in this run. The index and the forced scan stay within a few percent. This run does not support a claim that indexed candidate selection makes `UPDATE` or `DELETE` faster. The statement still stages a full replacement, and the WAL plus the publish walk dominate both the probe and the completeness check. The staged image at 100,000 rows is 12,800,008 bytes for one changed row and 11,600,000 bytes after deleting 10,000 rows. Those figures are the estimate above, not process RSS.
