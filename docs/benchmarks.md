@@ -1520,3 +1520,31 @@ Ten keys at 100,000 rows estimate 634 pages and decline. Descents stay at 9. Ind
 At 100 rows the tree is one leaf and no plan runs. At 1,000 rows ten keys see 6 pages and do plan. Index time is 135 µs against 85 µs late and 92 µs on the chain path, on a statement of about 14 ms. That is a map the fanout ceiling would have refused, and it does not pay for itself at that size. The 1,000-row bucket index is 421 µs against 409 µs late. At 10,000 rows ten keys estimate 62 pages and decline. The wide delete plans, and its index time is 1,021 µs against 1,062 µs late.
 
 A monotonic run, one posting, a request that is not longer than an exact page count, a one-leaf tree, and a validation or reservation failure stay on the older check. The late map remains available as a test force. The early plan is the default because the extra internal-page walk is gone, and the wide delete is faster for it.
+
+## Milestone 35 validated-path reuse
+
+16 Nov 2026, 4:01 PM CST, Apple M5, 17179869184 bytes of memory, rustc 1.100.0. The ignored test is `profile_milestone35`. It uses seed `0x3100`. `current` removes a non-underflow single through the parent path already in hand. `prior` restores Milestone 34: the older map bound, and `delete` for that single. `late` keeps Milestone 33's map. `chain` forces the Milestone 32 leaf-chain check. At 100,000 rows each workload is the median of three fresh copies. Smaller sizes are one sample. Counters below are from the first copy. Statement time includes the log sync. These are process-local timings.
+
+The work unit is one page read. A map is planned when `postings * height` exceeds the largest tree of that height, which is the same point the late map would be built. An exact smaller tree is planned when `postings > pages * height`, one full walk per level. An inexact ceiling still plans when `postings * height` exceeds that ceiling. Ten keys on the 1,000-row tree see 6 pages. Eight indexed bucket postings are not longer than `6 * 2`, so the map stays unbuilt. Milestone 34 planned it. The statement is 12,547 µs against 12,557 µs, and the index is 132 µs against 142 µs. Descents are 9 against 1. The log is 61,596 bytes on both, and `map_bytes` is 0. At 10,000 rows the same ten keys see 62 pages and also decline. At 100,000 rows they see 634 pages and decline, as they did in Milestone 34.
+
+A cached path is used only after the live leaf is decoded and the posting is found in it. A grouped rewrite and that single keep every other path: child indexes and the other leaf ids stay put, and a separator key may change. A span rebuild, a merge, a borrow, a root contraction, and a freed page drop the whole plan. The next posting descends from the new root. `reused` counts singles applied through a path already in hand. `invalidations` counts plans dropped for a structural change. `map_bytes` is `size_of<(i64, u64)>() + size_of<u32>()` times the live postings of the planned index, 20 bytes each. It leaves out the hash-table buckets and the parent-path vectors. Peak RSS was not measured.
+
+| workload | current | prior | late | chain | index | prior index | descents | prior descents | reused | plans | map bytes | WAL | checksum |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| one | 20,985 | 20,560 | 22,064 | 20,927 | 19 | 17 | 1 | 1 | 0 | 0 | 0 | 36,996 | 5001482560 |
+| ten | 67,963 | 65,393 | 65,564 | 63,728 | 4,455 | 4,560 | 9 | 9 | 0 | 0 | 0 | 2,045,996 | 5001482470 |
+| buckets | 256,639 | 270,934 | 274,831 | 282,657 | 18,033 | 19,367 | 2 | 63 | 61 | 1 | 1,600,000 | 10,906,096 | 3000897535 |
+| half | 201,259 | 198,214 | 199,086 | 224,699 | 18,947 | 19,062 | 1 | 1 | 0 | 1 | 1,600,000 | 7,101,296 | 3750796338 |
+| sparse | 211,623 | 212,952 | 212,848 | 210,884 | 6,080 | 6,250 | 2 | 2 | 0 | 0 | 0 | 9,581,796 | 4001250051 |
+| alternating | 271,544 | 273,780 | 273,138 | 296,004 | 18,276 | 18,763 | 2 | 63 | 61 | 1 | 1,600,000 | 11,537,496 | 2500711280 |
+| consecutive | 133,956 | 131,435 | 132,385 | 145,790 | 11,635 | 11,472 | 1 | 1 | 0 | 1 | 1,600,000 | 4,555,196 | 4688644540 |
+| all | 312,501 | 312,774 | 312,429 | 366,687 | 33,799 | 32,377 | 2 | 248 | 246 | 1 | 1,600,000 | 12,168,896 | 0 |
+| wide | 262,996 | 261,099 | 267,243 | 266,024 | 11,513 | 11,197 | 2 | 71 | 69 | 1 | 1,600,000 | 12,181,196 | 4546235365 |
+
+Times are microseconds. The log and the checksum match Milestone 34 on every 100,000-row workload. A non-underflow rewrite seals the same pages as one `delete` that does not merge.
+
+Buckets and alternating are the mixed grouped and single deletes. Each reuses 61 paths, drops the plan once, and descends twice. Bucket index time is 18,033 µs against 19,367 µs, and the statement is 256,639 µs against 270,934 µs. Alternating index time is 18,276 µs against 18,763 µs. Half, consecutive, and sparse have no reused path. Their statements stay within a few milliseconds of the prior path, and the logs are unchanged: half 7,101,296 bytes, consecutive 4,555,196 bytes, sparse 9,581,796 bytes.
+
+Delete-all reuses 246 paths. Descents fall from 248 to 2. The index timer rises from 32,377 µs to 33,799 µs. The statement stays 312,501 µs against 312,774 µs. The log stays 12,168,896 bytes. Each reused single still reads the ancestors before it writes the leaf, including ancestors whose separator did not change. That probe is the remaining index cost. Wide reuses 69 paths and descends twice, against 71 prior descents and 7,274 late descents. Its index time is 11,513 µs against 11,197 µs prior. The statement is 262,996 µs against 261,099 µs prior and 267,243 µs late. The log stays 12,181,196 bytes and the checksum stays 4546235365. The map payload stays 1,600,000 bytes wherever a plan is built.
+
+One row never enters the multi-posting path, so `reused` stays 0 and the log stays 36,996 bytes. At 100 rows every tree is one leaf and no path is reused. At 1,000 rows the bucket, half, alternating, consecutive, delete-all, and wide statements do plan: half reuses 1 path, buckets 73, alternating 9, consecutive 6, delete-all 37, and wide 29. Their logs match the prior path.

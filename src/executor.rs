@@ -22971,6 +22971,8 @@ mod tests {
         validations_skipped: u64,
         tree_validations: u64,
         path_us: u128,
+        reused_paths: u64,
+        path_invalidations: u64,
         grouped_postings: u64,
         id_height: u32,
         id_pages: usize,
@@ -22983,6 +22985,7 @@ mod tests {
         Late,
         Chain,
         Descent,
+        Prior,
     }
 
     fn profile_bulk_delete(
@@ -23030,6 +23033,10 @@ mod tests {
             VerifyMode::Presence => change_count(&mut bulk, &sql),
             VerifyMode::Late => {
                 let _guard = crate::storage::ForceLatePresence::new();
+                change_count(&mut bulk, &sql)
+            }
+            VerifyMode::Prior => {
+                let _guard = crate::storage::ForcePriorPlan::new();
                 change_count(&mut bulk, &sql)
             }
         };
@@ -23138,6 +23145,8 @@ mod tests {
             validations_skipped: bulk_phases.validations_skipped,
             tree_validations: bulk_phases.tree_validations,
             path_us: bulk_phases.path_record.as_micros(),
+            reused_paths: bulk_phases.reused_paths,
+            path_invalidations: bulk_phases.path_invalidations,
             grouped_postings: bulk_phases.leaf_batches,
             id_height,
             id_pages,
@@ -24121,6 +24130,160 @@ mod tests {
                     sample.ordered_verified,
                     sample.fallback_verified,
                     previous.fallback_verified
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release profile of validated-path reuse"]
+    fn profile_milestone35() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!("milestone35 cpu={cpu} mem_bytes={mem} rustc={rustc}");
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            let (_base_dir, base) = seed_delete_db("m35-base", rows, 0x3100);
+            let samples = if rows == 100_000 { 3 } else { 1 };
+            for workload in [
+                "one",
+                "ten",
+                "buckets",
+                "half",
+                "sparse",
+                "alternating",
+                "consecutive",
+                "all",
+                "wide",
+            ] {
+                let mut current = Vec::with_capacity(samples);
+                let mut prior = Vec::with_capacity(samples);
+                let mut late = Vec::with_capacity(samples);
+                let mut chain = Vec::with_capacity(samples);
+                for sample in 0..samples {
+                    current.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Presence,
+                    ));
+                    prior.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Prior,
+                    ));
+                    late.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Late,
+                    ));
+                    chain.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Chain,
+                    ));
+                }
+                for (index, sample) in current.iter().enumerate() {
+                    let previous = &prior[index];
+                    let deferred = &late[index];
+                    let ordered = &chain[index];
+                    assert_eq!(sample.checksum, previous.checksum, "{workload} {rows}");
+                    assert_eq!(sample.checksum, deferred.checksum, "{workload} {rows}");
+                    assert_eq!(sample.checksum, ordered.checksum, "{workload} {rows}");
+                    assert_eq!(sample.bulk_wal, deferred.bulk_wal, "{workload} {rows}");
+                    assert_eq!(sample.bulk_wal, ordered.bulk_wal, "{workload} {rows}");
+                    assert_eq!(sample.spans, previous.spans, "{workload} {rows}");
+                    assert_eq!(sample.singles, previous.singles, "{workload} {rows}");
+                    assert_eq!(sample.id_height, previous.id_height, "{workload} {rows}");
+                    assert_eq!(sample.id_pages, previous.id_pages, "{workload} {rows}");
+                    if sample.reused_paths > 0 {
+                        assert!(
+                            sample.descents < previous.descents,
+                            "{workload} {rows} reused {} prior {}",
+                            sample.descents,
+                            previous.descents
+                        );
+                    }
+                }
+                if rows == 1_000 && workload == "ten" {
+                    assert_eq!(current[0].early_plans, 0, "ten keys must not build a map");
+                    assert!(
+                        prior[0].early_plans >= 1,
+                        "milestone 34 planned this request: {:?}",
+                        prior[0].early_plans
+                    );
+                }
+                if rows == 100_000 && workload == "all" {
+                    assert!(current[0].reused_paths > 0, "{:?}", current[0].reused_paths);
+                    assert!(current[0].descents < prior[0].descents);
+                }
+                let current_us = median(
+                    &current
+                        .iter()
+                        .map(|sample| sample.bulk_us)
+                        .collect::<Vec<_>>(),
+                );
+                let prior_us = median(
+                    &prior
+                        .iter()
+                        .map(|sample| sample.bulk_us)
+                        .collect::<Vec<_>>(),
+                );
+                let late_us = median(&late.iter().map(|sample| sample.bulk_us).collect::<Vec<_>>());
+                let chain_us = median(
+                    &chain
+                        .iter()
+                        .map(|sample| sample.bulk_us)
+                        .collect::<Vec<_>>(),
+                );
+                let current_index = median(
+                    &current
+                        .iter()
+                        .map(|sample| sample.bulk_index_us)
+                        .collect::<Vec<_>>(),
+                );
+                let prior_index = median(
+                    &prior
+                        .iter()
+                        .map(|sample| sample.bulk_index_us)
+                        .collect::<Vec<_>>(),
+                );
+                let sample = &current[0];
+                let previous = &prior[0];
+                println!(
+                    "milestone35 median workload={workload} rows={rows} samples={samples} current_us={current_us} prior_us={prior_us} late_us={late_us} chain_us={chain_us} current_index_us={current_index} prior_index_us={prior_index} wal={} prior_wal={} checksum={} descents={} prior_descents={} reused={} invalidations={} early_plans={} prior_plans={} estimated_pages={} scanned_pages={} builds={} build_us={} member_us={} path_us={} validations={} map_bytes={} spans={} singles={} grouped_postings={} allocated={} freed={} scratch={} verified={}",
+                    sample.bulk_wal,
+                    previous.bulk_wal,
+                    sample.checksum,
+                    sample.descents,
+                    previous.descents,
+                    sample.reused_paths,
+                    sample.path_invalidations,
+                    sample.early_plans,
+                    previous.early_plans,
+                    sample.estimated_pages,
+                    sample.scanned_pages,
+                    sample.presence_builds,
+                    sample.presence_build_us,
+                    sample.presence_member_us,
+                    sample.path_us,
+                    sample.tree_validations,
+                    sample.map_bytes,
+                    sample.spans,
+                    sample.singles,
+                    sample.grouped_postings,
+                    sample.allocated,
+                    sample.freed,
+                    sample.scratch,
+                    sample.presence_verified
                 );
             }
         }
