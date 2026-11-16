@@ -59,8 +59,9 @@
 //! and `WHERE` then sees that extended row. An aggregate left join feeds each
 //! of those logical rows into the same group accumulator as an inner join.
 //! `COUNT(*)` counts a null-extended row. `COUNT`, `SUM`, `AVG`, `MIN`, and
-//! `MAX` of a right column ignore its NULLs. `SELECT DISTINCT` and `DISTINCT`
-//! aggregates stay rejected. A `WHERE` that removes the matches
+//! `MAX` of a right column ignore its NULLs, and so do `COUNT(DISTINCT ...)`,
+//! `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)`: a NULL argument is not stored
+//! in the per-group set. `SELECT DISTINCT` stays rejected. A `WHERE` that removes the matches
 //! does not add the NULL row. `ON` FALSE and `ON` UNKNOWN do not match,
 //! including `NULL = NULL`. `LIMIT` does not stop that scan. The left hash
 //! table stores positions into the right rows, not copied keys, and it does
@@ -2062,7 +2063,8 @@ struct AggGroup {
 /// it, and the clone is dropped if the set cannot reserve room. The set is
 /// not inside [`AccValue`], so a plain `COUNT` does not carry a map. There is
 /// no disk spill: every distinct value of every group stays in memory until
-/// the query finishes.
+/// the query finishes. A `HashMap` that cannot grow aborts the process. That
+/// is not returned as a query error.
 struct DistinctSet {
     buckets: HashMap<u64, Vec<Value>>,
 }
@@ -2435,11 +2437,6 @@ fn reject_left_join(from: &QueryFrom, tail: SelectTail<'_>) -> Result<(), DbErro
     if tail.distinct {
         return Err(DbError::unsupported(
             "LEFT JOIN is not supported with DISTINCT",
-        ));
-    }
-    if crate::ast::has_distinct_aggregate(tail.projection, tail.having, tail.order_by) {
-        return Err(DbError::unsupported(
-            "LEFT JOIN is not supported with DISTINCT aggregates",
         ));
     }
     Ok(())
@@ -11824,5 +11821,540 @@ mod tests {
             }
         }
         (checksum, hits)
+    }
+
+    #[test]
+    fn left_distinct_aggregates_match_nested_and_a_collision() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Ada'), (3, 'Bea'), (NULL, 'Dee');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 10), (1, 10), (1, 20), (3, 10), (NULL, 5);")
+            .unwrap();
+        let sqls = [
+            "SELECT COUNT(*), COUNT(o.amount), COUNT(DISTINCT o.amount), SUM(o.amount), SUM(DISTINCT o.amount), AVG(o.amount), AVG(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+            "SELECT u.name, COUNT(*), COUNT(DISTINCT o.amount), SUM(DISTINCT o.amount), AVG(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name;",
+            "SELECT u.name, COUNT(DISTINCT o.user_id) AS n FROM users u LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.name HAVING n > 0 ORDER BY n DESC;",
+            "SELECT COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.amount > 15;",
+            "SELECT COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id OR o.amount = 5;",
+            "SELECT COUNT(*), COUNT(DISTINCT b.name) FROM users a LEFT JOIN users b ON a.id = b.id;",
+            "SELECT COUNT(*), COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id AND FALSE;",
+            "SELECT COUNT(*), COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id AND NULL;",
+            "SELECT COUNT(*), COUNT(DISTINCT b.name) FROM users a LEFT JOIN users b ON a.name = b.name;",
+        ];
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            sqls.iter()
+                .map(|sql| query(&mut db, sql).rows)
+                .collect::<Vec<_>>()
+        };
+        let hashed = sqls
+            .iter()
+            .map(|sql| query(&mut db, sql).rows)
+            .collect::<Vec<_>>();
+        assert_eq!(hashed, nested);
+        let collided = {
+            let _force = ForceHashCollision::new();
+            sqls.iter()
+                .map(|sql| query(&mut db, sql).rows)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(collided, nested);
+        assert_eq!(
+            nested[0],
+            vec![vec![
+                Value::Integer(6),
+                Value::Integer(4),
+                Value::Integer(2),
+                Value::Integer(50),
+                Value::Integer(30),
+                Value::Ratio {
+                    numerator: 25,
+                    denominator: 2,
+                },
+                Value::Ratio {
+                    numerator: 15,
+                    denominator: 1,
+                },
+            ]]
+        );
+        assert_eq!(nested[6], vec![vec![Value::Integer(4), Value::Integer(0)]]);
+        assert_eq!(nested[7], vec![vec![Value::Integer(4), Value::Integer(0)]]);
+        assert_eq!(nested[8], vec![vec![Value::Integer(6), Value::Integer(3)]]);
+    }
+
+    #[test]
+    fn a_later_left_distinct_overflow_is_not_hidden_by_limit() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Bea');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 10), (2, 9223372036854775807), (2, 1);")
+            .unwrap();
+        let error = db
+            .execute(
+                "SELECT u.name, SUM(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name ORDER BY u.name ASC LIMIT 1;",
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "SUM overflows INTEGER");
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT COUNT(*) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+            )
+            .rows,
+            vec![vec![Value::Integer(3)]]
+        );
+        {
+            let _budget = DistinctReserveBudget::limit(0);
+            let error = db
+                .execute(
+                    "SELECT COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("DISTINCT set is too large"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+            )
+            .rows,
+            vec![vec![Value::Integer(3)]]
+        );
+    }
+
+    #[test]
+    fn a_mistyped_left_residual_fails_a_distinct_aggregate() {
+        let mut db = Database::new();
+        db.execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada'), (9, 'No');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 10), (2, 20);")
+            .unwrap();
+        replace_cell(&mut db, "orders", 1, 1, Value::Text("later".to_string()));
+        let sql = "SELECT COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.amount > 0;";
+        assert_join_error(&mut db, sql);
+        let explained = query(&mut db, &format!("EXPLAIN {sql}"));
+        assert_eq!(
+            explained.rows[0][0],
+            Value::Text("HashLeftJoin".to_string())
+        );
+    }
+
+    #[test]
+    fn a_failed_left_distinct_update_does_not_publish_or_write() {
+        let dir = crate::test_dir::TestDir::new("left-distinct-atomic");
+        let path = dir.join("db");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Bea'), (3, 'Cy');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 10), (1, 20), (2, 9223372036854775807), (2, 1);")
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut wal = path.as_os_str().to_owned();
+        wal.push(".wal");
+        let wal_before = std::fs::read(&wal).unwrap_or_default();
+        let sql = "SELECT u.name, COUNT(DISTINCT o.amount), SUM(DISTINCT o.amount), AVG(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name;";
+        {
+            let _budget = DistinctReserveBudget::limit(0);
+            let error = db.execute(sql).unwrap_err();
+            assert!(
+                error.to_string().contains("DISTINCT set is too large"),
+                "{error}"
+            );
+        }
+        {
+            // One new key charges the map and its bucket. The following new
+            // key is rejected, and the statement returns no row.
+            let _budget = DistinctReserveBudget::limit(2);
+            let error = db
+                .execute(
+                    "SELECT COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("DISTINCT set is too large"),
+                "{error}"
+            );
+        }
+        let overflow = db
+            .execute(
+                "SELECT u.name, SUM(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name ORDER BY u.name LIMIT 1;",
+            )
+            .unwrap_err();
+        assert_eq!(overflow.to_string(), "SUM overflows INTEGER");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&wal).unwrap_or_default(), wal_before);
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+            )
+            .rows,
+            vec![vec![Value::Integer(4)]]
+        );
+
+        let outer = [Value::Integer(1), Value::Text("Ada".to_string())];
+        let inner = [Value::Integer(1), Value::Integer(1)];
+        let mut acc = [AccValue::Avg {
+            sum: i128::MAX,
+            count: 1,
+        }];
+        let mut seen = vec![Some(DistinctSet::new())];
+        let error = update_acc(
+            &mut acc,
+            &mut seen,
+            InputRow::Pair(&outer, &inner),
+            &[AggFn::AvgDistinct(3)],
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "AVG overflows");
+        assert!(matches!(
+            acc[0],
+            AccValue::Avg { sum, count } if sum == i128::MAX && count == 1
+        ));
+        assert_eq!(seen[0].as_ref().unwrap().len(), 0);
+
+        let mut acc = [AccValue::Count(0)];
+        let mut seen = vec![Some(DistinctSet::new())];
+        update_acc(
+            &mut acc,
+            &mut seen,
+            InputRow::Pair(&outer, &[Value::Integer(1), Value::Integer(10)]),
+            &[AggFn::CountDistinct(3)],
+        )
+        .unwrap();
+        {
+            let _budget = DistinctReserveBudget::limit(0);
+            let error = update_acc(
+                &mut acc,
+                &mut seen,
+                InputRow::Pair(&outer, &[Value::Integer(1), Value::Integer(20)]),
+                &[AggFn::CountDistinct(3)],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("DISTINCT set is too large"));
+        }
+        assert!(matches!(acc[0], AccValue::Count(1)));
+        assert!(seen[0].as_ref().unwrap().contains(&Value::Integer(10)));
+        assert!(!seen[0].as_ref().unwrap().contains(&Value::Integer(20)));
+
+        let mut groups = Vec::new();
+        let mut buckets = std::collections::HashMap::new();
+        let plan = AggPlan {
+            group_ordinals: vec![1],
+            group_labels: vec!["name".to_string()],
+            aggs: vec![AggFn::CountDistinct(3)],
+            outputs: vec![0, 1],
+            output_names: vec!["name".to_string(), "n".to_string()],
+            slot_labels: vec!["COUNT(DISTINCT amount)".to_string()],
+            alias_labels: Vec::new(),
+            aggregate_labels: vec!["COUNT(DISTINCT amount)".to_string()],
+            sort_keys: Vec::new(),
+            filter: None,
+            having: None,
+            path: AccessPath::SeqScan,
+            access: "test".to_string(),
+        };
+        {
+            let _budget = DistinctReserveBudget::limit(0);
+            let error = absorb_row(
+                InputRow::Pair(&outer, &[Value::Integer(1), Value::Integer(10)]),
+                &plan,
+                &mut groups,
+                &mut buckets,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("DISTINCT set is too large"));
+        }
+        assert!(groups.is_empty());
+        absorb_row(
+            InputRow::Pair(&outer, &[Value::Integer(1), Value::Integer(10)]),
+            &plan,
+            &mut groups,
+            &mut buckets,
+        )
+        .unwrap();
+        let other = [Value::Integer(2), Value::Text("Bea".to_string())];
+        {
+            let _budget = DistinctReserveBudget::limit(0);
+            let error = absorb_row(
+                InputRow::Pair(&other, &[Value::Integer(2), Value::Integer(20)]),
+                &plan,
+                &mut groups,
+                &mut buckets,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("DISTINCT set is too large"));
+        }
+        assert_eq!(groups.len(), 1);
+        assert!(
+            groups[0].seen[0]
+                .as_ref()
+                .unwrap()
+                .contains(&Value::Integer(10))
+        );
+        assert!(
+            !groups[0].seen[0]
+                .as_ref()
+                .unwrap()
+                .contains(&Value::Integer(20))
+        );
+    }
+
+    #[test]
+    #[ignore = "release profile of DISTINCT aggregates over LEFT JOIN"]
+    fn profile_milestone22() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone22 cpu={cpu} mem_bytes={mem} rustc={rustc} value_bytes={} acc_bytes={} set_bytes={}",
+            std::mem::size_of::<Value>(),
+            std::mem::size_of::<AccValue>(),
+            std::mem::size_of::<std::collections::HashMap<u64, Vec<Value>>>()
+        );
+        for rows in [100_i64, 1_000, 4_000, 10_000] {
+            for shape in ["matched", "few", "duplicates", "none", "nulls"] {
+                let nested = rows <= 4_000 || (rows == 10_000 && shape == "matched");
+                profile_left_distinct(rows, shape, nested);
+            }
+        }
+    }
+
+    fn profile_left_distinct(rows: i64, shape: &str, nested: bool) {
+        let mut database = Database::new();
+        load_left_distinct(&mut database, rows, shape);
+        let ordinary = "SELECT COUNT(*), COUNT(o.amount), SUM(o.amount), AVG(o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;";
+        let distinct = "SELECT COUNT(DISTINCT o.amount), SUM(DISTINCT o.amount), AVG(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;";
+        let explained = query(&mut database, &format!("EXPLAIN {distinct}"));
+        assert_eq!(
+            explained.rows[0][0],
+            Value::Text("HashLeftJoin".to_string()),
+            "{shape} {rows}"
+        );
+        let expect = left_distinct_totals(rows, shape);
+        let (ordinary_cold, ordinary_warm, ordinary_checksum, ordinary_rows) =
+            time_agg(&mut database, ordinary);
+        let (cold, warm, checksum, returned) = time_agg(&mut database, distinct);
+        assert_eq!(ordinary_rows, 1);
+        assert_eq!(returned, 1);
+        assert_eq!(
+            ordinary_checksum, expect.ordinary_checksum,
+            "{shape} {rows}"
+        );
+        assert_eq!(checksum, expect.checksum, "{shape} {rows}");
+        let (nested_ordinary_cold, nested_ordinary_warm, nested_cold, nested_warm) = if nested {
+            let _force = ForceNestedJoin::new();
+            let (ordinary_cold, ordinary_warm, ordinary_checksum, _) =
+                time_agg(&mut database, ordinary);
+            let (cold, warm, checksum, _) = time_agg(&mut database, distinct);
+            assert_eq!(
+                ordinary_checksum, expect.ordinary_checksum,
+                "nested ordinary {shape} {rows}"
+            );
+            assert_eq!(checksum, expect.checksum, "nested {shape} {rows}");
+            (ordinary_cold, ordinary_warm, cold, warm)
+        } else {
+            (0, 0, 0, 0)
+        };
+        let acc_bytes = 4_usize.saturating_mul(std::mem::size_of::<AccValue>());
+        let distinct_bytes = 3_usize
+            .saturating_mul(std::mem::size_of::<AccValue>())
+            .saturating_add(
+                3_usize.saturating_mul(expect.uniques.saturating_mul(std::mem::size_of::<Value>())),
+            )
+            .saturating_add(3_usize.saturating_mul(std::mem::size_of::<
+                std::collections::HashMap<u64, Vec<Value>>,
+            >()));
+        println!(
+            "milestone22 shape={shape} users={rows} orders={rows} hits={} null_extended={} inputs={} groups=1 uniques={} ordinary_acc_bytes={acc_bytes} distinct_bytes={distinct_bytes} ordinary_hash_cold_us={ordinary_cold} ordinary_hash_warm_us={ordinary_warm} distinct_hash_cold_us={cold} distinct_hash_warm_us={warm} ordinary_nested_cold_us={nested_ordinary_cold} ordinary_nested_warm_us={nested_ordinary_warm} distinct_nested_cold_us={nested_cold} distinct_nested_warm_us={nested_warm} ordinary_checksum={ordinary_checksum} distinct_checksum={checksum}",
+            expect.hits, expect.null_extended, expect.inputs, expect.uniques
+        );
+    }
+
+    fn load_left_distinct(database: &mut Database, rows: i64, shape: &str) {
+        database
+            .execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        database
+            .execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        let mut start = 0_i64;
+        while start < rows {
+            let end = (start + 400).min(rows);
+            let mut sql = String::from("INSERT INTO users VALUES ");
+            for id in start..end {
+                if id > start {
+                    sql.push(',');
+                }
+                let name = (b'a' + u8::try_from(id % 8).unwrap_or(0)) as char;
+                sql.push_str(&format!("({id}, '{name}')"));
+            }
+            sql.push(';');
+            database.execute(&sql).unwrap();
+            start = end;
+        }
+        start = 0;
+        while start < rows {
+            let end = (start + 400).min(rows);
+            let mut sql = String::from("INSERT INTO orders VALUES ");
+            for id in start..end {
+                if id > start {
+                    sql.push(',');
+                }
+                let (user_id, amount) = left_distinct_order(id, rows, shape);
+                match (user_id, amount) {
+                    (Some(user_id), Some(amount)) => {
+                        sql.push_str(&format!("({user_id}, {amount})"));
+                    }
+                    (Some(user_id), None) => sql.push_str(&format!("({user_id}, NULL)")),
+                    (None, Some(amount)) => sql.push_str(&format!("(NULL, {amount})")),
+                    (None, None) => sql.push_str("(NULL, NULL)"),
+                }
+            }
+            sql.push(';');
+            database.execute(&sql).unwrap();
+            start = end;
+        }
+    }
+
+    fn left_distinct_order(id: i64, rows: i64, shape: &str) -> (Option<i64>, Option<i64>) {
+        let user_id = match shape {
+            "none" => Some(-1),
+            "duplicates" => Some(id % 10),
+            _ => Some(id % rows.max(1)),
+        };
+        let amount = match shape {
+            "nulls" => None,
+            "few" => Some(id % 3),
+            "duplicates" => {
+                if id % 4 == 0 {
+                    None
+                } else {
+                    Some(id % 5)
+                }
+            }
+            _ => {
+                if id % 11 == 0 {
+                    None
+                } else {
+                    Some(id % 97)
+                }
+            }
+        };
+        (user_id, amount)
+    }
+
+    struct LeftDistinctTotals {
+        hits: i64,
+        null_extended: i64,
+        inputs: i64,
+        uniques: usize,
+        ordinary_checksum: i64,
+        checksum: i64,
+    }
+
+    fn left_distinct_totals(rows: i64, shape: &str) -> LeftDistinctTotals {
+        let mut hits = 0_i64;
+        let mut seen_user = vec![false; usize::try_from(rows).unwrap_or(0)];
+        let mut amounts = Vec::new();
+        for id in 0..rows {
+            let (user_id, amount) = left_distinct_order(id, rows, shape);
+            let Some(user_id) = user_id else {
+                continue;
+            };
+            if (0..rows).contains(&user_id) {
+                hits += 1;
+                seen_user[usize::try_from(user_id).unwrap_or(0)] = true;
+                if let Some(amount) = amount {
+                    amounts.push(amount);
+                }
+            }
+        }
+        let null_extended = i64::try_from(
+            (0..rows)
+                .filter(|id| !seen_user[usize::try_from(*id).unwrap_or(0)])
+                .count(),
+        )
+        .unwrap_or(i64::MAX);
+        let count_star = hits + null_extended;
+        let count_amount = i64::try_from(amounts.len()).unwrap_or(i64::MAX);
+        let mut unique = amounts.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        let sum: i128 = amounts
+            .iter()
+            .fold(0, |sum, amount| sum + i128::from(*amount));
+        let sum_distinct: i128 = unique
+            .iter()
+            .fold(0, |sum, amount| sum + i128::from(*amount));
+        let sum_cell = if amounts.is_empty() {
+            Value::Null
+        } else {
+            Value::Integer(i64::try_from(sum).unwrap())
+        };
+        let sum_distinct_cell = if unique.is_empty() {
+            Value::Null
+        } else {
+            Value::Integer(i64::try_from(sum_distinct).unwrap())
+        };
+        let ordinary = [
+            Value::Integer(count_star),
+            Value::Integer(count_amount),
+            sum_cell,
+            reduced_average(sum, count_amount),
+        ];
+        let distinct = [
+            Value::Integer(i64::try_from(unique.len()).unwrap_or(i64::MAX)),
+            sum_distinct_cell,
+            reduced_average(sum_distinct, i64::try_from(unique.len()).unwrap_or(0)),
+        ];
+        LeftDistinctTotals {
+            hits,
+            null_extended,
+            inputs: count_star,
+            uniques: unique.len(),
+            ordinary_checksum: ordinary
+                .iter()
+                .fold(0_i64, |sum, cell| sum.wrapping_add(profile_cell(cell))),
+            checksum: distinct
+                .iter()
+                .fold(0_i64, |sum, cell| sum.wrapping_add(profile_cell(cell))),
+        }
+    }
+
+    fn reduced_average(sum: i128, count: i64) -> Value {
+        if count <= 0 {
+            return Value::Null;
+        }
+        let mut left = sum.unsigned_abs();
+        let mut right = u128::from(u64::try_from(count).unwrap_or(0));
+        while right != 0 {
+            (left, right) = (right, left % right);
+        }
+        let divisor = left.max(1);
+        Value::Ratio {
+            numerator: i128::try_from(sum.unsigned_abs() / divisor).unwrap_or(0),
+            denominator: i64::try_from(u128::from(u64::try_from(count).unwrap_or(0)) / divisor)
+                .unwrap_or(1),
+        }
     }
 }

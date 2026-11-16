@@ -1034,11 +1034,13 @@ fn aliases_self_joins_and_illegal_projections_bind_before_the_scan() {
         "SELECT u.name, COUNT(*) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
     );
     assert!(error.contains("must appear in GROUP BY"), "{error}");
-    let error = failure(
-        &mut database,
-        "SELECT COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+    assert_eq!(
+        rows(
+            &mut database,
+            "SELECT COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+        ),
+        vec![vec![integer(3)]]
     );
-    assert_eq!(error, "LEFT JOIN is not supported with DISTINCT aggregates");
     let error = failure(
         &mut database,
         "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id;",

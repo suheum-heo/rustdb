@@ -351,48 +351,6 @@ impl Expr {
         write_expr(self, 0, &mut out);
         out
     }
-
-    fn contains_distinct_aggregate(&self) -> bool {
-        match self {
-            Self::Aggregate(call) => call.distinct,
-            Self::Binary { left, right, .. } => {
-                left.contains_distinct_aggregate() || right.contains_distinct_aggregate()
-            }
-            Self::Not(inner) | Self::IsNull(inner) | Self::IsNotNull(inner) => {
-                inner.contains_distinct_aggregate()
-            }
-            Self::Literal(_) | Self::Column { .. } => false,
-        }
-    }
-}
-
-/// `COUNT(DISTINCT ...)`, `SUM(DISTINCT ...)`, or `AVG(DISTINCT ...)` anywhere
-/// this milestone still rejects on a `LEFT JOIN`.
-pub(crate) fn has_distinct_aggregate(
-    projection: &Projection,
-    having: Option<&Expr>,
-    order_by: &[OrderKey],
-) -> bool {
-    if having.is_some_and(Expr::contains_distinct_aggregate) {
-        return true;
-    }
-    if order_by.iter().any(|key| {
-        matches!(
-            &key.target,
-            OrderTarget::Aggregate(call) if call.distinct
-        )
-    }) {
-        return true;
-    }
-    let Projection::Columns(items) = projection else {
-        return false;
-    };
-    items.iter().any(|item| {
-        matches!(
-            item,
-            SelectItem::Aggregate { call, .. } if call.distinct
-        )
-    })
 }
 
 fn write_expr(expr: &Expr, parent: u8, out: &mut String) {

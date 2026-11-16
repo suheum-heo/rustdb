@@ -507,19 +507,25 @@ fn unsupported_outer_forms_stay_rejected() {
             "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
             "LEFT JOIN is not supported with DISTINCT",
         ),
-        (
-            "SELECT COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
-            "LEFT JOIN is not supported with DISTINCT aggregates",
-        ),
     ];
     for (sql, message) in cases {
         assert_eq!(failure(&mut database, sql), message, "{sql}");
     }
-    let error = failure(
+    let explained = query(
         &mut database,
         "EXPLAIN SELECT COUNT(DISTINCT o.user_id) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
     );
-    assert_eq!(error, "LEFT JOIN is not supported with DISTINCT aggregates");
+    assert_eq!(
+        explained.rows[0][0],
+        Value::Text("HashLeftJoin".to_string())
+    );
+    assert!(
+        explained.rows[0]
+            .iter()
+            .any(|cell| matches!(cell, Value::Text(text) if text.contains("COUNT(DISTINCT"))),
+        "{:?}",
+        explained.rows
+    );
 }
 
 #[test]
