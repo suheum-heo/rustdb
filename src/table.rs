@@ -4,10 +4,11 @@
 //! store publishes those rows into slotted heap pages after the statement
 //! succeeds. Each row has an id assigned at insert time. `UPDATE` keeps ids
 //! and can replace only the matched rows. `DELETE` keeps the ids of the
-//! surviving rows.
+//! surviving rows and does not reuse a removed id.
 //!
 //! `positions` maps those stable ids to the current vector slot. It is rebuilt
-//! when `DELETE` compacts the vector. It is not written to the file.
+//! when `DELETE` compacts the vector and when a failed `DELETE` splices the
+//! removed rows back. It is not written to the file.
 
 use std::collections::{HashMap, HashSet};
 
@@ -332,7 +333,13 @@ impl Table {
     ///
     /// Surviving row ids stay attached to those rows. This is how `DELETE`
     /// preserves identity without matching values that may not be unique.
-    pub(crate) fn retain_indexes(&mut self, indexes: &[usize]) -> Result<(), DbError> {
+    /// Survivor images are moved, not cloned. The returned time is the rebuild
+    /// of the row-id map. Keeping every row does not allocate.
+    ///
+    /// The replacement vectors reserve room for the original row count before
+    /// the table changes. A reservation failure leaves this table as it was.
+    /// Restore allocates its own vectors; it does not reuse this spare capacity.
+    pub(crate) fn retain_indexes(&mut self, indexes: &[usize]) -> Result<u128, DbError> {
         if self.row_ids.len() != self.rows.len() {
             return Err(DbError::Internal(format!(
                 "table '{}' has {} row ids for {} rows",
@@ -341,8 +348,17 @@ impl Table {
                 self.rows.len()
             )));
         }
-        let mut kept_rows = Vec::with_capacity(indexes.len());
-        let mut kept_ids = Vec::with_capacity(indexes.len());
+        if indexes.len() == self.rows.len() {
+            for (expected, index) in indexes.iter().enumerate() {
+                if *index != expected {
+                    return Err(DbError::Internal(format!(
+                        "cannot retain row {index} from table '{}'",
+                        self.name
+                    )));
+                }
+            }
+            return Ok(0);
+        }
         let mut previous = None;
         for index in indexes {
             if *index >= self.rows.len() || previous.is_some_and(|seen: usize| *index <= seen) {
@@ -352,17 +368,201 @@ impl Table {
                 )));
             }
             previous = Some(*index);
-            kept_rows.push(self.rows[*index].clone());
-            kept_ids.push(self.row_ids[*index]);
         }
+        let original = self.rows.len();
+        let mut kept_rows = Vec::new();
+        kept_rows
+            .try_reserve(original)
+            .map_err(|_| restoration_capacity())?;
+        let mut kept_ids = Vec::new();
+        kept_ids
+            .try_reserve(original)
+            .map_err(|_| restoration_capacity())?;
+        let mut positions = HashMap::new();
+        positions
+            .try_reserve(original)
+            .map_err(|_| restoration_capacity())?;
+        let mut seen = HashSet::new();
+        seen.try_reserve(indexes.len())
+            .map_err(|_| restoration_capacity())?;
+        for index in indexes {
+            if !seen.insert(self.row_ids[*index]) {
+                return Err(DbError::Storage("database file is corrupt".to_string()));
+            }
+        }
+
+        let mut rows = std::mem::take(&mut self.rows);
+        let row_ids = std::mem::take(&mut self.row_ids);
+        for index in indexes {
+            kept_rows.push(std::mem::take(&mut rows[*index]));
+            kept_ids.push(row_ids[*index]);
+        }
+        drop(rows);
+        let started = std::time::Instant::now();
+        for (position, row_id) in kept_ids.iter().copied().enumerate() {
+            positions.insert(row_id, position);
+        }
+        let positions_us = started.elapsed().as_micros();
         self.rows = kept_rows;
         self.row_ids = kept_ids;
-        self.rebuild_positions()?;
+        self.positions = positions;
+        Ok(positions_us)
+    }
+
+    /// Confirm `rows` can be spliced back without writing.
+    ///
+    /// `rows` is `(original position, row id)` in increasing position. A live
+    /// id, a repeated id, or a position that is not a hole left by compaction
+    /// fails before any slot changes.
+    pub(crate) fn check_delete_restore(&self, rows: &[(usize, u64)]) -> Result<(), DbError> {
+        if self.row_ids.len() != self.rows.len() {
+            return Err(DbError::Internal(format!(
+                "table '{}' has {} row ids for {} rows",
+                self.name,
+                self.row_ids.len(),
+                self.rows.len()
+            )));
+        }
+        let mut live = HashSet::new();
+        live.try_reserve(self.row_ids.len().saturating_add(rows.len()))
+            .map_err(|_| restoration_capacity())?;
+        for row_id in &self.row_ids {
+            if !live.insert(*row_id) {
+                return Err(DbError::Storage("database file is corrupt".to_string()));
+            }
+        }
+        let mut previous = None;
+        for (index, (position, row_id)) in rows.iter().enumerate() {
+            if *row_id == 0 || *row_id >= self.next_row_id {
+                return Err(DbError::Internal(format!(
+                    "undo row {row_id} is outside the counter for table '{}'",
+                    self.name
+                )));
+            }
+            if !live.insert(*row_id) {
+                return Err(DbError::Internal(format!(
+                    "undo row {row_id} is already in '{}'",
+                    self.name
+                )));
+            }
+            let limit = self.rows.len() + index;
+            if previous.is_some_and(|seen| *position <= seen) || *position > limit {
+                return Err(DbError::Internal(format!(
+                    "undo row {row_id} cannot return to position {position} in '{}'",
+                    self.name
+                )));
+            }
+            previous = Some(*position);
+        }
+        Ok(())
+    }
+
+    /// Splice removed rows back at their original positions.
+    ///
+    /// Validation, the placement plan, and vector reservation all finish
+    /// before a live row is moved. The completed vectors then replace this
+    /// table. A failure before that replacement leaves the compacted rows and
+    /// `rows` in place. Filling the plan does not return a query error: every
+    /// index is in range and every push fits the reservation. An allocator
+    /// abort while moving is not a query error. Row ids and `next_row_id` are
+    /// not reassigned.
+    pub(crate) fn restore_deleted(
+        &mut self,
+        rows: &mut Vec<(usize, u64, Vec<Value>)>,
+    ) -> Result<(), DbError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut pairs = Vec::new();
+        pairs
+            .try_reserve(rows.len())
+            .map_err(|_| restoration_capacity())?;
+        for (position, row_id, _) in rows.iter() {
+            pairs.push((*position, *row_id));
+        }
+        self.check_delete_restore(&pairs)?;
+        let survivors = self.rows.len();
+        let Some(original) = survivors.checked_add(rows.len()) else {
+            return Err(restoration_capacity());
+        };
+        let mut plan = Vec::new();
+        plan.try_reserve(original)
+            .map_err(|_| restoration_capacity())?;
+        let mut deleted_at = 0usize;
+        let mut survivor_at = 0usize;
+        for position in 0..original {
+            if deleted_at < rows.len() && rows[deleted_at].0 == position {
+                plan.push(RestorePlace::Deleted(deleted_at));
+                deleted_at += 1;
+            } else if survivor_at < survivors {
+                plan.push(RestorePlace::Survivor(survivor_at));
+                survivor_at += 1;
+            } else {
+                return Err(DbError::Internal(format!(
+                    "undo could not place position {position} in '{}'",
+                    self.name
+                )));
+            }
+        }
+        if deleted_at != rows.len() || survivor_at != survivors {
+            return Err(DbError::Internal(format!(
+                "undo restore did not consume table '{}'",
+                self.name
+            )));
+        }
+        let mut merged_rows = Vec::new();
+        merged_rows
+            .try_reserve(original)
+            .map_err(|_| restoration_capacity())?;
+        let mut merged_ids = Vec::new();
+        merged_ids
+            .try_reserve(original)
+            .map_err(|_| restoration_capacity())?;
+        let mut positions = HashMap::new();
+        positions
+            .try_reserve(original)
+            .map_err(|_| restoration_capacity())?;
+        let mut deleted_ids = Vec::new();
+        deleted_ids
+            .try_reserve(rows.len())
+            .map_err(|_| restoration_capacity())?;
+        let mut deleted_values = Vec::new();
+        deleted_values
+            .try_reserve(rows.len())
+            .map_err(|_| restoration_capacity())?;
+
+        let mut old_rows = std::mem::take(&mut self.rows);
+        let old_ids = std::mem::take(&mut self.row_ids);
+        for (_, row_id, values) in std::mem::take(rows) {
+            deleted_ids.push(row_id);
+            deleted_values.push(values);
+        }
+        for place in plan {
+            let (row_id, values) = match place {
+                RestorePlace::Survivor(index) => {
+                    (old_ids[index], std::mem::take(&mut old_rows[index]))
+                }
+                RestorePlace::Deleted(index) => (
+                    deleted_ids[index],
+                    std::mem::take(&mut deleted_values[index]),
+                ),
+            };
+            let slot = merged_rows.len();
+            positions.insert(row_id, slot);
+            merged_ids.push(row_id);
+            merged_rows.push(values);
+        }
+        self.rows = merged_rows;
+        self.row_ids = merged_ids;
+        self.positions = positions;
         Ok(())
     }
 
     fn rebuild_positions(&mut self) -> Result<(), DbError> {
         self.positions.clear();
+        self.positions
+            .try_reserve(self.row_ids.len())
+            .map_err(|_| restoration_capacity())?;
         for (position, row_id) in self.row_ids.iter().copied().enumerate() {
             if self.positions.insert(row_id, position).is_some() {
                 return Err(DbError::Storage("database file is corrupt".to_string()));
@@ -428,6 +628,15 @@ impl Table {
                 .collect(),
         }
     }
+}
+
+enum RestorePlace {
+    Survivor(usize),
+    Deleted(usize),
+}
+
+fn restoration_capacity() -> DbError {
+    DbError::Internal("delete could not reserve restoration capacity".to_string())
 }
 
 #[cfg(test)]
@@ -575,5 +784,68 @@ mod tests {
         image.rows.push(image.rows[0].clone());
         let error = Table::from_image(image).unwrap_err();
         assert!(error.to_string().contains("corrupt"), "{error}");
+    }
+
+    #[test]
+    fn restore_deleted_puts_every_shape_back() {
+        let mut table = users();
+        table
+            .insert(
+                &[],
+                vec![
+                    vec![Value::Integer(1), Value::Text("a".to_string())],
+                    vec![Value::Integer(2), Value::Text("b".to_string())],
+                    vec![Value::Integer(3), Value::Text("c".to_string())],
+                    vec![Value::Integer(4), Value::Text("d".to_string())],
+                ],
+            )
+            .unwrap();
+        let next = table.next_row_id();
+        let original = table.rows().to_vec();
+        let original_ids = table.row_ids().to_vec();
+
+        for kept in [
+            vec![1, 2, 3],
+            vec![0, 2, 3],
+            vec![0, 1, 2],
+            vec![0, 3],
+            vec![1],
+            vec![],
+            vec![0, 1, 2, 3],
+        ] {
+            table.retain_indexes(&kept).unwrap();
+            let mut removed: Vec<_> = (0..original.len())
+                .filter(|position| !kept.contains(position))
+                .map(|position| (position, original_ids[position], original[position].clone()))
+                .collect();
+            table.restore_deleted(&mut removed).unwrap();
+            assert!(removed.is_empty());
+            assert_eq!(table.rows(), original.as_slice());
+            assert_eq!(table.row_ids(), original_ids.as_slice());
+            assert_eq!(table.next_row_id(), next);
+            for (position, row_id) in original_ids.iter().copied().enumerate() {
+                assert_eq!(table.position(row_id), Some(position));
+            }
+        }
+
+        table.retain_indexes(&[0, 2, 3]).unwrap();
+        let mut duplicate = vec![(1, 1, vec![Value::Integer(9), Value::Text("x".to_string())])];
+        let error = table.restore_deleted(&mut duplicate).unwrap_err();
+        assert!(error.to_string().contains("already in"), "{error}");
+        assert_eq!(duplicate.len(), 1);
+        assert_eq!(table.row_ids(), &[1, 3, 4]);
+        assert_eq!(table.rows().len(), 3);
+        assert_eq!(table.next_row_id(), next);
+        assert_eq!(table.position(1), Some(0));
+        assert_eq!(table.position(2), None);
+
+        let mut impossible = vec![(9, 2, vec![Value::Integer(2), Value::Text("b".to_string())])];
+        let error = table.restore_deleted(&mut impossible).unwrap_err();
+        assert!(error.to_string().contains("cannot return"), "{error}");
+        assert_eq!(impossible.len(), 1);
+        assert_eq!(table.row_ids(), &[1, 3, 4]);
+        assert_eq!(table.rows().len(), 3);
+        assert_eq!(table.position(2), None);
+        assert_eq!(table.next_row_id(), next);
     }
 }

@@ -1256,3 +1256,45 @@ Updating every row is 211,227 µs with the journal and 207,646 µs with the snap
 At 100 rows the warm updates sit inside the WAL, about 10–12 ms, and neither undo path is consistently faster. A miss is 7 µs versus 11 µs. At 1,000 rows a miss is 45 µs versus 126 µs and a no-op is 43 µs versus 98 µs. A one-row update is 11,926 µs versus 11,027 µs, inside the noise of one sync. At 10,000 rows a miss is 165 µs versus 537 µs, a no-op is 250 µs versus 590 µs, and a one-row update is 10,978 µs versus 12,063 µs. Updating every row at 10,000 is 30,042 µs versus 29,847 µs with the same 574,096 WAL bytes.
 
 The journal removes the full-table clone from a selective `UPDATE` that does not match every row. It does not reduce WAL bytes when the same pages are dirty, and it does not remove the equality walk. An update of every row still journals the table and still rewrites those heap pages. `DELETE` and `INSERT` still snapshot the table. Peak RSS was not measured, so this run does not claim a smaller process.
+
+## Milestone 28 selective DELETE undo
+
+16 Nov 2026, Apple M5, 17179869184 bytes of memory, rustc 1.100.0. `Value` is 32 bytes, `Vec<Value>` is 24 bytes, and `usize` is 8 bytes. The ignored test is `profile_milestone28`. It copies one database per size and runs the row journal against the previous full-table undo snapshot. Publish is the existing unlink path on both. Samples are 6 below 100,000 rows and 3 at 100,000 for a miss, a one-row delete, a ten-row delete, and a duplicate-key delete. Cold is the first sample. Warm is the median of the rest. Deleting half the rows, every row, one row after an indexed key change, one wide text value, and the precommit failure are one sample each, so cold and warm match. Injected errors are not a power-loss test.
+
+`undo_bytes` is `entries * 8 + entries * 8 + entries * columns * 32`: one `usize` position, one row id, and the value slots. `snapshot_bytes` is the Milestone 27 estimate, `rows * 160` on this schema. Neither figure is process RSS. Neither includes the heap bytes of a `TEXT` value or the row-id map. Allocation counts were not instrumented, and peak RSS was not measured. A miss stores no journal entries. Deleting every row stores one entry per row. On this schema that journal is `rows * 144` bytes and the snapshot estimate is `rows * 160`. The 1,600,000 byte gap at 100,000 rows is the snapshot's per-row `Vec` header, which the journal does not keep for survivors.
+
+| Rows | Workload | Entries | Undo bytes | Snapshot bytes | WAL bytes | Heap | Index | Frames | Checksum |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100,000 | miss | 0 | 0 | 16,000,000 | 0 | 0 | 0 | 0 | 5,001,088,890 |
+| 100,000 | one | 1 | 144 | 16,000,000 | 36,996 | 1 | 6 | 9 | 5,001,088,887 |
+| 100,000 | ten | 10 | 1,440 | 16,000,000 | 94,396 | 1 | 20 | 23 | 5,001,088,770 |
+| 100,000 | duplicates | 10,000 | 1,440,000 | 16,000,000 | 7,749,096 | 1,407 | 403 | 1,890 | 4,501,070,001 |
+| 100,000 | half | 50,000 | 7,200,000 | 16,000,000 | 6,314,096 | 1 | 42 | 1,540 | 3,750,550,000 |
+| 100,000 | all | 100,000 | 14,400,000 | 16,000,000 | 12,275,496 | 0 | 1 | 2,994 | 0 |
+| 100,000 | updated | 1 | 144 | 16,000,000 | 45,196 | 1 | 7 | 11 | 5,001,088,887 |
+| 100,000 | wide | 1 | 144 | 16,000,000 | 61,596 | 1 | 8 | 15 | 5,001,088,887 |
+| 100,000 | rollback | 1 | 144 | 16,000,000 | 0 durable | 0 | 0 | 0 | 5,001,088,890 restored |
+
+The journal and the snapshot wrote the same WAL and the same heap, index, and frame counts on every workload, at every size. Checksums matched. Rollback left the logical table unchanged. Its encoded log was 49,264 bytes and was not a synced commit. The checksum above is the 100,000-row database before that failed statement. The retry then matches the one-row delete, checksum 5,001,088,885. A delete of every row frees the heap pages, so the heap counter is 0 and those pages are included in the 2,994 frames as free pages. The half delete likewise frees pages: one heap page remains in the counter, 42 index pages are dirty, and the frame count is 1,540.
+
+Warm latency, journal then snapshot, in microseconds. `positions` is the in-memory row-id map rebuild on the untimed statement. `apply` includes that rebuild and the survivor move.
+
+| Rows | Workload | Journal | Snapshot | Undo capture | Snapshot clone | Discover | Validate | Apply | Positions |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100,000 | miss | 23,765 | 29,774 | 0 | 2,679 | 318 | 312 | 23 | 0 |
+| 100,000 | one | 31,000 | 35,448 | 28 | 2,580 | 468 | 448 | 2,809 | 1,074 |
+| 100,000 | ten | 38,919 | 43,107 | 36 | 2,644 | 1,995 | 0 | 2,721 | 1,012 |
+| 100,000 | duplicates | 3,438,808 | 3,477,783 | 1,237 | 3,049 | 1,864 | 515 | 3,024 | 745 |
+| 100,000 | half | 20,420,738 | 20,388,899 | 3,757 | 2,989 | 1,126 | 0 | 2,102 | 513 |
+| 100,000 | all | 1,454,122 | 1,454,278 | 7,298 | 2,695 | 1,356 | 0 | 1,627 | 0 |
+| 100,000 | updated | 30,758 | 35,885 | 1 | 2,728 | 455 | 358 | 2,570 | 867 |
+| 100,000 | wide | 31,382 | 35,399 | 1 | 2,766 | 427 | 316 | 2,752 | 910 |
+| 100,000 | rollback | 23,417 | 23,639 | 44 | 2,584 | 206 | 199 | 2,537 | 885 |
+
+At 100,000 rows a miss is 23,765 µs with the journal and 29,774 µs with the snapshot. Both write 0 WAL bytes. The snapshot clone is 2,679 µs and the journal stores nothing. Publish still builds a table image, about 12,200 µs on the journal and 12,933 µs on the snapshot, because a miss does not change row ids and the editor compares the stored rows. A one-row delete is 31,000 µs versus 35,448 µs, and both logs are 36,996 bytes: one heap page, six index pages, and nine frames. Rebuilding the row-id map for the survivors is 1,074 µs. The durable write did not get smaller. The wide-text delete journals the original short name in the byte estimate, 144 bytes, while the 200-character value is real heap memory outside that estimate. Its log is 61,596 bytes on both paths. Deleting the row after an indexed key change is 30,758 µs versus 35,885 µs, with 45,196 WAL bytes and seven index pages.
+
+Deleting 10,000 duplicate keys is 3,438,808 µs versus 3,477,783 µs. Both write 7,749,096 WAL bytes. Capturing the journal is 1,237 µs and the clone is 3,049 µs. Publish is about 3.35 seconds on both, which is the unlink, not the undo. Deleting half the rows is 20,420,738 µs versus 20,388,899 µs. Publish is about 20.3 seconds on both. The journal is larger to capture, 3,757 µs versus 2,989 µs, and the statement does not get faster. Deleting every row is 1,454,122 µs versus 1,454,278 µs, both writing 12,275,496 WAL bytes. Capturing 100,000 images took 7,298 µs. Cloning the table took 2,695 µs. The journal is smaller by the estimate above and slower to build.
+
+At 100 rows the warm deletes sit inside the WAL, about 9–13 ms, and neither undo path is consistently faster. A miss is 26 µs versus 29 µs. At 1,000 rows a miss is 505 µs versus 275 µs, inside the noise of a statement that writes nothing, and the clone is 63 µs. A one-row delete is 12,056 µs versus 11,999 µs. At 10,000 rows a miss is 2,248 µs versus 2,581 µs and a one-row delete is 13,005 µs versus 11,999 µs, the same 28,796 WAL bytes. Deleting every row at 10,000 is 66,102 µs versus 66,058 µs with the same 1,205,496 WAL bytes.
+
+The journal removes the full-table clone from a `DELETE` that does not remove every row. It does not reduce WAL bytes when the same pages are dirty, and it does not remove the equality walk or the per-row unlink. A miss still pays for a table image. `INSERT` still snapshots the table. Peak RSS was not measured, so this run does not claim a smaller process.
