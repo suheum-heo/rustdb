@@ -216,6 +216,52 @@ impl Table {
         Ok(())
     }
 
+    /// Confirm every saved image still names a live slot.
+    ///
+    /// This writes nothing. Rollback uses it before moving the images back so
+    /// a missing id does not leave a prefix of the statement restored.
+    pub(crate) fn check_restore(&self, rows: &[(u64, Vec<Value>)]) -> Result<(), DbError> {
+        for (row_id, _) in rows {
+            let Some(position) = self.position(*row_id) else {
+                return Err(DbError::Internal(format!(
+                    "undo row {row_id} is not in '{}'",
+                    self.name
+                )));
+            };
+            if self.rows.get(position).is_none() {
+                return Err(DbError::Internal(format!(
+                    "undo row {row_id} is not in '{}'",
+                    self.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Move saved images back into their slots.
+    ///
+    /// `check_restore` has already accepted every id. A miss here means the
+    /// map changed after that check. Earlier images in `rows` may already
+    /// have been written; the caller fences instead of reporting success.
+    pub(crate) fn restore_images(&mut self, rows: Vec<(u64, Vec<Value>)>) -> Result<(), DbError> {
+        for (row_id, values) in rows {
+            let Some(position) = self.position(row_id) else {
+                return Err(DbError::Internal(format!(
+                    "undo row {row_id} is not in '{}'",
+                    self.name
+                )));
+            };
+            if self.rows.get(position).is_none() {
+                return Err(DbError::Internal(format!(
+                    "undo row {row_id} is not in '{}'",
+                    self.name
+                )));
+            }
+            self.rows[position] = values;
+        }
+        Ok(())
+    }
+
     /// Check row ids and cell types the way a full publish does, without cloning
     /// or encoding rows this statement does not rewrite.
     pub(crate) fn audit(&self) -> Result<(), DbError> {

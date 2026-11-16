@@ -226,28 +226,48 @@ impl Database {
 
     fn execute_statement(&mut self, statement: Statement) -> Result<StatementResult, DbError> {
         self.clear_selective();
+        self.clear_update_undo();
+        #[cfg(test)]
+        crate::database::reset_table_snapshots();
         if !self.stores_on_disk() {
-            return self.apply(statement);
+            return match self.apply(statement) {
+                Ok(result) => {
+                    self.clear_update_undo();
+                    Ok(result)
+                }
+                Err(error) => {
+                    self.restore_update_journal(false)?;
+                    self.clear_selective();
+                    Err(error)
+                }
+            };
         }
         let change = durable_change(&statement);
         let undo = self.prepare_durable(&change);
         let result = match self.apply(statement) {
             Ok(result) => result,
             Err(error) => {
+                self.restore_update_journal(false)?;
                 self.clear_selective();
                 return Err(error);
             }
         };
         if matches!(change, DurableChange::None) {
             self.clear_selective();
+            self.clear_update_undo();
             return Ok(result);
         }
         if let Err(error) = self.publish() {
             if let crate::storage::StepError::BeforeCommit(_) = &error {
-                self.rollback(undo);
+                self.rollback(undo)?;
+            } else {
+                // The commit may already be durable. Drop the journal without
+                // restoring it, and leave the fence in place.
+                self.clear_update_undo();
             }
             return Err(error.into_db());
         }
+        self.clear_update_undo();
         Ok(result)
     }
 
@@ -2362,6 +2382,7 @@ impl Database {
                 stage_us,
                 apply_us: installed.apply_us,
             },
+            installed.undo,
         ));
         Ok(StatementResult::Update {
             count: installed.count,
@@ -2408,6 +2429,7 @@ impl Database {
                 stage_us: 0,
                 apply_us: installed.apply_us,
             },
+            installed.undo,
         ));
         Ok(StatementResult::Update {
             count: installed.count,
@@ -2464,6 +2486,7 @@ impl Database {
                 stage_us,
                 apply_us,
             },
+            snapshot_undo(heap_rows, width),
         ));
         Ok(StatementResult::Delete { count: deleted })
     }
@@ -2508,6 +2531,7 @@ impl Database {
                 stage_us: 0,
                 apply_us,
             },
+            snapshot_undo(heap_rows, width),
         ));
         Ok(StatementResult::Delete { count: deleted })
     }
@@ -2662,6 +2686,10 @@ impl Database {
 
     /// Install prepared rows. The full-table guard keeps the old replacement
     /// so a test can compare it with the selective path.
+    ///
+    /// Original images are saved before either replacement writes a slot. The
+    /// full-undo guard skips that journal because the table was cloned before
+    /// `apply`. Index pages are not edited here.
     fn install_update(
         &mut self,
         table_name: &str,
@@ -2673,6 +2701,14 @@ impl Database {
         } else {
             self.table(table_name)?.schema().len()
         };
+        let undo_started = std::time::Instant::now();
+        let captured = self.capture_update_undo(table_name, &proposals, force_full_undo())?;
+        let capture_us = if captured.snapshot {
+            snapshot_capture_us()
+        } else {
+            undo_started.elapsed().as_micros()
+        };
+        let undo = undo_accounting(&captured, capture_us);
         if full_table_update() {
             let rows = {
                 let table = self.table(table_name)?;
@@ -2696,6 +2732,7 @@ impl Database {
                 width,
                 staged_rows,
                 apply_us,
+                undo,
             });
         }
         let row_ids: Vec<u64> = proposals.iter().map(|(row_id, _)| *row_id).collect();
@@ -2709,6 +2746,7 @@ impl Database {
             width,
             staged_rows,
             apply_us,
+            undo,
         })
     }
 
@@ -2752,6 +2790,22 @@ struct UpdateInstall {
     width: usize,
     staged_rows: usize,
     apply_us: u128,
+    undo: UndoAccounting,
+}
+
+/// Undo retained for one `UPDATE` or `DELETE`.
+///
+/// `bytes` is the journal when `snapshot` is false: one `u64` id and one
+/// `Value` slot per column of each matched row. When `snapshot` is true it is
+/// the full-table estimate in `snapshot_bytes`. Neither figure is process RSS,
+/// and neither includes the heap bytes of a `TEXT` value. `capture_us` is the
+/// journal copy, or the table clone when the snapshot path ran.
+struct UndoAccounting {
+    entries: usize,
+    bytes: u64,
+    snapshot_bytes: u64,
+    snapshot: bool,
+    capture_us: u128,
 }
 
 struct MutationCounts {
@@ -2779,12 +2833,16 @@ struct MutationTiming {
 /// One `UPDATE` or `DELETE`, recorded for tests and the release profile.
 ///
 /// `staged_bytes` is the target-id list plus the replacement cells. It is not
-/// process RSS, and it does not include the pre-statement undo clone. On the
-/// selective path the replacement is only the matched rows. The full-rewrite
-/// guard stages every row. `discover_us` is the probe, the heap equality
-/// check, and `WHERE`. `apply_us` is the in-memory install. A heap scan folds
-/// its filter into `filter_us` and leaves the probe and the equality check at
-/// zero. The WAL and the heap compare happen later, in publish.
+/// process RSS. On the selective path the replacement is only the matched
+/// rows. The full-rewrite guard stages every row. `undo_bytes` is the journal
+/// of original images, or the full-table snapshot estimate when `undo_snapshot`
+/// is set. `snapshot_bytes` is always that full-table estimate. Neither undo
+/// figure includes `TEXT` heap bytes. `discover_us` is the probe, the heap
+/// equality check, and `WHERE`. `apply_us` is the in-memory install.
+/// `undo_us` is the journal copy, or the table clone on the snapshot path. A
+/// heap scan folds its filter into `filter_us` and leaves the probe and the
+/// equality check at zero. The WAL and the heap compare happen later, in
+/// publish.
 #[cfg_attr(test, derive(Clone))]
 #[cfg_attr(not(test), allow(dead_code))]
 struct MutationNote {
@@ -2799,12 +2857,17 @@ struct MutationNote {
     heap_rows: u64,
     modified: u64,
     staged_bytes: u64,
+    undo_entries: u64,
+    undo_bytes: u64,
+    snapshot_bytes: u64,
+    undo_snapshot: bool,
     discover_us: u128,
     probe_us: u128,
     validate_us: u128,
     filter_us: u128,
     stage_us: u128,
     apply_us: u128,
+    undo_us: u128,
 }
 
 impl MutationNote {
@@ -2812,6 +2875,7 @@ impl MutationNote {
         planned: &plan::MutationAccess,
         counts: MutationCounts,
         timing: MutationTiming,
+        undo: UndoAccounting,
     ) -> Self {
         let (index, predicate, residual) = mutation_fields(planned);
         Self {
@@ -2826,12 +2890,17 @@ impl MutationNote {
             heap_rows: u64::try_from(counts.heap_rows).unwrap_or(u64::MAX),
             modified: u64::try_from(counts.modified).unwrap_or(u64::MAX),
             staged_bytes: staged_mutation_bytes(counts.modified, counts.staged_rows, counts.width),
+            undo_entries: u64::try_from(undo.entries).unwrap_or(u64::MAX),
+            undo_bytes: undo.bytes,
+            snapshot_bytes: undo.snapshot_bytes,
+            undo_snapshot: undo.snapshot,
             discover_us: timing.probe_us + timing.validate_us + timing.filter_us,
             probe_us: timing.probe_us,
             validate_us: timing.validate_us,
             filter_us: timing.filter_us,
             stage_us: timing.stage_us,
             apply_us: timing.apply_us,
+            undo_us: undo.capture_us,
         }
     }
 
@@ -2842,6 +2911,7 @@ impl MutationNote {
         staged_rows: usize,
         width: usize,
         timing: MutationTiming,
+        undo: UndoAccounting,
     ) -> Self {
         let (index, predicate, residual) = mutation_fields(planned);
         Self {
@@ -2856,12 +2926,17 @@ impl MutationNote {
             heap_rows: u64::try_from(heap_rows).unwrap_or(u64::MAX),
             modified: u64::try_from(modified).unwrap_or(u64::MAX),
             staged_bytes: staged_mutation_bytes(modified, staged_rows, width),
+            undo_entries: u64::try_from(undo.entries).unwrap_or(u64::MAX),
+            undo_bytes: undo.bytes,
+            snapshot_bytes: undo.snapshot_bytes,
+            undo_snapshot: undo.snapshot,
             discover_us: timing.filter_us,
             probe_us: timing.probe_us,
             validate_us: timing.validate_us,
             filter_us: timing.filter_us,
             stage_us: timing.stage_us,
             apply_us: timing.apply_us,
+            undo_us: undo.capture_us,
         }
     }
 }
@@ -2897,6 +2972,53 @@ fn staged_mutation_bytes(modified: usize, rows: usize, width: usize) -> u64 {
     u64::try_from(ids.saturating_add(cells)).unwrap_or(u64::MAX)
 }
 
+fn journal_bytes(entries: usize, width: usize) -> u64 {
+    staged_mutation_bytes(entries, entries, width)
+}
+
+/// Value slots, row-id vector, and per-row `Vec` headers.
+///
+/// The positions map and any `TEXT` allocation are extra and are not included.
+fn estimated_snapshot_bytes(rows: usize, width: usize) -> u64 {
+    let cells = staged_mutation_bytes(0, rows, width);
+    let ids = u64::try_from(rows.saturating_mul(std::mem::size_of::<u64>())).unwrap_or(u64::MAX);
+    let headers =
+        u64::try_from(rows.saturating_mul(std::mem::size_of::<Vec<Value>>())).unwrap_or(u64::MAX);
+    cells.saturating_add(ids).saturating_add(headers)
+}
+
+fn undo_accounting(captured: &crate::database::CapturedUndo, capture_us: u128) -> UndoAccounting {
+    let snapshot_bytes = estimated_snapshot_bytes(captured.heap_rows, captured.width);
+    if captured.snapshot {
+        UndoAccounting {
+            entries: captured.heap_rows,
+            bytes: snapshot_bytes,
+            snapshot_bytes,
+            snapshot: true,
+            capture_us,
+        }
+    } else {
+        UndoAccounting {
+            entries: captured.entries,
+            bytes: journal_bytes(captured.entries, captured.width),
+            snapshot_bytes,
+            snapshot: false,
+            capture_us,
+        }
+    }
+}
+
+fn snapshot_undo(heap_rows: usize, width: usize) -> UndoAccounting {
+    let snapshot_bytes = estimated_snapshot_bytes(heap_rows, width);
+    UndoAccounting {
+        entries: heap_rows,
+        bytes: snapshot_bytes,
+        snapshot_bytes,
+        snapshot: true,
+        capture_us: snapshot_capture_us(),
+    }
+}
+
 fn note_mutation(note: MutationNote) {
     #[cfg(test)]
     LAST_MUTATION.with(|slot| *slot.borrow_mut() = Some(note));
@@ -2908,9 +3030,16 @@ fn durable_change(statement: &Statement) -> DurableChange {
     match statement {
         Statement::CreateTable { name, .. } => DurableChange::Create(name.clone()),
         Statement::DropTable { names } => DurableChange::Drop(names.clone()),
-        Statement::Insert { table, .. }
-        | Statement::Update { table, .. }
-        | Statement::Delete { table, .. } => DurableChange::Write(table.clone()),
+        Statement::Insert { table, .. } | Statement::Delete { table, .. } => {
+            DurableChange::Write(table.clone())
+        }
+        Statement::Update { table, .. } => {
+            if force_full_undo() {
+                DurableChange::Write(table.clone())
+            } else {
+                DurableChange::Update
+            }
+        }
         Statement::CreateIndex { .. } | Statement::DropIndex { .. } => DurableChange::Index,
         Statement::Select(_) | Statement::Explain(_) => DurableChange::None,
     }
@@ -5008,6 +5137,29 @@ impl Drop for ForceFullUpdate {
     }
 }
 
+/// Keeps the pre-statement table clone for `UPDATE`.
+///
+/// Publish stays selective unless [`ForceFullUpdate`] is also set. The guard
+/// is the Milestone 26 undo path, used to compare the row journal with a
+/// snapshot that is not produced by the journal.
+#[cfg(test)]
+pub(crate) struct ForceFullUndo;
+
+#[cfg(test)]
+impl ForceFullUndo {
+    pub(crate) fn new() -> Self {
+        FORCE_FULL_UNDO.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceFullUndo {
+    fn drop(&mut self) {
+        FORCE_FULL_UNDO.with(|flag| flag.set(false));
+    }
+}
+
 /// Skips the `WHERE` cell-type check so a test can show the missed row.
 #[cfg(test)]
 struct SkipWhereSchemaCheck;
@@ -5960,6 +6112,7 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static FORCE_HEAP_MUTATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FORCE_FULL_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_FULL_UNDO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// When set, an indexed `UPDATE` or `DELETE` does not precheck `WHERE` cells.
     static SKIP_WHERE_SCHEMA_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LAST_MUTATION: std::cell::RefCell<Option<MutationNote>> =
@@ -5984,6 +6137,28 @@ fn force_heap_mutation() -> bool {
 #[cfg(test)]
 fn force_full_update() -> bool {
     FORCE_FULL_UPDATE.with(std::cell::Cell::get)
+}
+
+fn force_full_undo() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_FULL_UNDO.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn snapshot_capture_us() -> u128 {
+    #[cfg(test)]
+    {
+        crate::database::snapshot_us()
+    }
+    #[cfg(not(test))]
+    {
+        0
+    }
 }
 
 fn full_table_update() -> bool {
@@ -16649,6 +16824,10 @@ mod tests {
         row[0] = Value::Integer(6);
     }
 
+    fn walk_id_nine(row: &mut [Value]) {
+        row[0] = Value::Integer(9);
+    }
+
     fn walk_wide(row: &mut [Value]) {
         row[1] = Value::Text("x".repeat(40));
     }
@@ -17358,6 +17537,645 @@ mod tests {
         (dir, db)
     }
 
+    fn assert_journal(entries: u64, heap_rows: usize) {
+        let note = mutation_note();
+        assert!(!note.undo_snapshot);
+        assert_eq!(note.undo_entries, entries);
+        assert_eq!(crate::database::table_snapshots(), 0);
+        assert_eq!(note.undo_bytes, journal_bytes(entries as usize, 4));
+        assert_eq!(note.snapshot_bytes, estimated_snapshot_bytes(heap_rows, 4));
+        assert!(note.undo_bytes < note.snapshot_bytes);
+    }
+
+    fn db_file(path: &std::path::Path) -> Vec<u8> {
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn a_selective_update_journals_only_matched_rows() {
+        let (_dir, mut db) = open_mutation("m27-journal");
+        let ids = db.table("users").unwrap().row_ids().to_vec();
+        let next = db.table("users").unwrap().next_row_id();
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Z' WHERE id = 2;"),
+            1
+        );
+        assert_journal(1, 5);
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(db.table("users").unwrap().next_row_id(), next);
+        {
+            let _guard = ForceFullUndo::new();
+            assert_eq!(
+                change_count(&mut db, "UPDATE users SET name = 'Bea' WHERE id = 2;"),
+                1
+            );
+        }
+        let snapshot = mutation_note();
+        assert!(snapshot.undo_snapshot);
+        assert_eq!(snapshot.undo_entries, 5);
+        assert_eq!(snapshot.undo_bytes, snapshot.snapshot_bytes);
+        assert_eq!(crate::database::table_snapshots(), 1);
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Z' WHERE id = -1;"),
+            0
+        );
+        let miss = mutation_note();
+        assert_eq!(miss.undo_entries, 0);
+        assert_eq!(miss.undo_bytes, 0);
+        assert!(miss.snapshot_bytes > 0);
+        assert_eq!(crate::database::table_snapshots(), 0);
+        let before = table_rows(&mut db);
+        let error = db
+            .execute("UPDATE users SET name = 1 WHERE id = 2;")
+            .unwrap_err();
+        assert!(error.to_string().contains("expects"), "{error}");
+        assert_eq!(table_rows(&mut db), before);
+        assert_eq!(crate::database::table_snapshots(), 0);
+    }
+
+    #[test]
+    fn a_precommit_failure_restores_the_journal() {
+        let (dir, mut db) = open_mutation("m27-precommit");
+        let path = dir.join("db");
+        let original = table_rows(&mut db);
+        let ids = db.table("users").unwrap().row_ids().to_vec();
+        let postings = index_postings(&mut db, "idx_users_id");
+        let before = db_file(&path);
+        db.set_inject(crate::storage::Inject::BeforeLogSync);
+        let error = db
+            .execute("UPDATE users SET name = 'Z' WHERE bucket = 1;")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected failure before the redo log was synced"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("rows updated"), "{error}");
+        assert_journal(3, 5);
+        assert_eq!(table_rows(&mut db), original);
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(db_file(&path), before);
+        assert_eq!(index_postings(&mut db, "idx_users_id"), postings);
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Z' WHERE bucket = 1;"),
+            3
+        );
+        db.set_inject(crate::storage::Inject::BeforeLogSync);
+        let error = db
+            .execute("UPDATE users SET id = NULL WHERE name = 'Bea';")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected failure before the redo log was synced"),
+            "{error}"
+        );
+        assert_eq!(index_postings(&mut db, "idx_users_id"), postings);
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Y' WHERE id = 2;"),
+            1
+        );
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+    }
+
+    #[test]
+    fn undo_restore_failure_is_not_a_confirmed_rollback() {
+        let (dir, mut db) = open_mutation("m27-undo-fail");
+        let path = dir.join("db");
+        let before = db_file(&path);
+        db.set_inject(crate::storage::Inject::BeforeLogSync);
+        let error = {
+            let _guard = crate::database::FailUndoRestore::new();
+            db.execute("UPDATE users SET name = 'Z' WHERE id = 2;")
+                .unwrap_err()
+        };
+        let text = error.to_string();
+        assert!(text.contains("not a confirmed rollback"), "{text}");
+        assert!(text.contains("undo could not restore"), "{text}");
+        assert!(!text.contains("rows updated"), "{text}");
+        assert_eq!(db_file(&path), before);
+        let follow = db
+            .execute("UPDATE users SET name = 'Y' WHERE id = 2;")
+            .unwrap_err()
+            .to_string();
+        assert!(follow.contains("not a confirmed rollback"), "{follow}");
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut db)[2][1], Value::Text("Bea".to_string()));
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Y' WHERE id = 2;"),
+            1
+        );
+    }
+
+    #[test]
+    fn an_after_commit_failure_does_not_apply_the_journal() {
+        let (dir, mut db) = open_mutation("m27-after-commit");
+        let path = dir.join("db");
+        db.set_inject(crate::storage::Inject::AfterLogSync);
+        let error = {
+            let _guard = crate::database::FailUndoRestore::new();
+            db.execute("UPDATE users SET name = 'Z' WHERE bucket = 1;")
+                .unwrap_err()
+        };
+        let text = error.to_string();
+        assert!(text.contains("checkpoint did not finish"), "{text}");
+        assert!(!text.contains("undo could not restore"), "{text}");
+        let follow = db
+            .execute("SELECT name FROM users;")
+            .unwrap_err()
+            .to_string();
+        assert!(follow.contains("checkpoint did not finish"), "{follow}");
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        let renamed = table_rows(&mut db)
+            .into_iter()
+            .filter(|row| row[1] == Value::Text("Z".to_string()))
+            .count();
+        assert_eq!(renamed, 3);
+        drop(db);
+
+        let (dir, mut db) = open_mutation("m27-sync-failed");
+        let path = dir.join("db");
+        db.set_inject(crate::storage::Inject::CommitSyncFailed);
+        let error = db
+            .execute("UPDATE users SET name = 'Q' WHERE id = 2;")
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("outcome is unknown"), "{text}");
+        assert!(text.contains("not a confirmed rollback"), "{text}");
+        assert!(!text.contains("undo could not restore"), "{text}");
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut db)[2][1], Value::Text("Q".to_string()));
+        drop(db);
+
+        let (dir, mut db) = open_mutation("m27-checkpoint");
+        let path = dir.join("db");
+        db.set_inject(crate::storage::Inject::DuringCheckpoint(1));
+        let error = db
+            .execute("UPDATE users SET id = 8 WHERE id = 2;")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("checkpoint did not finish"),
+            "{error}"
+        );
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut db)[2][0], Value::Integer(8));
+        assert_eq!(db.table("users").unwrap().row_ids(), &[1, 2, 3, 4, 5]);
+        assert_eq!(
+            index_postings(&mut db, "idx_users_id"),
+            reference_postings(&table_rows(&mut db), &[1, 2, 3, 4, 5], 0)
+        );
+    }
+
+    #[test]
+    fn delete_still_snapshots_the_table() {
+        let (dir, mut db) = open_mutation("m27-delete-undo");
+        let path = dir.join("db");
+        let original = table_rows(&mut db);
+        let ids = db.table("users").unwrap().row_ids().to_vec();
+        let before = db_file(&path);
+        db.set_inject(crate::storage::Inject::BeforeLogSync);
+        let error = db.execute("DELETE FROM users WHERE id = 2;").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected failure before the redo log was synced"),
+            "{error}"
+        );
+        let note = mutation_note();
+        assert!(note.undo_snapshot);
+        assert_eq!(note.undo_entries, 5);
+        assert_eq!(crate::database::table_snapshots(), 1);
+        assert_eq!(table_rows(&mut db), original);
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(db_file(&path), before);
+        assert_eq!(change_count(&mut db, "DELETE FROM users WHERE id = 2;"), 1);
+        assert_eq!(crate::database::table_snapshots(), 1);
+        assert_eq!(db.table("users").unwrap().next_row_id(), 6);
+    }
+
+    #[test]
+    fn relocation_rollback_restores_the_original_record() {
+        let _phases = crate::storage::enable_phases();
+        let (dir, mut db) = open_packed("m27-relocate");
+        let path = dir.join("db");
+        let original = packed_rows(&mut db);
+        let ids = db.table("users").unwrap().row_ids().to_vec();
+        let before = db_file(&path);
+        let grow = format!(
+            "UPDATE users SET name = '{}' WHERE id = 1;",
+            "w".repeat(3_200)
+        );
+        db.set_inject(crate::storage::Inject::BeforeLogSync);
+        let error = db.execute(&grow).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected failure before the redo log was synced"),
+            "{error}"
+        );
+        assert_eq!(mutation_note().undo_entries, 2);
+        assert_eq!(crate::database::table_snapshots(), 0);
+        assert_eq!(packed_rows(&mut db), original);
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(db_file(&path), before);
+        assert_checksums(&path);
+        crate::storage::reset_phases();
+        assert_eq!(change_count(&mut db, &grow), 2);
+        let moved = crate::storage::take_phases();
+        assert!(moved.heap_pages >= 2, "heap {}", moved.heap_pages);
+        assert_eq!(moved.index_pages, 0);
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(
+            index_postings(&mut db, "idx_users_id"),
+            reference_postings(&packed_rows(&mut db), &ids, 0)
+        );
+        assert_checksums(&path);
+        let keyed = format!(
+            "UPDATE users SET id = 11, name = '{}' WHERE bucket = 1;",
+            "w".repeat(3_200)
+        );
+        db.set_inject(crate::storage::Inject::BeforeLogSync);
+        let error = db.execute(&keyed).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected failure before the redo log was synced"),
+            "{error}"
+        );
+        assert_eq!(packed_rows(&mut db)[0][0], Value::Integer(1));
+        assert_eq!(
+            index_postings(&mut db, "idx_users_id"),
+            reference_postings(&packed_rows(&mut db), &ids, 0)
+        );
+        assert_eq!(change_count(&mut db, &keyed), 1);
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(packed_rows(&mut db)[0][0], Value::Integer(11));
+        assert_checksums(&path);
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 's' WHERE id = 11;"),
+            1
+        );
+        assert_eq!(change_count(&mut db, "DELETE FROM users WHERE id = 11;"), 1);
+        assert_eq!(db.table("users").unwrap().next_row_id(), 4);
+        db.execute("INSERT INTO users VALUES (5, 'New', 1);")
+            .unwrap();
+        assert_eq!(db.table("users").unwrap().row_ids(), &[2, 3, 4]);
+        assert_eq!(db.table("users").unwrap().next_row_id(), 5);
+        assert_checksums(&path);
+        let rows = packed_rows(&mut db);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(packed_rows(&mut db), rows);
+        assert_checksums(&path);
+    }
+
+    #[test]
+    fn index_changes_roll_back_with_the_journal() {
+        let (dir, mut db) = open_mutation("m27-index");
+        let path = dir.join("db");
+        let ids = vec![1_u64, 2, 3, 4, 5];
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET active = FALSE WHERE id = 2;"),
+            1
+        );
+        assert_journal(1, 5);
+        assert_eq!(
+            index_postings(&mut db, "idx_users_id"),
+            reference_postings(&table_rows(&mut db), &ids, 0)
+        );
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET id = NULL WHERE id = 2;"),
+            1
+        );
+        assert_journal(1, 5);
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET id = 2 WHERE name = 'Bea';"),
+            1
+        );
+        assert!(!mutation_note().undo_snapshot);
+        assert_eq!(crate::database::table_snapshots(), 0);
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET id = 1 WHERE id = 4;"),
+            1
+        );
+        let duplicated = table_rows(&mut db);
+        assert_eq!(
+            index_postings(&mut db, "idx_users_id"),
+            reference_postings(&duplicated, &ids, 0)
+        );
+        let before = db_file(&path);
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET id = 1 WHERE id = 1;"),
+            3
+        );
+        assert_journal(3, 5);
+        assert_eq!(db_file(&path), before);
+        assert_eq!(wal_len(&path), 0);
+        let saved_rows = table_rows(&mut db);
+        let saved_posts = index_postings(&mut db, "idx_users_id");
+        db.corrupt_index_root_type("idx_users_id").unwrap();
+        let error = db
+            .execute("UPDATE users SET id = 40 WHERE bucket = 1;")
+            .unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(mutation_note().undo_entries, 3);
+        assert_eq!(crate::database::table_snapshots(), 0);
+        assert_eq!(table_rows(&mut db), saved_rows);
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+        assert_eq!(db_file(&path), before);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut db), saved_rows);
+        assert_eq!(index_postings(&mut db, "idx_users_id"), saved_posts);
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET id = 40 WHERE bucket = 1;"),
+            3
+        );
+        assert_eq!(db.table("users").unwrap().row_ids(), ids.as_slice());
+
+        let (dir, mut db) = open_mutation("m27-missing");
+        let path = dir.join("db");
+        let original = table_rows(&mut db);
+        let before = db_file(&path);
+        db.drop_root_leaf_entry("idx_users_bucket", 0).unwrap();
+        let error = db
+            .execute("UPDATE users SET name = 'Z' WHERE bucket = 1;")
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error}");
+        assert_eq!(crate::database::table_snapshots(), 0);
+        assert_eq!(table_rows(&mut db), original);
+        assert_eq!(db_file(&path), before);
+        assert_eq!(wal_len(&path), 0);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Z' WHERE bucket = 1;"),
+            3
+        );
+    }
+
+    fn walk_delete(walk: &mut Walk, pred: fn(&[Value]) -> bool) -> usize {
+        let before = walk.rows.len();
+        let mut rows = Vec::new();
+        let mut ids = Vec::new();
+        for (row, id) in std::mem::take(&mut walk.rows)
+            .into_iter()
+            .zip(std::mem::take(&mut walk.ids))
+        {
+            if pred(&row) {
+                continue;
+            }
+            rows.push(row);
+            ids.push(id);
+        }
+        walk.rows = rows;
+        walk.ids = ids;
+        before - walk.rows.len()
+    }
+
+    struct UndoTrio {
+        journal: Database,
+        snapshot: Database,
+        full: Database,
+        journal_path: std::path::PathBuf,
+        snapshot_path: std::path::PathBuf,
+        full_path: std::path::PathBuf,
+    }
+
+    fn agree_undo(trio: &mut UndoTrio, walk: &Walk, sql: &str, expected: usize) {
+        assert_eq!(change_count(&mut trio.journal, sql), expected, "{sql}");
+        let journal_note = mutation_note();
+        assert!(!journal_note.undo_snapshot, "{sql}");
+        assert_eq!(journal_note.undo_entries, expected as u64, "{sql}");
+        assert!(
+            journal_note.undo_bytes < journal_note.snapshot_bytes,
+            "{sql}"
+        );
+        assert_eq!(crate::database::table_snapshots(), 0, "{sql}");
+        let snapshot_count = {
+            let _guard = ForceFullUndo::new();
+            change_count(&mut trio.snapshot, sql)
+        };
+        assert_eq!(snapshot_count, expected, "{sql}");
+        let snapshot_note = mutation_note();
+        assert!(snapshot_note.undo_snapshot, "{sql}");
+        assert_eq!(
+            snapshot_note.undo_bytes, journal_note.snapshot_bytes,
+            "{sql}"
+        );
+        assert_eq!(crate::database::table_snapshots(), 1, "{sql}");
+        let full_count = {
+            let _guard = ForceFullUpdate::new();
+            change_count(&mut trio.full, sql)
+        };
+        assert_eq!(full_count, expected, "{sql}");
+        assert!(!mutation_note().undo_snapshot, "{sql}");
+        assert_eq!(table_rows(&mut trio.journal), walk.rows, "{sql}");
+        assert_eq!(table_rows(&mut trio.snapshot), walk.rows, "{sql}");
+        assert_eq!(table_rows(&mut trio.full), walk.rows, "{sql}");
+        assert_eq!(
+            trio.journal.table("users").unwrap().row_ids(),
+            walk.ids.as_slice(),
+            "{sql}"
+        );
+        assert_eq!(
+            trio.snapshot.table("users").unwrap().row_ids(),
+            walk.ids.as_slice(),
+            "{sql}"
+        );
+        assert_eq!(
+            trio.full.table("users").unwrap().row_ids(),
+            walk.ids.as_slice(),
+            "{sql}"
+        );
+        assert_eq!(
+            trio.journal.table("users").unwrap().next_row_id(),
+            13,
+            "{sql}"
+        );
+        assert_eq!(
+            trio.snapshot.table("users").unwrap().next_row_id(),
+            13,
+            "{sql}"
+        );
+        assert_eq!(
+            index_postings(&mut trio.journal, "idx_users_id"),
+            reference_postings(&walk.rows, &walk.ids, 0),
+            "{sql}"
+        );
+        assert_eq!(
+            index_postings(&mut trio.snapshot, "idx_users_bucket"),
+            reference_postings(&walk.rows, &walk.ids, 3),
+            "{sql}"
+        );
+        assert_eq!(
+            db_file(&trio.journal_path),
+            db_file(&trio.snapshot_path),
+            "{sql}"
+        );
+        assert_eq!(
+            db_file(&trio.journal_path),
+            db_file(&trio.full_path),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn seeded_selective_undo_matches_the_snapshot_and_a_walker() {
+        const SEED: u64 = 0x27c3;
+        let mut walk = walk_from(SEED, 12);
+        let (dir, generated) = open_generated("m27-seed", &walk.rows, true);
+        let journal_path = dir.join("db");
+        let snapshot_path = dir.join("snapshot");
+        let full_path = dir.join("full");
+        drop(generated);
+        std::fs::copy(&journal_path, &snapshot_path).unwrap();
+        std::fs::copy(&journal_path, &full_path).unwrap();
+        let mut trio = UndoTrio {
+            journal: Database::open(&journal_path).unwrap(),
+            snapshot: Database::open(&snapshot_path).unwrap(),
+            full: Database::open(&full_path).unwrap(),
+            journal_path,
+            snapshot_path,
+            full_path,
+        };
+
+        let marked = update_walk(&mut walk, pred_bucket_one, walk_mark);
+        agree_undo(
+            &mut trio,
+            &walk,
+            "UPDATE users SET name = 'marked' WHERE bucket = 1;",
+            marked,
+        );
+        let unchanged = db_file(&trio.journal_path);
+        let repeated = update_walk(&mut walk, pred_marked, walk_mark);
+        agree_undo(
+            &mut trio,
+            &walk,
+            "UPDATE users SET name = 'marked' WHERE name = 'marked';",
+            repeated,
+        );
+        assert_eq!(db_file(&trio.journal_path), unchanged);
+        assert_eq!(wal_len(&trio.journal_path), 0);
+        let missed = update_walk(&mut walk, pred_none, walk_mark);
+        agree_undo(
+            &mut trio,
+            &walk,
+            "UPDATE users SET name = 'n' WHERE id = -1;",
+            missed,
+        );
+        let parked = db_file(&trio.journal_path);
+        let failed = "UPDATE users SET id = 9 WHERE bucket = 2;";
+        trio.journal
+            .set_inject(crate::storage::Inject::BeforeLogSync);
+        let journal_error = trio.journal.execute(failed).unwrap_err().to_string();
+        assert!(!mutation_note().undo_snapshot);
+        assert_eq!(crate::database::table_snapshots(), 0);
+        trio.snapshot
+            .set_inject(crate::storage::Inject::BeforeLogSync);
+        let snapshot_error = {
+            let _guard = ForceFullUndo::new();
+            trio.snapshot.execute(failed).unwrap_err().to_string()
+        };
+        trio.full.set_inject(crate::storage::Inject::BeforeLogSync);
+        let full_error = {
+            let _guard = ForceFullUpdate::new();
+            trio.full.execute(failed).unwrap_err().to_string()
+        };
+        assert_eq!(journal_error, snapshot_error);
+        assert_eq!(journal_error, full_error);
+        assert!(journal_error.contains("injected failure before the redo log was synced"));
+        assert_eq!(table_rows(&mut trio.journal), walk.rows);
+        assert_eq!(table_rows(&mut trio.snapshot), walk.rows);
+        assert_eq!(table_rows(&mut trio.full), walk.rows);
+        assert_eq!(db_file(&trio.journal_path), parked);
+        assert_eq!(db_file(&trio.snapshot_path), parked);
+        assert_eq!(db_file(&trio.full_path), parked);
+        let rekeyed = update_walk(&mut walk, pred_bucket_two, walk_id_nine);
+        agree_undo(&mut trio, &walk, failed, rekeyed);
+        let cleared = update_walk(&mut walk, pred_bucket_zero, walk_clear_id);
+        agree_undo(
+            &mut trio,
+            &walk,
+            "UPDATE users SET id = NULL WHERE bucket = 0;",
+            cleared,
+        );
+        let sixes = update_walk(&mut walk, pred_null_id, walk_id_six);
+        agree_undo(
+            &mut trio,
+            &walk,
+            "UPDATE users SET id = 6 WHERE id IS NULL;",
+            sixes,
+        );
+        assert!(sixes >= 2, "{sixes}");
+        let widened = update_walk(&mut walk, pred_bucket_two, walk_wide);
+        agree_undo(
+            &mut trio,
+            &walk,
+            &format!(
+                "UPDATE users SET name = '{}' WHERE bucket = 2;",
+                "x".repeat(40)
+            ),
+            widened,
+        );
+        let shortened = update_walk(&mut walk, pred_bucket_two, walk_short);
+        agree_undo(
+            &mut trio,
+            &walk,
+            "UPDATE users SET name = 's' WHERE bucket = 2;",
+            shortened,
+        );
+        let all = update_walk(&mut walk, pred_any, walk_inactive);
+        agree_undo(
+            &mut trio,
+            &walk,
+            "UPDATE users SET active = FALSE WHERE TRUE OR id = 0;",
+            all,
+        );
+        let deleted = walk_delete(&mut walk, pred_bucket_one);
+        assert_eq!(
+            change_count(&mut trio.journal, "DELETE FROM users WHERE bucket = 1;"),
+            deleted
+        );
+        assert!(mutation_note().undo_snapshot);
+        assert_eq!(crate::database::table_snapshots(), 1);
+        assert_eq!(
+            {
+                let _guard = ForceFullUndo::new();
+                change_count(&mut trio.snapshot, "DELETE FROM users WHERE bucket = 1;")
+            },
+            deleted
+        );
+        assert_eq!(
+            {
+                let _guard = ForceFullUpdate::new();
+                change_count(&mut trio.full, "DELETE FROM users WHERE bucket = 1;")
+            },
+            deleted
+        );
+        assert_eq!(table_rows(&mut trio.journal), walk.rows);
+        assert_eq!(table_rows(&mut trio.snapshot), walk.rows);
+        assert_eq!(table_rows(&mut trio.full), walk.rows);
+        assert_eq!(trio.journal.table("users").unwrap().next_row_id(), 13);
+        assert_eq!(db_file(&trio.journal_path), db_file(&trio.snapshot_path));
+        let journal_path = trio.journal_path.clone();
+        let snapshot_path = trio.snapshot_path.clone();
+        drop(trio);
+        let mut journal = Database::open(&journal_path).unwrap();
+        let mut snapshot = Database::open(&snapshot_path).unwrap();
+        assert_eq!(table_rows(&mut journal), table_rows(&mut snapshot));
+        assert_eq!(
+            index_postings(&mut journal, "idx_users_id"),
+            reference_postings(&walk.rows, &walk.ids, 0)
+        );
+        let _keep = dir;
+    }
+
     #[test]
     #[ignore = "release profile of selective UPDATE publishing"]
     fn profile_milestone26() {
@@ -17643,5 +18461,369 @@ mod tests {
         let mut warm = values.to_vec();
         warm.sort_unstable();
         warm[warm.len() / 2]
+    }
+
+    #[test]
+    #[ignore = "release profile of selective UPDATE undo"]
+    fn profile_milestone27() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone27 cpu={cpu} mem_bytes={mem} rustc={rustc} value_bytes={} vec_bytes={}",
+            std::mem::size_of::<Value>(),
+            std::mem::size_of::<Vec<Value>>()
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            let (base_dir, base) = open_profile_db("m27-base", rows);
+            let base_path = base_dir.join("db");
+            drop(base);
+            for workload in [
+                "miss",
+                "one",
+                "ten",
+                "duplicates",
+                "key",
+                "grow",
+                "shrink",
+                "relocate",
+                "many",
+                "noop",
+                "rollback",
+            ] {
+                profile_undo(&base_path, rows, workload);
+            }
+        }
+    }
+
+    fn undo_work(workload: &str) -> (String, Option<String>, bool) {
+        match workload {
+            "one" => (
+                "UPDATE users SET name = 'n' WHERE id = 1;".to_string(),
+                None,
+                true,
+            ),
+            "miss" => (
+                "UPDATE users SET name = 'n' WHERE id = -1;".to_string(),
+                None,
+                false,
+            ),
+            "ten" => (
+                "UPDATE users SET name = 'n' WHERE id < 10;".to_string(),
+                None,
+                true,
+            ),
+            "duplicates" => (
+                "UPDATE users SET name = 'n' WHERE bucket = 1;".to_string(),
+                None,
+                true,
+            ),
+            "key" => (
+                "UPDATE users SET id = -1 WHERE id = 1;".to_string(),
+                Some("UPDATE users SET id = 1 WHERE id = -1;".to_string()),
+                false,
+            ),
+            "grow" => (
+                format!("UPDATE users SET name = '{}' WHERE id = 1;", wide_name()),
+                Some("UPDATE users SET name = 'n1' WHERE id = 1;".to_string()),
+                false,
+            ),
+            "shrink" => (
+                "UPDATE users SET name = 'n' WHERE id = 1;".to_string(),
+                Some(format!(
+                    "UPDATE users SET name = '{}' WHERE id = 1;",
+                    wide_name()
+                )),
+                false,
+            ),
+            "relocate" => (
+                format!(
+                    "UPDATE users SET name = '{}' WHERE id = 1;",
+                    "w".repeat(3_200)
+                ),
+                Some("UPDATE users SET name = 'n1' WHERE id = 1;".to_string()),
+                false,
+            ),
+            "many" => (
+                "UPDATE users SET name = 'n' WHERE active = TRUE;".to_string(),
+                None,
+                true,
+            ),
+            "noop" => (
+                "UPDATE users SET id = 1 WHERE id = 1;".to_string(),
+                None,
+                false,
+            ),
+            "rollback" => (
+                "UPDATE users SET name = 'z' WHERE id = 1;".to_string(),
+                None,
+                false,
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    fn profile_undo(base: &std::path::Path, rows: i64, workload: &str) {
+        let (_journal_dir, mut journal) = copied_profile_db(base, "m27-journal");
+        let (_snapshot_dir, mut snapshot) = copied_profile_db(base, "m27-snapshot");
+        let (_rewrite_dir, mut rewrite) = copied_profile_db(base, "m27-rewrite");
+        if workload == "shrink" {
+            let setup = format!("UPDATE users SET name = '{}' WHERE id = 1;", wide_name());
+            journal.execute(&setup).unwrap();
+            snapshot.execute(&setup).unwrap();
+            rewrite.execute(&setup).unwrap();
+        }
+        let (sql, restore, alternate) = undo_work(workload);
+        if workload == "rollback" {
+            profile_undo_rollback(&mut journal, &mut snapshot, &mut rewrite, &sql, rows);
+            return;
+        }
+        crate::storage::reset_phases();
+        let journal_count = change_count(&mut journal, &sql);
+        let journal_note = mutation_note();
+        let journal_phases = crate::storage::take_phases();
+        let snapshot_count = {
+            let _guard = ForceFullUndo::new();
+            change_count(&mut snapshot, &sql)
+        };
+        let snapshot_note = mutation_note();
+        crate::storage::reset_phases();
+        let rewrite_count = {
+            let _guard = ForceFullUpdate::new();
+            change_count(&mut rewrite, &sql)
+        };
+        let rewrite_phases = crate::storage::take_phases();
+        assert_eq!(journal_count, snapshot_count, "{workload}");
+        assert_eq!(journal_count, rewrite_count, "{workload}");
+        let checksum = mutation_checksum(&mut journal);
+        assert_eq!(checksum, mutation_checksum(&mut snapshot), "{workload}");
+        assert_eq!(checksum, mutation_checksum(&mut rewrite), "{workload}");
+        assert!(!journal_note.undo_snapshot, "{workload}");
+        assert!(snapshot_note.undo_snapshot, "{workload}");
+        assert_eq!(
+            journal_note.snapshot_bytes, snapshot_note.undo_bytes,
+            "{workload}"
+        );
+        assert!(
+            journal_note.undo_bytes < journal_note.snapshot_bytes,
+            "{workload}"
+        );
+        assert_eq!(
+            journal_phases.wal_bytes, rewrite_phases.wal_bytes,
+            "{workload}"
+        );
+        assert_eq!(
+            journal_phases.heap_pages, rewrite_phases.heap_pages,
+            "{workload}"
+        );
+        assert_eq!(
+            journal_phases.index_pages, rewrite_phases.index_pages,
+            "{workload}"
+        );
+        if workload == "relocate" {
+            assert!(
+                journal_phases.heap_pages >= 2,
+                "heap {}",
+                journal_phases.heap_pages
+            );
+        }
+        if let Some(restore) = restore.as_deref() {
+            journal.execute(restore).unwrap();
+            snapshot.execute(restore).unwrap();
+            rewrite.execute(restore).unwrap();
+        }
+        let samples = if rows >= 100_000 { 3 } else { 6 };
+        let journal_time = time_undo(
+            &mut journal,
+            &sql,
+            restore.as_deref(),
+            samples,
+            false,
+            alternate,
+        );
+        let snapshot_time = time_undo(
+            &mut snapshot,
+            &sql,
+            restore.as_deref(),
+            samples,
+            true,
+            alternate,
+        );
+        assert_eq!(
+            journal_time.wal_bytes, snapshot_time.wal_bytes,
+            "{workload}"
+        );
+        assert_eq!(
+            journal_time.heap_pages, snapshot_time.heap_pages,
+            "{workload}"
+        );
+        assert_eq!(
+            journal_time.index_pages, snapshot_time.index_pages,
+            "{workload}"
+        );
+        println!(
+            "milestone27 workload={workload} rows={rows} executed={} modified={} undo_entries={} undo_bytes={} snapshot_bytes={} snapshot_entries={} undo_us={} snapshot_undo_us={} discover_us={} validate_us={} stage_us={} apply_us={} journal_cold_us={} journal_warm_us={} snapshot_cold_us={} snapshot_warm_us={} journal_wal_us={} snapshot_wal_us={} journal_publish_us={} snapshot_publish_us={} journal_compare_us={} snapshot_compare_us={} wal_bytes={} heap_pages={} index_pages={} frames={} checksum={checksum}",
+            journal_note.executed,
+            journal_note.modified,
+            journal_note.undo_entries,
+            journal_note.undo_bytes,
+            journal_note.snapshot_bytes,
+            snapshot_note.undo_entries,
+            journal_note.undo_us,
+            snapshot_note.undo_us,
+            journal_note.discover_us,
+            journal_note.validate_us,
+            journal_note.stage_us,
+            journal_note.apply_us,
+            journal_time.cold,
+            journal_time.warm,
+            snapshot_time.cold,
+            snapshot_time.warm,
+            journal_time.wal_warm,
+            snapshot_time.wal_warm,
+            journal_time.publish_warm,
+            snapshot_time.publish_warm,
+            journal_time.compare_warm,
+            snapshot_time.compare_warm,
+            journal_time.wal_bytes,
+            journal_time.heap_pages,
+            journal_time.index_pages,
+            journal_time.frames,
+        );
+    }
+
+    fn profile_undo_rollback(
+        journal: &mut Database,
+        snapshot: &mut Database,
+        rewrite: &mut Database,
+        sql: &str,
+        rows: i64,
+    ) {
+        let before = mutation_checksum(journal);
+        assert_eq!(before, mutation_checksum(snapshot));
+        assert_eq!(before, mutation_checksum(rewrite));
+        crate::storage::reset_phases();
+        journal.set_inject(crate::storage::Inject::BeforeLogSync);
+        let started = std::time::Instant::now();
+        let error = journal.execute(sql).unwrap_err();
+        let journal_us = started.elapsed().as_micros();
+        let encoded = crate::storage::take_phases();
+        assert!(
+            error
+                .to_string()
+                .contains("injected failure before the redo log was synced"),
+            "{error}"
+        );
+        let note = mutation_note();
+        assert!(!note.undo_snapshot);
+        assert_eq!(note.undo_entries, 1);
+        assert_eq!(mutation_checksum(journal), before);
+        snapshot.set_inject(crate::storage::Inject::BeforeLogSync);
+        let started = std::time::Instant::now();
+        let snapshot_error = {
+            let _guard = ForceFullUndo::new();
+            snapshot.execute(sql).unwrap_err()
+        };
+        let snapshot_us = started.elapsed().as_micros();
+        assert_eq!(snapshot_error.to_string(), error.to_string());
+        let snapshot_note = mutation_note();
+        assert!(snapshot_note.undo_snapshot);
+        assert_eq!(mutation_checksum(snapshot), before);
+        rewrite.set_inject(crate::storage::Inject::BeforeLogSync);
+        let rewrite_error = {
+            let _guard = ForceFullUpdate::new();
+            rewrite.execute(sql).unwrap_err()
+        };
+        assert_eq!(rewrite_error.to_string(), error.to_string());
+        assert_eq!(mutation_checksum(rewrite), before);
+        assert_eq!(change_count(journal, sql), {
+            let _guard = ForceFullUndo::new();
+            change_count(snapshot, sql)
+        });
+        let checksum = mutation_checksum(journal);
+        assert_eq!(checksum, mutation_checksum(snapshot));
+        println!(
+            "milestone27 workload=rollback rows={rows} executed={} undo_entries={} undo_bytes={} snapshot_bytes={} snapshot_entries={} undo_us={} snapshot_undo_us={} journal_cold_us={journal_us} snapshot_cold_us={snapshot_us} journal_warm_us={journal_us} snapshot_warm_us={snapshot_us} discover_us={} validate_us={} stage_us={} apply_us={} encoded_wal_bytes={} durable_wal_bytes=0 heap_pages=0 index_pages=0 frames=0 checksum={checksum} restored_checksum={before}",
+            note.executed,
+            note.undo_entries,
+            note.undo_bytes,
+            note.snapshot_bytes,
+            snapshot_note.undo_entries,
+            note.undo_us,
+            snapshot_note.undo_us,
+            note.discover_us,
+            note.validate_us,
+            note.stage_us,
+            note.apply_us,
+            encoded.wal_bytes,
+        );
+    }
+
+    fn time_undo(
+        db: &mut Database,
+        sql: &str,
+        restore: Option<&str>,
+        samples: usize,
+        snapshot: bool,
+        alternate: bool,
+    ) -> TimedPublish {
+        let mut totals = Vec::with_capacity(samples);
+        let mut wal = Vec::with_capacity(samples);
+        let mut publish = Vec::with_capacity(samples);
+        let mut compare = Vec::with_capacity(samples);
+        let mut wal_bytes = Vec::with_capacity(samples);
+        let mut heap_pages = Vec::with_capacity(samples);
+        let mut index_pages = Vec::with_capacity(samples);
+        let mut frames = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            let statement = publish_sample(sql, sample, alternate);
+            crate::storage::reset_phases();
+            let started = std::time::Instant::now();
+            if snapshot {
+                let _guard = ForceFullUndo::new();
+                db.execute(&statement).unwrap();
+            } else {
+                db.execute(&statement).unwrap();
+            }
+            totals.push(started.elapsed().as_micros());
+            let taken = crate::storage::take_phases();
+            wal.push(
+                (taken.wal_write
+                    + taken.wal_sync
+                    + taken.db_write
+                    + taken.db_sync
+                    + taken.wal_clear)
+                    .as_micros(),
+            );
+            publish.push(taken.apply.as_micros());
+            compare.push(taken.compare.as_micros());
+            wal_bytes.push(taken.wal_bytes);
+            heap_pages.push(taken.heap_pages);
+            index_pages.push(taken.index_pages);
+            frames.push(taken.frames);
+            if let Some(restore) = restore {
+                if snapshot {
+                    let _guard = ForceFullUndo::new();
+                    db.execute(restore).unwrap();
+                } else {
+                    db.execute(restore).unwrap();
+                }
+            }
+        }
+        TimedPublish {
+            cold: totals[0],
+            warm: median(&totals[1..]),
+            wal_warm: median(&wal[1..]),
+            sync_warm: 0,
+            publish_warm: median(&publish[1..]),
+            compare_warm: median(&compare[1..]),
+            compares: 0,
+            wal_bytes: median_u64(&wal_bytes[1..]),
+            heap_pages: heap_pages[heap_pages.len() - 1],
+            index_pages: index_pages[index_pages.len() - 1],
+            other_pages: 0,
+            frames: frames[frames.len() - 1],
+        }
     }
 }
