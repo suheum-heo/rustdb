@@ -19,8 +19,11 @@
 //! `COUNT`, `SUM`, and `AVG` accept `DISTINCT` on one column. `SELECT DISTINCT`
 //! keeps the first copy of each projected row from one non-aggregate table,
 //! one non-aggregate `INNER JOIN`, or one non-aggregate `LEFT JOIN`. A `LEFT JOIN` of two tables keeps
-//! every left row. A same-type column equality hashes the right table. Any
-//! other `ON` uses a nested loop. A left row with no TRUE `ON` match is
+//! every left row. An indexed integer equality probes the right index when the
+//! left table is empty or the right table has more than 64 times as many rows.
+//! That factor is separate from the inner join's rule. Any other same-type
+//! column equality hashes the right table. Any other `ON` uses a nested loop.
+//! A left row with no TRUE `ON` match is
 //! returned once, with NULL for each right column. `WHERE` runs after that
 //! extension. `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,
 //! `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)` use the same per-group sets

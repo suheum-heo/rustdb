@@ -997,3 +997,38 @@ Release profile `profile_milestone23`, 15 Nov 2026. Apple M5, 17179869184 bytes 
 At 10,000 by 10,000 matched rows, plain hash warm is 1,400 µs and nested warm is 715,496 µs, 511.1×. Distinct hash warm is 1,810 µs and nested warm is 731,256 µs, 404.0×. The plain hash cold time is 2,275 µs and the distinct hash cold time is 2,195 µs. The nested loop examines 100,000,000 pairs. Square matched plain checksums are 4,361; 43,690; 177,784; and 446,000. Square matched distinct checksums are 4,359; 35,461; 38,032; and 38,032. The distinct checksum stops changing once all eight names and the `id % 97` residues, including NULL, have been seen: 784 tuples.
 
 Distinct admission is visible and small next to the join. At 10,000 matched rows the distinct hash warm time is 410 µs above the plain query. Twenty-four unique tuples and 784 unique tuples differ by 202 µs at that size, while the estimate grows from 3,096 bytes to 101,136 bytes. The unmatched `none` hash run is the cheapest distinct sample at 10,000, 1,025 µs. `ORDER BY` plus `LIMIT 10` stays near the full distinct time because the scan still admits every tuple before the sort. These samples do not support a claim that the distinct set dominates a hash left join.
+
+## Milestone 24 index nested-loop LEFT JOIN
+
+Release profile `profile_milestone24`, rerun 15 Nov 2026. Apple M5, 17179869184 bytes of memory, `rustc 1.100.0 (0ef1bc386 2026-11-09)`. `Value` is 32 bytes. Hash times are taken before `CREATE INDEX`. Index times force the probe on that index, including sizes the 64× rule would hash. Nested times force the loop. A zero nested time was not run. `probes` counts left rows with a non-NULL integer key: one B+ tree lookup each. `entries` counts right rows stored under those keys, before the residual `ON`. Every returned entry is one `ON` comparison, so the `ON` evaluation count equals `entries`. `nested candidates` is `users × orders`, which is a different count. `hash bytes` estimates the right-side hash table. `index bytes` is 0: the probe does not keep a pair buffer or a hash table. Neither figure is process RSS, and neither includes the on-disk tree. Checksums matched across hash, index, and, where it ran, the nested loop.
+
+| Shape | Users | Orders | Probes | Entries | Hash bytes | Plain hash warm | Plain index warm | Plain nested warm | Distinct hash warm | Distinct index warm | Plain checksum |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| matched | 100 | 100 | 100 | 100 | 7,200 | 26 µs | 111 µs | 125 µs | 37 µs | 80 µs | 4,361 |
+| none | 100 | 100 | 100 | 0 | 864 | 17 µs | 68 µs | 85 µs | 22 µs | 73 µs | 100 |
+| duplicates | 100 | 100 | 100 | 100 | 1,440 | 48 µs | 140 µs | 86 µs | 71 µs | 164 µs | 390 |
+| selective | 100 | 100 | 100 | 1 | 928 | 38 µs | 131 µs | 185 µs | 48 µs | 142 µs | 100 |
+| residual | 100 | 100 | 100 | 100 | 7,200 | 66 µs | 131 µs | 370 µs | 84 µs | 165 µs | 4,354 |
+| matched | 1,000 | 1,000 | 1,000 | 1,000 | 72,000 | 339 µs | 887 µs | 7,430 µs | 589 µs | 1,243 µs | 43,690 |
+| none | 1,000 | 1,000 | 1,000 | 0 | 8,064 | 99 µs | 1,188 µs | 6,766 µs | 136 µs | 1,230 µs | 1,000 |
+| duplicates | 1,000 | 1,000 | 1,000 | 1,000 | 8,640 | 128 µs | 1,403 µs | 6,956 µs | 218 µs | 1,341 µs | 3,990 |
+| selective | 1,000 | 1,000 | 1,000 | 10 | 8,128 | 109 µs | 1,149 µs | 6,891 µs | 142 µs | 1,152 µs | 1,089 |
+| residual | 1,000 | 1,000 | 1,000 | 1,000 | 72,000 | 175 µs | 953 µs | 15,201 µs | 311 µs | 1,024 µs | 43,630 |
+| matched | 4,000 | 4,000 | 4,000 | 4,000 | 288,000 | 589 µs | 3,144 µs | 107,887 µs | 813 µs | 3,247 µs | 177,784 |
+| none | 4,000 | 4,000 | 4,000 | 0 | 32,064 | 382 µs | 4,316 µs | 108,536 µs | 471 µs | 4,314 µs | 4,000 |
+| duplicates | 4,000 | 4,000 | 4,000 | 4,000 | 32,640 | 505 µs | 4,770 µs | 108,299 µs | 769 µs | 5,148 µs | 15,990 |
+| selective | 4,000 | 4,000 | 4,000 | 40 | 32,128 | 407 µs | 5,090 µs | 107,820 µs | 520 µs | 4,601 µs | 4,366 |
+| residual | 4,000 | 4,000 | 4,000 | 4,000 | 288,000 | 707 µs | 3,041 µs | 244,810 µs | 836 µs | 3,313 µs | 177,556 |
+| matched | 10,000 | 10,000 | 10,000 | 10,000 | 720,000 | 1,333 µs | 8,492 µs | 685,743 µs | 1,682 µs | 9,463 µs | 446,000 |
+| none | 10,000 | 10,000 | 10,000 | 0 | 80,064 | 779 µs | 12,160 µs | — | 1,075 µs | 12,361 µs | 10,000 |
+| duplicates | 10,000 | 10,000 | 10,000 | 10,000 | 80,640 | 1,122 µs | 12,360 µs | — | 1,700 µs | 13,130 µs | 39,990 |
+| selective | 10,000 | 10,000 | 10,000 | 100 | 80,128 | 770 µs | 11,717 µs | — | 1,122 µs | 12,035 µs | 10,909 |
+| residual | 10,000 | 10,000 | 10,000 | 10,000 | 720,000 | 1,409 µs | 8,901 µs | — | 1,838 µs | 10,033 µs | 445,432 |
+| matched | 100 | 10,000 | 100 | 10,000 | 86,400 | 681 µs | 750 µs | 7,035 µs | 1,136 µs | 1,161 µs | 446,000 |
+| matched | 10,000 | 100 | 10,000 | 100 | 7,200 | 525 µs | 5,812 µs | 6,923 µs | 1,002 µs | 6,055 µs | 14,261 |
+
+At 10,000 by 10,000 matched rows, plain hash warm is 1,333 µs, plain index warm is 8,492 µs, and plain nested warm is 685,743 µs. The nested loop is 514.4× the hash and 80.8× the index. The index is 6.4× the hash. Plain hash cold is 1,364 µs and plain index cold is 10,539 µs. The aggregate warm times are 1,460 µs, 8,702 µs, and 690,447 µs. The distinct `ORDER BY` plus `LIMIT 10` warm times are 1,728 µs, 9,064 µs, and 687,710 µs. The index makes 10,000 probes and visits 10,000 entries, and those 10,000 entries are the `ON` comparisons. The nested loop examines 100,000,000 pairs. Square matched plain checksums are 4,361; 43,690; 177,784; and 446,000.
+
+The index is not uniformly faster than the hash. Equal sizes stay on the hash: at 10,000 by 10,000 the hash warm time is lower for every shape in this run. At 10,000 by 100, outside the size rule, hash warm is 525 µs and index warm is 5,812 µs. That is 10,000 probes visiting 100 entries.
+
+The 100 by 10,000 case is inside the size rule: 100 probes visit 10,000 entries. One sample in the table has hash warm 681 µs and index warm 750 µs. Seven fresh databases, each reporting the median of five warm runs, gave hash medians 656, 706, 708, 781, 834, 906, and 1,109 µs, and index medians 755, 771, 804, 809, 827, 834, and 882 µs. The median of those medians is 781 µs for the hash and 809 µs for the index. The index was faster on 4 of the 7 databases and slower on 3. The ranges overlap. This does not support treating the index as faster than the hash at 100 by 10,000. It does support keeping the hash when the right table is not much larger than the left, and it does not support replacing every hash left join with an index probe.
