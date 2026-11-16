@@ -22,8 +22,10 @@
 //! every left row. A same-type column equality hashes the right table. Any
 //! other `ON` uses a nested loop. A left row with no TRUE `ON` match is
 //! returned once, with NULL for each right column. `WHERE` runs after that
-//! extension. `COUNT(*)` counts a null-extended row. `SELECT DISTINCT` and
-//! `DISTINCT` aggregates stay off that join.
+//! extension. `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,
+//! `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)` use the same per-group sets
+//! as a single table and ignore NULL, including a null-extended right column.
+//! `SELECT DISTINCT` stays off that join.
 //! Other filters scan the in-memory table.
 //!
 //! # Example

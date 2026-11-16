@@ -581,26 +581,21 @@ fn select_distinct(select: &Select) -> Result<bool, DbError> {
     }
 }
 
-/// `SELECT DISTINCT` and `DISTINCT` aggregates stay off a `LEFT JOIN`.
+/// `SELECT DISTINCT` stays off a `LEFT JOIN`.
 ///
-/// Plain `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, and `HAVING` are
-/// accepted. The arguments are the same expressions an `INNER JOIN` aggregate
-/// already accepts.
+/// `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, including `COUNT(DISTINCT ...)`,
+/// `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)`, plus `GROUP BY` and `HAVING`,
+/// use the same binding as an `INNER JOIN` aggregate.
 fn reject_left_join(
     distinct: bool,
-    projection: &Projection,
+    _projection: &Projection,
     _group_by: &[SelectColumn],
-    having: Option<&Expr>,
-    order_by: &[OrderKey],
+    _having: Option<&Expr>,
+    _order_by: &[OrderKey],
 ) -> Result<(), DbError> {
     if distinct {
         return Err(DbError::unsupported(
             "LEFT JOIN is not supported with DISTINCT",
-        ));
-    }
-    if crate::ast::has_distinct_aggregate(projection, having, order_by) {
-        return Err(DbError::unsupported(
-            "LEFT JOIN is not supported with DISTINCT aggregates",
         ));
     }
     Ok(())
@@ -1661,14 +1656,8 @@ mod tests {
             "SELECT u.name, COUNT(o.user_id) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name;",
         )
         .unwrap();
-        let error = parse(
-            "SELECT SUM(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "LEFT JOIN is not supported with DISTINCT aggregates"
-        );
+        parse("SELECT SUM(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;")
+            .unwrap();
         let error = parse("SELECT * FROM users RIGHT JOIN orders ON users.id = orders.user_id;")
             .unwrap_err();
         assert_eq!(error.to_string(), "RIGHT JOIN is not supported");
