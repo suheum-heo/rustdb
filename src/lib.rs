@@ -31,7 +31,10 @@
 //! posting fails the statement. The original predicate then runs on that
 //! complete set. A range, `OR`, `IS NULL`, and a non-integer equality still
 //! scan the heap. The index and the WAL change only inside the existing
-//! publish of that statement. `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,
+//! publish of that statement. An `UPDATE` publishes the matched rows through
+//! that commit and does not compare the other heap values. A larger record
+//! relocates with the existing page editor. The undo clone of the table still
+//! happens before the statement. `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,
 //! `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)` use the same per-group sets
 //! as a single table and ignore NULL, including a null-extended right column.
 //! `SELECT DISTINCT` keeps the first copy of each projected logical row,

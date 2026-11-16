@@ -114,6 +114,57 @@ impl Editor {
             }
         }
         self.create_missing_indexes(pager, indexes)?;
+        self.prepared(pager)
+    }
+
+    /// Rewrite `changes` and leave every other stored row unread.
+    ///
+    /// A value that already matches its slot does not dirty a page. A larger
+    /// record uses the existing relocate path. Index pages are dirtied only
+    /// when an integer key changes. The returned pages are one atomic commit.
+    pub(crate) fn rewrite_changes(
+        mut self,
+        pager: &mut Pager,
+        table: &str,
+        changes: &[(u64, Vec<Value>)],
+    ) -> Result<Option<Prepared>, DbError> {
+        if changes.is_empty() {
+            return Ok(None);
+        }
+        let positions = {
+            let live = self.snapshot.tables.get(table).ok_or_else(|| {
+                DbError::Internal(format!("updated table '{table}' is not stored"))
+            })?;
+            let mut positions = HashMap::with_capacity(live.row_ids.len());
+            for (index, row_id) in live.row_ids.iter().copied().enumerate() {
+                if positions.insert(row_id, index).is_some() {
+                    return Err(DbError::Internal(format!(
+                        "stored table '{table}' repeats row {row_id}"
+                    )));
+                }
+            }
+            positions
+        };
+        let mut seen = HashSet::with_capacity(changes.len());
+        for (row_id, values) in changes {
+            if !seen.insert(*row_id) {
+                return Err(DbError::Internal(format!(
+                    "update lists row {row_id} twice in '{table}'"
+                )));
+            }
+            let Some(index) = positions.get(row_id).copied() else {
+                return Err(DbError::Internal(format!(
+                    "updated row {row_id} is not stored in '{table}'"
+                )));
+            };
+            if !self.same_values(pager, table, index, values)? {
+                self.rewrite_row(pager, table, index, *row_id, values)?;
+            }
+        }
+        self.prepared(pager)
+    }
+
+    fn prepared(mut self, pager: &mut Pager) -> Result<Option<Prepared>, DbError> {
         if self.dirty.is_empty() && !self.freelist_dirty {
             return Ok(None);
         }
@@ -686,6 +737,13 @@ impl Editor {
                 .pages
                 .get_mut(&id)
                 .ok_or_else(|| DbError::Internal(format!("dirty page {id} is missing")))?;
+            match page::page_type_of(page) {
+                page::TYPE_HEAP => profile::note_heap_page(),
+                page::TYPE_INDEX_LEAF | page::TYPE_INDEX_INTERNAL | page::TYPE_INDEX_CATALOG => {
+                    profile::note_index_page()
+                }
+                _ => profile::note_other_page(),
+            }
             page::seal(page);
             page::verify(page, id)?;
         }
