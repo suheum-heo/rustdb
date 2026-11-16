@@ -1298,3 +1298,53 @@ Deleting 10,000 duplicate keys is 3,438,808 µs versus 3,477,783 µs. Both write
 At 100 rows the warm deletes sit inside the WAL, about 9–13 ms, and neither undo path is consistently faster. A miss is 26 µs versus 29 µs. At 1,000 rows a miss is 505 µs versus 275 µs, inside the noise of a statement that writes nothing, and the clone is 63 µs. A one-row delete is 12,056 µs versus 11,999 µs. At 10,000 rows a miss is 2,248 µs versus 2,581 µs and a one-row delete is 13,005 µs versus 11,999 µs, the same 28,796 WAL bytes. Deleting every row at 10,000 is 66,102 µs versus 66,058 µs with the same 1,205,496 WAL bytes.
 
 The journal removes the full-table clone from a `DELETE` that does not remove every row. It does not reduce WAL bytes when the same pages are dirty, and it does not remove the equality walk or the per-row unlink. A miss still pays for a table image. `INSERT` still snapshots the table. Peak RSS was not measured, so this run does not claim a smaller process.
+
+## Milestone 29 selective DELETE publication
+
+16 Nov 2026, Apple M5, 17179869184 bytes of memory, rustc 1.100.0. `Value` is 32 bytes, `Vec<Value>` is 24 bytes, and `usize` is 8 bytes. The ignored test is `profile_milestone29`. It copies one database per size and runs selective publication against the previous full table image. Both sides use the Milestone 28 row journal. Samples are 6 below 100,000 rows and 3 at 100,000 for a miss, a one-row delete, a ten-row delete, and a duplicate-key delete. Cold is the first sample. Warm is the median of the rest. Deleting half the rows, every row, one row after an indexed key change, one wide text value, and the precommit failure are one sample each, so cold and warm match. Injected errors are not a power-loss test.
+
+`id_bytes` is the deleted row-id list, `count * 8`. `image_bytes` is the Milestone 27 survivor estimate, `survivors * 160` on this schema, which is what the full-image path clones. Neither figure is process RSS. Neither includes the heap bytes of a `TEXT` value. Allocation counts were not instrumented, and peak RSS was not measured. A miss has an empty id list and still decodes every stored row. Deleting every row has no survivors, so `image_bytes` is 0 and `id_bytes` is `rows * 8`.
+
+The durable results below are the selective path. The full-image path wrote the same WAL, the same heap, index, and frame counts, and the same checksum on every workload, at every size.
+
+| Rows | Workload | Id bytes | Image bytes | WAL bytes | Heap | Index | Frames | Checksum |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100,000 | miss | 0 | 16,000,000 | 0 | 0 | 0 | 0 | 5,001,088,890 |
+| 100,000 | one | 8 | 15,999,840 | 36,996 | 1 | 6 | 9 | 5,001,088,887 |
+| 100,000 | ten | 80 | 15,998,400 | 94,396 | 1 | 20 | 23 | 5,001,088,770 |
+| 100,000 | duplicates | 80,000 | 14,400,000 | 7,749,096 | 1,407 | 403 | 1,890 | 4,501,070,001 |
+| 100,000 | half | 400,000 | 8,000,000 | 6,314,096 | 1 | 42 | 1,540 | 3,750,550,000 |
+| 100,000 | all | 800,000 | 0 | 12,275,496 | 0 | 1 | 2,994 | 0 |
+| 100,000 | updated | 8 | 15,999,840 | 45,196 | 1 | 7 | 11 | 5,001,088,887 |
+| 100,000 | wide | 8 | 15,999,840 | 61,596 | 1 | 8 | 15 | 5,001,088,887 |
+| 100,000 | rollback | 8 | 15,999,840 | 0 durable | 0 | 0 | 0 | 5,001,088,890 restored |
+
+Those WAL byte counts, page counts, and checksums are the Milestone 28 numbers. Rollback's encoded log was 49,264 bytes and was not a synced commit. The retry then matches the one-row delete, checksum 5,001,088,885. A delete of every row frees the heap pages, so the heap counter is 0 and those pages are included in the 2,994 frames as free pages.
+
+Warm latency, selective publication then the full image, in microseconds. `prepare` is the in-memory audit, or the table-image clone on the full path. `publish` is the editor. `compare` is the stored-row decode. A real delete compares nothing. A miss compares every row.
+
+| Rows | Workload | Selective | Full image | Prepare | Full prepare | Publish | Full publish | Compare | WAL bytes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100,000 | miss | 15,751 | 21,733 | 1,854 | 4,388 | 12,674 | 12,024 | 8,028 | 0 |
+| 100,000 | one | 19,952 | 28,929 | 1,900 | 5,075 | 1,517 | 3,650 | 0 | 36,996 |
+| 100,000 | ten | 21,855 | 36,821 | 1,771 | 4,596 | 2,919 | 11,548 | 0 | 94,396 |
+| 100,000 | duplicates | 416,074 | 3,144,914 | 1,699 | 3,641 | 333,987 | 3,057,729 | 0 | 7,749,096 |
+| 100,000 | half | 1,176,450 | 17,688,489 | 900 | 2,304 | 1,106,131 | 17,616,282 | 0 | 6,314,096 |
+| 100,000 | all | 1,396,383 | 1,383,504 | 0 | 2 | 1,279,153 | 1,271,095 | 0 | 12,275,496 |
+| 100,000 | updated | 18,832 | 28,958 | 1,917 | 4,536 | 1,631 | 3,716 | 0 | 45,196 |
+| 100,000 | wide | 19,742 | 28,031 | 1,821 | 4,427 | 1,917 | 3,958 | 0 | 61,596 |
+| 100,000 | rollback | 12,048 | 20,894 | — | — | — | — | — | 0 durable |
+
+At 100,000 rows a miss is 15,751 µs selective and 21,733 µs with the full image. Both write 0 WAL bytes and both decode all 100,000 stored rows, about 8,028 µs. Building the image is 4,388 µs against an audit of 1,854 µs. The estimated image is 16,000,000 bytes. The selective path does not allocate it. The id list is empty. The decode remains.
+
+A one-row delete is 19,952 µs versus 28,929 µs, and both logs are 36,996 bytes: one heap page, six index pages, and nine frames. The editor is 1,517 µs versus 3,650 µs. The durable write did not get smaller. The statement is still mostly the log sync. Rebuilding the row-id map is 952 µs on the untimed statement. The wide-text delete journals 144 bytes by the estimate while the 200-character value sits outside that estimate. Its log is 61,596 bytes on both paths.
+
+Deleting 10,000 duplicate keys is 416,074 µs versus 3,144,914 µs. Both write 7,749,096 WAL bytes, 1,407 heap pages, 403 index pages, and 1,890 frames. The editor is 333,987 µs versus 3,057,729 µs. The image estimate is 14,400,000 bytes and preparing it is only 3,641 µs, so that gap is not the clone. The full-image editor searches the keep set from the end once per removed row. The selective path resolves each stored id once and unlinks from the highest index. The 334 ms that remains is unlink and index maintenance.
+
+Deleting half the rows is 1,176,450 µs versus 17,688,489 µs. Both write 6,314,096 WAL bytes, one heap page, 42 index pages, and 1,540 frames. Prepare is 900 µs versus 2,304 µs. Publish is 1,106,131 µs versus 17,616,282 µs. The same keep-set search explains the full-image time. The selective publish is still 1.1 seconds, and that is the per-row unlink.
+
+Deleting every row is 1,396,383 µs versus 1,383,504 µs. Both write 12,275,496 WAL bytes. There are no survivors to clone, and both editors unlink from the end, so the times match. Publish is about 1.28 seconds on both. That is the remaining bottleneck: one heap unlink and its index updates per row, then the same dirty pages as before.
+
+At 100 rows the warm deletes sit inside the WAL, about 10–12 ms, and the image clone is a few microseconds. A miss is 30 µs versus 38 µs and compares all 100 rows. At 1,000 rows a miss is 387 µs versus 396 µs. A one-row delete is 12,066 µs versus 12,957 µs with the same 28,796 WAL bytes. At 10,000 rows a miss is 1,460 µs versus 2,102 µs. A one-row delete is 11,783 µs versus 12,086 µs with the same 28,796 WAL bytes. Deleting half of 10,000 rows is 47,323 µs versus 194,636 µs with the same 758,596 WAL bytes. Deleting every row at 10,000 is 61,803 µs versus 61,917 µs with the same 1,205,496 WAL bytes.
+
+The selective path removes the survivor-image clone and the repeated keep-set scan. It does not reduce WAL bytes when the same pages are dirty. A miss still decodes every stored row. Deleting every row still unlinks every row. `INSERT` still snapshots the table. Peak RSS was not measured, so this run does not claim a smaller process.

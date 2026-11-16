@@ -23,6 +23,15 @@ pub struct Database {
     /// Publish rewrites those rows and leaves the others unread. `None` means
     /// this statement is not an update, so publish compares the whole image.
     selective: Option<(String, Vec<u64>)>,
+    /// Deleted row ids from the current `DELETE`.
+    ///
+    /// These are the ids captured before compaction, copied so the undo journal
+    /// keeps the images and the original positions. Publish unlinks this set
+    /// through the existing editor and does not clone surviving values. `None`
+    /// means this statement is not a selective delete. An empty list is a
+    /// delete that matched nothing: memory is still audited, stored rows are
+    /// still decoded, and nothing is written when they already match.
+    delete_targets: Option<(String, Vec<u64>)>,
     /// Original images for the current selective `UPDATE`.
     ///
     /// `None` means this statement did not capture a journal. An empty journal
@@ -157,6 +166,7 @@ impl Database {
             indexes: Vec::new(),
             store: None,
             selective: None,
+            delete_targets: None,
             update_undo: None,
             delete_undo: None,
         }
@@ -180,6 +190,7 @@ impl Database {
             indexes,
             store: Some(store),
             selective: None,
+            delete_targets: None,
             update_undo: None,
             delete_undo: None,
         })
@@ -617,12 +628,23 @@ impl Database {
         self.selective = Some((table.to_string(), row_ids));
     }
 
+    /// Remember ids to unlink. This does not take the undo journal.
+    ///
+    /// `row_ids` is a copy of the ids captured before compaction. The journal
+    /// still owns the removed images and their positions. An empty list is a
+    /// real no-match, not a skipped publish.
+    pub(crate) fn stage_selective_delete(&mut self, table: &str, row_ids: Vec<u64>) {
+        self.delete_targets = Some((table.to_string(), row_ids));
+    }
+
     pub(crate) fn clear_selective(&mut self) {
         self.selective = None;
+        self.delete_targets = None;
     }
 
     pub(crate) fn publish(&mut self) -> Result<(), StepError> {
         let selective = self.selective.take();
+        let deleted = self.delete_targets.take();
         if self.store.is_none() {
             return Ok(());
         }
@@ -638,11 +660,103 @@ impl Database {
             };
             return store.publish_row_changes(&name, &changes);
         }
+        if let Some((name, deleted_ids)) = &deleted
+            && self.delete_targets_match(name, deleted_ids)
+        {
+            return self.publish_deleted(name, deleted_ids);
+        }
+        let prepare = crate::storage::publish_timer();
         let images: Vec<TableImage> = self.tables.values().map(Table::image).collect();
+        crate::storage::add_publish_prepare(prepare);
+        #[cfg(test)]
+        note_publish_images(images.len());
         let Some(store) = self.store.as_mut() else {
             return Err(Self::missing_store());
         };
         store.publish_indexes(&images, &self.indexes)
+    }
+
+    /// Audit memory, then unlink `deleted` without cloning survivors.
+    ///
+    /// Tables whose stored ids still match memory are decoded and compared.
+    /// The table being unlinked is not one of them, so its survivors are not
+    /// read. A no-match has an empty `deleted` list and does compare that
+    /// table. A stored row that already matches does not dirty a page.
+    fn publish_deleted(&mut self, name: &str, deleted: &[u64]) -> Result<(), StepError> {
+        let prepare = crate::storage::publish_timer();
+        for table in self.tables.values() {
+            table.audit_for_publish().map_err(StepError::BeforeCommit)?;
+        }
+        crate::storage::add_publish_prepare(prepare);
+        let Database {
+            tables,
+            store,
+            indexes,
+            ..
+        } = self;
+        let Some(store) = store.as_mut() else {
+            return Err(Self::missing_store());
+        };
+        let mut scans = Vec::new();
+        for (other, table) in tables.iter() {
+            if other.as_str() == name && !deleted.is_empty() {
+                continue;
+            }
+            scans.push(crate::storage::MemoryRows {
+                name: other.as_str(),
+                rows: table.rows(),
+            });
+        }
+        store.publish_deletes(name, deleted, &scans, indexes)
+    }
+
+    /// True when unlinking `deleted` from the stored ids leaves this table.
+    ///
+    /// The comparison uses ids only. It does not clone row values. A mismatch
+    /// falls back to the full image, which is the previous publication path.
+    fn delete_targets_match(&self, name: &str, deleted: &[u64]) -> bool {
+        let Some(store) = self.store.as_ref() else {
+            return false;
+        };
+        let Some(table) = self.tables.get(name) else {
+            return false;
+        };
+        let Some(stored_ids) = store.stored_row_ids(name) else {
+            return false;
+        };
+        let Some(stored_next) = store.stored_next_row_id(name) else {
+            return false;
+        };
+        if stored_next != table.next_row_id() {
+            return false;
+        }
+        for (other, other_table) in &self.tables {
+            if other.as_str() == name {
+                continue;
+            }
+            if !store.matches_row_identity(other, other_table.row_ids(), other_table.next_row_id())
+            {
+                return false;
+            }
+        }
+        let mut pending = HashSet::with_capacity(deleted.len());
+        for id in deleted {
+            if *id == 0 || !pending.insert(*id) {
+                return false;
+            }
+        }
+        let memory = table.row_ids();
+        let mut memory_index = 0;
+        for id in stored_ids {
+            if pending.remove(id) {
+                continue;
+            }
+            if memory.get(memory_index) != Some(id) {
+                return false;
+            }
+            memory_index += 1;
+        }
+        pending.is_empty() && memory_index == memory.len()
     }
 
     fn missing_store() -> StepError {
@@ -885,10 +999,17 @@ fn fail_undo_restore() -> bool {
 }
 
 #[cfg(test)]
+fn note_publish_images(count: usize) {
+    let count = u64::try_from(count).unwrap_or(u64::MAX);
+    PUBLISH_IMAGES.with(|slot| slot.set(slot.get().saturating_add(count)));
+}
+
+#[cfg(test)]
 thread_local! {
     static TABLE_SNAPSHOTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static SNAPSHOT_US: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
     static FAIL_UNDO_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PUBLISH_IMAGES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Counts table clones taken for undo.
@@ -911,6 +1032,21 @@ pub(crate) fn table_snapshots() -> u64 {
 #[cfg(test)]
 pub(crate) fn snapshot_us() -> u128 {
     SNAPSHOT_US.with(std::cell::Cell::get)
+}
+
+/// Clears the count of table images built for publish.
+#[cfg(test)]
+pub(crate) fn reset_publish_images() {
+    PUBLISH_IMAGES.with(|slot| slot.set(0));
+}
+
+/// Table images built by the full publish path since the last reset.
+///
+/// A selective `DELETE` leaves this at zero. The full-image guard increments
+/// it by the number of tables.
+#[cfg(test)]
+pub(crate) fn publish_images() -> u64 {
+    PUBLISH_IMAGES.with(std::cell::Cell::get)
 }
 
 /// Makes the next undo restore fence the process instead of writing images.

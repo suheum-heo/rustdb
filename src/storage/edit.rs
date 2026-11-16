@@ -12,7 +12,7 @@ use crate::storage::page::{self, PAGE_SIZE, Page};
 use crate::storage::pager::Pager;
 use crate::storage::profile;
 use crate::storage::record::{self, IndexCatalog, Link, NULL_LINK, StoredRecord};
-use crate::storage::store::{IndexImage, TableImage};
+use crate::storage::store::{IndexImage, MemoryRows, TableImage};
 use crate::value::{DataType, Value};
 
 const FREE_DIRECTORY_CAPACITY: usize = (PAGE_SIZE - 28) / 4;
@@ -162,6 +162,73 @@ impl Editor {
             }
         }
         self.prepared(pager)
+    }
+
+    /// Unlink `deleted` and compare `scans`, reusing [`Self::unlink_row`].
+    ///
+    /// The ids were captured before compaction. They are checked against the
+    /// stored snapshot before any row is removed: a duplicate, a zero, an id
+    /// past the counter, or an id that is not stored fails with no page
+    /// marked dirty. Removal starts at the highest index, so earlier indexes
+    /// stay valid. Surviving ids stay in insertion order. `next_row_id` is
+    /// left unchanged. `scans` are tables whose stored ids still match memory,
+    /// including a delete that matched nothing. Those rows are decoded and
+    /// compared. A survivor of a real delete is not in `scans` and is not cloned.
+    pub(crate) fn unlink_deleted(
+        mut self,
+        pager: &mut Pager,
+        table: &str,
+        deleted: &[u64],
+        scans: &[MemoryRows<'_>],
+        indexes: &[IndexImage],
+    ) -> Result<Option<Prepared>, DbError> {
+        if !self.snapshot.tables.contains_key(table) {
+            return Err(DbError::Internal(format!(
+                "deleted table '{table}' is not stored"
+            )));
+        }
+        self.drop_absent_indexes(pager, indexes)?;
+        let positions = if deleted.is_empty() {
+            Vec::new()
+        } else {
+            let live = &self.snapshot.tables[table];
+            deleted_positions(live, table, deleted)?
+        };
+        for scan in scans {
+            self.sync_stored_rows(pager, scan)?;
+        }
+        for index in positions {
+            self.unlink_row(pager, table, index)?;
+        }
+        self.create_missing_indexes(pager, indexes)?;
+        self.prepared(pager)
+    }
+
+    fn sync_stored_rows(
+        &mut self,
+        pager: &mut Pager,
+        scan: &MemoryRows<'_>,
+    ) -> Result<(), DbError> {
+        let count = {
+            let live = self.snapshot.tables.get(scan.name).ok_or_else(|| {
+                DbError::Internal(format!("stored table '{}' is missing", scan.name))
+            })?;
+            if live.row_ids.len() != scan.rows.len() || live.links.len() != scan.rows.len() {
+                return Err(DbError::Internal(format!(
+                    "stored table '{}' does not match memory",
+                    scan.name
+                )));
+            }
+            live.row_ids.len()
+        };
+        for index in 0..count {
+            let row_id = self.snapshot.tables[scan.name].row_ids[index];
+            let values = &scan.rows[index];
+            if !self.same_values(pager, scan.name, index, values)? {
+                self.rewrite_row(pager, scan.name, index, row_id, values)?;
+            }
+        }
+        Ok(())
     }
 
     fn prepared(mut self, pager: &mut Pager) -> Result<Option<Prepared>, DbError> {
@@ -1262,6 +1329,47 @@ fn directories_needed(unused: usize, capacity: usize) -> usize {
     } else {
         (unused - capacity).div_ceil(FREE_DIRECTORY_CAPACITY + 1)
     }
+}
+
+/// Stored indexes of `deleted`, highest first.
+///
+/// Checking finishes before any unlink. A later removal does not change an
+/// earlier index, so the caller can pass these indexes straight to `unlink_row`.
+fn deleted_positions(
+    live: &LiveTable,
+    table: &str,
+    deleted: &[u64],
+) -> Result<Vec<usize>, DbError> {
+    let mut positions = HashMap::with_capacity(live.row_ids.len());
+    for (index, row_id) in live.row_ids.iter().copied().enumerate() {
+        if positions.insert(row_id, index).is_some() {
+            return Err(DbError::Internal(format!(
+                "stored table '{table}' repeats row {row_id}"
+            )));
+        }
+    }
+    let mut seen = HashSet::with_capacity(deleted.len());
+    let mut indexes = Vec::with_capacity(deleted.len());
+    for row_id in deleted {
+        if *row_id == 0 || *row_id >= live.next_row_id {
+            return Err(DbError::Internal(format!(
+                "deleted row {row_id} is outside the counter for table '{table}'"
+            )));
+        }
+        if !seen.insert(*row_id) {
+            return Err(DbError::Internal(format!(
+                "delete lists row {row_id} twice in '{table}'"
+            )));
+        }
+        let Some(index) = positions.get(row_id).copied() else {
+            return Err(DbError::Internal(format!(
+                "deleted row {row_id} is not stored in '{table}'"
+            )));
+        };
+        indexes.push(index);
+    }
+    indexes.sort_unstable_by(|left, right| right.cmp(left));
+    Ok(indexes)
 }
 
 fn is_subsequence(needle: &[u64], haystack: &[u64]) -> bool {

@@ -37,7 +37,10 @@
 //! saves the previous images of the matched rows and restores them if the
 //! commit fails before the log sync. A `DELETE` saves each removed row's
 //! image and original position and puts that row back, with the same id, if
-//! the commit fails before the log sync. `INSERT` still snapshots the table.
+//! the commit fails before the log sync. Publish unlinks those ids and does
+//! not clone the surviving values. A delete that matches nothing still audits
+//! memory and decodes the stored rows, and it writes no log when they already
+//! match. `INSERT` still snapshots the table.
 //! `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,
 //! `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)` use the same per-group sets
 //! as a single table and ignore NULL, including a null-extended right column.
