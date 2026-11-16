@@ -11,8 +11,18 @@
 //! outer integer column and that indexed column. The original `ON` stays the
 //! residual predicate. Anything else is a nested loop.
 //!
-//! A two-table `LEFT JOIN` does not use an index. A same-type column equality
-//! hashes the right table. `OR`, a range, and `IS NULL` stay a nested loop.
+//! A two-table `LEFT JOIN` probes an integer index on the right table when
+//! `ON` contains an equality between a left integer column and that indexed
+//! column. The executor keeps that probe only when the left table is empty or
+//! the right table has more than [`INDEX_PROBE_LEFT_FACTOR`] times as many
+//! rows. Otherwise that same integer equality hashes the right table, because
+//! one hash build is cheaper than a tree probe per left row. This is a size
+//! rule, not a cost model. It does not change the inner join's 64× rule. A
+//! `TEXT` or `BOOLEAN` equality is not an index probe. It hashes the right
+//! table even when an integer index exists on another column. An indexed
+//! integer equality is preferred to an earlier text equality in the same
+//! `AND`; the text comparison stays in the residual. `OR`, a range, and
+//! `IS NULL` stay a nested loop.
 //!
 //! A range also stays a sequential scan when it covers every `i64`, or every
 //! key currently stored in the chosen index. That decision uses the predicate
@@ -218,10 +228,13 @@ pub(crate) enum JoinAccess {
 
 /// How a two-table `LEFT JOIN` will be executed.
 ///
-/// An equality of `INTEGER`, `TEXT`, or `BOOLEAN` columns hashes the right
-/// table. `OR`, a range, `IS NULL`, or any comparison that is not a column
-/// equality on both sides stays a nested loop. Indexes are not consulted.
-/// `WHERE` is not part of this choice.
+/// An integer equality on an indexed right column is an index probe.
+/// [`finish_left_access`] turns that probe back into a hash of the right table
+/// unless the right table is empty-probed or more than
+/// [`INDEX_PROBE_LEFT_FACTOR`] times the left table. Any other equality of
+/// `INTEGER`, `TEXT`, or `BOOLEAN` columns hashes the right table. `OR`, a
+/// range, `IS NULL`, or any comparison that is not a column equality on both
+/// sides stays a nested loop. `WHERE` is not part of this choice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LeftAccess {
     /// Compare every left row with every right row.
@@ -241,24 +254,64 @@ pub(crate) enum LeftAccess {
         /// Original `ON` text when it is not exactly `predicate`.
         residual: Option<String>,
     },
+    /// For each left row, look up one integer key in a right-table index.
+    ///
+    /// The original `ON` still decides a match. `residual` is that text when
+    /// `ON` is wider than `predicate`.
+    Index {
+        /// Index that supplies the right candidates.
+        name: String,
+        /// Schema position of the indexed right column.
+        inner_ordinal: usize,
+        /// Schema position of the left join key.
+        outer_ordinal: usize,
+        /// The equality that supplies the probe key.
+        predicate: String,
+        /// Original `ON` text when it is not exactly `predicate`.
+        residual: Option<String>,
+    },
 }
 
-/// Pick a left-join path from the shape of `ON`.
+/// Right rows per left row before a left join keeps an index probe.
 ///
-/// The first column-to-column equality in `AND` order wins. Reversed operands
-/// are the same equality. A later equality is not a second hash key.
+/// Hashing the whole right table is one pass. An index probe is one tree
+/// lookup per left row. The inner join measured the hash scan faster at 20×
+/// and the index probe faster at 100× and 400×, so 64 sits between those
+/// measurements. This constant is not the inner join's factor: changing one
+/// does not change the other. It is a size rule, not a cost model.
+pub(crate) const INDEX_PROBE_LEFT_FACTOR: usize = 64;
+
+/// Pick a left-join path from the shape of `ON`. Row counts are applied later.
+///
+/// An indexed integer equality is the first candidate. Reversed operands are
+/// the same equality. The earliest matching index in `indexes` wins, and
+/// `indexes` is catalog order. Otherwise the first column-to-column equality
+/// in `AND` order hashes the right table. A later equality is not a second
+/// hash key. `OR` anywhere stays a nested loop.
 pub(crate) fn choose_left_join(
     outer_alias: &str,
     outer_columns: &[(String, DataType)],
     inner_alias: &str,
     inner_columns: &[(String, DataType)],
     on: &Expr,
+    indexes: &[IndexChoice],
 ) -> LeftAccess {
     if contains_or(on) {
         return LeftAccess::NestedLoop;
     }
     let mut atoms = Vec::new();
     flatten_and(on, &mut atoms);
+    if let Some(path) = left_index_join(
+        outer_alias,
+        outer_columns,
+        inner_alias,
+        inner_columns,
+        on,
+        indexes,
+        &atoms,
+    ) {
+        return path;
+    }
     for atom in atoms {
         let Some((outer_ordinal, inner_ordinal)) =
             hash_ordinals(atom, outer_alias, outer_columns, inner_alias, inner_columns)
@@ -274,6 +327,75 @@ pub(crate) fn choose_left_join(
         };
     }
     LeftAccess::NestedLoop
+}
+
+/// Keep an index probe when the right table is the one the size rule says is
+/// cheaper to probe. Every other indexed equality hashes those same columns.
+pub(crate) fn finish_left_access(
+    access: LeftAccess,
+    left_len: usize,
+    right_len: usize,
+) -> LeftAccess {
+    let LeftAccess::Index {
+        name,
+        inner_ordinal,
+        outer_ordinal,
+        predicate,
+        residual,
+    } = access
+    else {
+        return access;
+    };
+    if prefer_left_index_probe(left_len, right_len) {
+        return LeftAccess::Index {
+            name,
+            inner_ordinal,
+            outer_ordinal,
+            predicate,
+            residual,
+        };
+    }
+    LeftAccess::Hash {
+        outer_ordinal,
+        inner_ordinal,
+        predicate,
+        residual,
+    }
+}
+
+/// `true` when probing the right index is the chosen size rule.
+pub(crate) fn prefer_left_index_probe(left_len: usize, right_len: usize) -> bool {
+    if left_len == 0 {
+        return true;
+    }
+    right_len > left_len.saturating_mul(INDEX_PROBE_LEFT_FACTOR)
+}
+
+fn left_index_join(
+    outer_alias: &str,
+    outer_columns: &[(String, DataType)],
+    inner_alias: &str,
+    inner_columns: &[(String, DataType)],
+    on: &Expr,
+    indexes: &[IndexChoice],
+    atoms: &[&Expr],
+) -> Option<LeftAccess> {
+    let (name, inner_ordinal, outer_ordinal, predicate, residual) = indexed_equality(
+        outer_alias,
+        outer_columns,
+        inner_alias,
+        inner_columns,
+        on,
+        indexes,
+        atoms,
+    )?;
+    Some(LeftAccess::Index {
+        name,
+        inner_ordinal,
+        outer_ordinal,
+        predicate,
+        residual,
+    })
 }
 
 /// Pick a join path from the shape of `ON`. Row counts are applied later.
@@ -332,6 +454,34 @@ fn index_join(
     indexes: &[IndexChoice],
     atoms: &[&Expr],
 ) -> Option<JoinAccess> {
+    let (name, inner_ordinal, outer_ordinal, predicate, residual) = indexed_equality(
+        outer_alias,
+        outer_columns,
+        inner_alias,
+        inner_columns,
+        on,
+        indexes,
+        atoms,
+    )?;
+    Some(JoinAccess::IndexNestedLoop {
+        name,
+        inner_ordinal,
+        outer_ordinal,
+        predicate,
+        residual,
+    })
+}
+
+/// The earliest catalog index on an integer equality, if `ON` has one.
+fn indexed_equality(
+    outer_alias: &str,
+    outer_columns: &[(String, DataType)],
+    inner_alias: &str,
+    inner_columns: &[(String, DataType)],
+    on: &Expr,
+    indexes: &[IndexChoice],
+    atoms: &[&Expr],
+) -> Option<(String, usize, usize, String, Option<String>)> {
     if indexes.is_empty() {
         return None;
     }
@@ -355,13 +505,13 @@ fn index_join(
     let index = &indexes[*index_pos];
     let predicate = atom.render();
     let residual = residual(on, &predicate);
-    Some(JoinAccess::IndexNestedLoop {
-        name: index.name.clone(),
-        inner_ordinal: index.ordinal,
-        outer_ordinal: *outer_ordinal,
+    Some((
+        index.name.clone(),
+        index.ordinal,
+        *outer_ordinal,
         predicate,
         residual,
-    })
+    ))
 }
 
 fn hash_join(on: &Expr, atom: &Expr, outer_ordinal: usize, inner_ordinal: usize) -> JoinAccess {
@@ -1078,7 +1228,7 @@ mod tests {
 
     fn left_path(on: &Expr) -> LeftAccess {
         let tables = users_and_orders();
-        choose_left_join("users", &tables.outer, "orders", &tables.inner, on)
+        choose_left_join("users", &tables.outer, "orders", &tables.inner, on, &[])
     }
 
     #[test]
@@ -1100,7 +1250,9 @@ mod tests {
                 assert_eq!(predicate, "orders.user_id = users.id");
                 assert_eq!(residual, None);
             }
-            LeftAccess::NestedLoop => panic!("expected a hash left join"),
+            LeftAccess::NestedLoop | LeftAccess::Index { .. } => {
+                panic!("expected a hash left join")
+            }
         }
         let residual_on = binary(
             binary(
@@ -1127,7 +1279,9 @@ mod tests {
                     Some("users.id = orders.user_id AND orders.total > 100")
                 );
             }
-            LeftAccess::NestedLoop => panic!("expected a residual hash left join"),
+            LeftAccess::NestedLoop | LeftAccess::Index { .. } => {
+                panic!("expected a residual hash left join")
+            }
         }
         let or_on = binary(
             binary(
@@ -1176,7 +1330,9 @@ mod tests {
                 assert_eq!(predicate, "users.id = orders.user_id");
                 assert!(residual.is_some());
             }
-            LeftAccess::NestedLoop => panic!("the first equality is the hash key"),
+            LeftAccess::NestedLoop | LeftAccess::Index { .. } => {
+                panic!("the first equality is the hash key")
+            }
         }
         let not_eq = binary(
             qualified("users", "id"),
@@ -1206,5 +1362,292 @@ mod tests {
             ),
         );
         assert!(matches!(left_path(&or_inside), LeftAccess::NestedLoop));
+    }
+
+    #[test]
+    fn left_join_uses_the_earliest_right_index_and_the_size_rule() {
+        let tables = users_and_orders();
+        let indexes = order_indexes();
+        let equality = binary(
+            qualified("orders", "user_id"),
+            BinOp::Eq,
+            qualified("users", "id"),
+        );
+        match choose_left_join(
+            "users",
+            &tables.outer,
+            "orders",
+            &tables.inner,
+            &equality,
+            &indexes,
+        ) {
+            LeftAccess::Index {
+                name,
+                outer_ordinal,
+                inner_ordinal,
+                predicate,
+                residual,
+            } => {
+                assert_eq!(name, "idx_orders_user");
+                assert_eq!(outer_ordinal, 0);
+                assert_eq!(inner_ordinal, 1);
+                assert_eq!(predicate, "orders.user_id = users.id");
+                assert_eq!(residual, None);
+            }
+            other => panic!("expected an index left join, got {other:?}"),
+        }
+        let kept = finish_left_access(
+            choose_left_join(
+                "users",
+                &tables.outer,
+                "orders",
+                &tables.inner,
+                &equality,
+                &indexes,
+            ),
+            1,
+            INDEX_PROBE_LEFT_FACTOR + 1,
+        );
+        assert!(matches!(kept, LeftAccess::Index { .. }));
+        let hashed = finish_left_access(
+            choose_left_join(
+                "users",
+                &tables.outer,
+                "orders",
+                &tables.inner,
+                &equality,
+                &indexes,
+            ),
+            1,
+            INDEX_PROBE_LEFT_FACTOR,
+        );
+        assert!(matches!(hashed, LeftAccess::Hash { .. }));
+        assert!(prefer_left_index_probe(0, 4));
+        assert!(!prefer_left_index_probe(100, 100));
+        assert!(!prefer_left_index_probe(10_000, 100));
+        assert!(prefer_left_index_probe(100, 6_401));
+        // `name` is TEXT and `user_id` is INTEGER. Different types are not a
+        // hash key. A same-type TEXT or BOOLEAN equality still hashes.
+        let mixed = binary(
+            qualified("users", "name"),
+            BinOp::Eq,
+            qualified("orders", "user_id"),
+        );
+        assert!(matches!(
+            choose_left_join(
+                "users",
+                &tables.outer,
+                "orders",
+                &tables.inner,
+                &mixed,
+                &indexes,
+            ),
+            LeftAccess::NestedLoop
+        ));
+        let or_on = binary(equality, BinOp::Or, Expr::Literal(Value::Boolean(true)));
+        assert!(matches!(
+            choose_left_join(
+                "users",
+                &tables.outer,
+                "orders",
+                &tables.inner,
+                &or_on,
+                &indexes,
+            ),
+            LeftAccess::NestedLoop
+        ));
+    }
+
+    #[test]
+    fn left_join_keeps_text_and_boolean_hashes_beside_an_integer_index() {
+        let outer = vec![
+            ("id".to_string(), DataType::Integer),
+            ("name".to_string(), DataType::Text),
+            ("active".to_string(), DataType::Boolean),
+        ];
+        let inner = vec![
+            ("user_id".to_string(), DataType::Integer),
+            ("label".to_string(), DataType::Text),
+            ("paid".to_string(), DataType::Boolean),
+            ("amount".to_string(), DataType::Integer),
+        ];
+        let user_index = [IndexChoice {
+            name: "idx_orders_user".to_string(),
+            column: "user_id".to_string(),
+            ordinal: 0,
+        }];
+        let amount_index = [IndexChoice {
+            name: "idx_orders_amount".to_string(),
+            column: "amount".to_string(),
+            ordinal: 3,
+        }];
+        let text_eq = binary(
+            qualified("users", "name"),
+            BinOp::Eq,
+            qualified("orders", "label"),
+        );
+        let flags = binary(
+            qualified("users", "active"),
+            BinOp::Eq,
+            qualified("orders", "paid"),
+        );
+        let ids = binary(
+            qualified("users", "id"),
+            BinOp::Eq,
+            qualified("orders", "user_id"),
+        );
+        match choose_left_join("users", &outer, "orders", &inner, &text_eq, &user_index) {
+            LeftAccess::Hash {
+                outer_ordinal,
+                inner_ordinal,
+                predicate,
+                residual,
+            } => {
+                assert_eq!(outer_ordinal, 1);
+                assert_eq!(inner_ordinal, 1);
+                assert_eq!(predicate, "users.name = orders.label");
+                assert_eq!(residual, None);
+            }
+            other => panic!("text equality stays a hash, got {other:?}"),
+        }
+        match choose_left_join("users", &outer, "orders", &inner, &flags, &user_index) {
+            LeftAccess::Hash {
+                outer_ordinal,
+                inner_ordinal,
+                ..
+            } => {
+                assert_eq!(outer_ordinal, 2);
+                assert_eq!(inner_ordinal, 2);
+            }
+            other => panic!("boolean equality stays a hash, got {other:?}"),
+        }
+        assert!(matches!(
+            choose_left_join("users", &outer, "orders", &inner, &ids, &[]),
+            LeftAccess::Hash {
+                outer_ordinal: 0,
+                inner_ordinal: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            choose_left_join("users", &outer, "orders", &inner, &ids, &amount_index),
+            LeftAccess::Hash {
+                inner_ordinal: 0,
+                ..
+            }
+        ));
+        match choose_left_join("users", &outer, "orders", &inner, &ids, &user_index) {
+            LeftAccess::Index {
+                name,
+                inner_ordinal,
+                outer_ordinal,
+                ..
+            } => {
+                assert_eq!(name, "idx_orders_user");
+                assert_eq!(outer_ordinal, 0);
+                assert_eq!(inner_ordinal, 0);
+            }
+            other => panic!("indexed integer equality is a probe candidate, got {other:?}"),
+        }
+        let small = finish_left_access(
+            choose_left_join("users", &outer, "orders", &inner, &ids, &user_index),
+            100,
+            100,
+        );
+        assert!(matches!(
+            small,
+            LeftAccess::Hash {
+                outer_ordinal: 0,
+                inner_ordinal: 0,
+                ..
+            }
+        ));
+        let wide = finish_left_access(
+            choose_left_join("users", &outer, "orders", &inner, &ids, &user_index),
+            100,
+            10_000,
+        );
+        assert!(matches!(wide, LeftAccess::Index { name, .. } if name == "idx_orders_user"));
+        let narrow = finish_left_access(
+            choose_left_join("users", &outer, "orders", &inner, &ids, &user_index),
+            10_000,
+            100,
+        );
+        assert!(matches!(narrow, LeftAccess::Hash { .. }));
+        let both = binary(text_eq.clone(), BinOp::And, ids.clone());
+        let earlier_amount = [
+            IndexChoice {
+                name: "idx_orders_amount".to_string(),
+                column: "amount".to_string(),
+                ordinal: 3,
+            },
+            IndexChoice {
+                name: "idx_orders_user".to_string(),
+                column: "user_id".to_string(),
+                ordinal: 0,
+            },
+        ];
+        let amount_eq = binary(
+            qualified("users", "id"),
+            BinOp::Eq,
+            qualified("orders", "amount"),
+        );
+        let two_integers = binary(ids, BinOp::And, amount_eq);
+        match choose_left_join(
+            "users",
+            &outer,
+            "orders",
+            &inner,
+            &two_integers,
+            &earlier_amount,
+        ) {
+            LeftAccess::Index {
+                name,
+                inner_ordinal,
+                predicate,
+                residual,
+                ..
+            } => {
+                assert_eq!(name, "idx_orders_amount");
+                assert_eq!(inner_ordinal, 3);
+                assert_eq!(predicate, "users.id = orders.amount");
+                assert!(residual.is_some());
+            }
+            other => panic!("catalog order picks the amount index, got {other:?}"),
+        }
+        match choose_left_join("users", &outer, "orders", &inner, &both, &user_index) {
+            LeftAccess::Index {
+                name,
+                inner_ordinal,
+                predicate,
+                residual,
+                ..
+            } => {
+                assert_eq!(name, "idx_orders_user");
+                assert_eq!(inner_ordinal, 0);
+                assert_eq!(predicate, "users.id = orders.user_id");
+                let residual = residual.expect("text equality remains");
+                assert!(residual.contains("users.name = orders.label"), "{residual}");
+            }
+            other => panic!("integer index wins over an earlier text equality, got {other:?}"),
+        }
+        let hashed_text = finish_left_access(
+            choose_left_join("users", &outer, "orders", &inner, &both, &user_index),
+            2,
+            2,
+        );
+        match hashed_text {
+            LeftAccess::Hash {
+                inner_ordinal,
+                predicate,
+                residual,
+                ..
+            } => {
+                assert_eq!(inner_ordinal, 0);
+                assert_eq!(predicate, "users.id = orders.user_id");
+                assert!(residual.is_some());
+            }
+            other => panic!("a small indexed equality hashes those columns, got {other:?}"),
+        }
     }
 }

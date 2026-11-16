@@ -47,7 +47,8 @@
 //!
 //! An `INNER JOIN` walks the outer table in insertion order. For each outer
 //! row it reads inner candidates, then keeps a pair only when `ON` is TRUE.
-//! `WHERE` then runs on that pair. A `LEFT JOIN` hashes the right table when
+//! `WHERE` then runs on that pair. A `LEFT JOIN` probes a right-table integer index when that index is eligible
+//! and the right table is much larger, and otherwise hashes the right table when
 //! `ON` has a same-type column equality. The hash key skips NULL. Each exact
 //! key still runs the original `ON`, so a residual predicate can reject a
 //! candidate. A stored cell that is not NULL and not the column's declared
@@ -559,27 +560,44 @@ impl Database {
             .map(crate::schema::Column::data_type)
             .collect::<Vec<_>>();
         let inner_width = inner_types.len();
-        self.with_copied_side(outer, inner, |outer_rows, inner_rows, _| match path {
+        match path {
+            plan::LeftAccess::Index {
+                name,
+                outer_ordinal,
+                inner_ordinal,
+                ..
+            } => {
+                let probe = IndexProbe {
+                    index: name,
+                    inner_ordinal,
+                    outer_ordinal,
+                };
+                self.scan_index_left_join(outer, inner, &probe, prepared, tail.limit)
+            }
             plan::LeftAccess::NestedLoop => {
-                scan_left_join(outer_rows, inner_rows, inner_width, prepared, tail.limit)
+                self.with_copied_side(outer, inner, |outer_rows, inner_rows, _| {
+                    scan_left_join(outer_rows, inner_rows, inner_width, prepared, tail.limit)
+                })
             }
             plan::LeftAccess::Hash {
                 outer_ordinal,
                 inner_ordinal,
                 ..
-            } => scan_hash_left_join(
-                outer_rows,
-                inner_rows,
-                &outer_types,
-                &inner_types,
-                HashKeys {
-                    outer_ordinal,
-                    inner_ordinal,
-                },
-                prepared,
-                tail.limit,
-            ),
-        })
+            } => self.with_copied_side(outer, inner, |outer_rows, inner_rows, _| {
+                scan_hash_left_join(
+                    outer_rows,
+                    inner_rows,
+                    &outer_types,
+                    &inner_types,
+                    HashKeys {
+                        outer_ordinal,
+                        inner_ordinal,
+                    },
+                    prepared,
+                    tail.limit,
+                )
+            }),
+        }
     }
 
     /// `SELECT DISTINCT` over one `LEFT JOIN`.
@@ -609,19 +627,38 @@ impl Database {
         let inner_types = declared_types(self.table(&inner.name)?);
         let outputs = prepared.output_indexes.clone();
         let mut distinct = DistinctRows::new();
-        self.with_copied_side(outer, inner, |outer_rows, inner_rows, _| {
-            consume_left_join(
-                outer_rows,
-                inner_rows,
-                &outer_types,
-                &inner_types,
-                &path,
-                &prepared,
-                |outer_row, inner_row| {
+        match &path {
+            plan::LeftAccess::Index {
+                name,
+                outer_ordinal,
+                inner_ordinal,
+                ..
+            } => {
+                let probe = IndexProbe {
+                    index: name.clone(),
+                    inner_ordinal: *inner_ordinal,
+                    outer_ordinal: *outer_ordinal,
+                };
+                self.visit_index_left(outer, inner, &probe, &prepared, |outer_row, inner_row| {
                     distinct.admit(project_pair(outer_row, inner_row, &outputs)?)
-                },
-            )
-        })?;
+                })?;
+            }
+            plan::LeftAccess::NestedLoop | plan::LeftAccess::Hash { .. } => {
+                self.with_copied_side(outer, inner, |outer_rows, inner_rows, _| {
+                    consume_left_join(
+                        outer_rows,
+                        inner_rows,
+                        &outer_types,
+                        &inner_types,
+                        &path,
+                        &prepared,
+                        |outer_row, inner_row| {
+                            distinct.admit(project_pair(outer_row, inner_row, &outputs)?)
+                        },
+                    )
+                })?;
+            }
+        }
         Ok(finish_distinct_rows(
             distinct,
             &prepared.sort_keys,
@@ -630,9 +667,137 @@ impl Database {
         ))
     }
 
+    /// Project an index left join. `ORDER BY` stores the surviving logical
+    /// rows, not the candidate pairs. Without it, `LIMIT` stops output and
+    /// the scan continues.
+    fn scan_index_left_join(
+        &mut self,
+        outer: &TableRef,
+        inner: &TableRef,
+        probe: &IndexProbe,
+        prepared: PreparedJoin,
+        limit: Option<u64>,
+    ) -> Result<StatementResult, DbError> {
+        let limit_n = limit.map(|limit| usize::try_from(limit).unwrap_or(usize::MAX));
+        if prepared.sort_keys.is_empty() {
+            let mut projected = Vec::new();
+            let outputs = prepared.output_indexes.clone();
+            self.visit_index_left(outer, inner, probe, &prepared, |outer_row, inner_row| {
+                if limit_n.is_some_and(|limit_n| projected.len() >= limit_n) {
+                    return Ok(());
+                }
+                projected.push(project_pair(outer_row, inner_row, &outputs)?);
+                Ok(())
+            })?;
+            return Ok(StatementResult::Query(QueryResult {
+                columns: prepared.output_names,
+                rows: projected,
+            }));
+        }
+        let mut joined = Vec::new();
+        self.visit_index_left(outer, inner, probe, &prepared, |outer_row, inner_row| {
+            joined.push(concat_pair(outer_row, inner_row));
+            Ok(())
+        })?;
+        finish_rows(
+            joined,
+            &prepared.sort_keys,
+            limit,
+            &prepared.output_indexes,
+            prepared.output_names,
+        )
+    }
+
+    /// Probe the right index once per left row.
+    ///
+    /// A NULL left key produces no candidates. Each returned row id is checked
+    /// by [`Database::indexed_positions`]: a missing id, a repeated id, a key
+    /// that disagrees with the heap, a corrupt page, or a broken leaf link
+    /// fails the statement. Those errors are not turned into an empty match.
+    /// A posting that is simply absent is not one of those checks. Open rejects
+    /// that file. A probe after open does not.
+    ///
+    /// Before the first probe, every `ON` cell is checked against its declared
+    /// type. A non-NULL cell of the wrong type uses the nested loop and does
+    /// not touch the index, so the comparison error matches the other left-join
+    /// strategies. Heap type errors and index corruption are different failures.
+    /// `EXPLAIN` does not show this fallback.
+    ///
+    /// `ON` TRUE sets the match. A residual that rejects every key hit leaves
+    /// the left row unmatched. `WHERE` runs after that decision. One candidate
+    /// row is borrowed at a time. The probe does not store the joined pairs.
+    fn visit_index_left(
+        &mut self,
+        outer: &TableRef,
+        inner: &TableRef,
+        probe: &IndexProbe,
+        prepared: &PreparedJoin,
+        mut visit: impl FnMut(&[Value], &[Value]) -> Result<(), DbError>,
+    ) -> Result<(), DbError> {
+        let outer_rows = self.table(&outer.name)?.rows().to_vec();
+        if !self.on_inputs_allow_fast_join(outer, inner, &outer_rows, &prepared.on)? {
+            let inner_rows = self.copied_inner(outer, inner, &outer_rows)?;
+            let width = declared_types(self.table(&inner.name)?).len();
+            let nulls = vec![Value::Null; width];
+            return visit_left_pairs(&outer_rows, &inner_rows, &nulls, prepared, visit);
+        }
+        let width = declared_types(self.table(&inner.name)?).len();
+        let nulls = vec![Value::Null; width];
+        for outer_row in &outer_rows {
+            let mut matched = false;
+            let positions = match outer_row.get(probe.outer_ordinal) {
+                Some(Value::Integer(key)) => self.indexed_positions(
+                    &inner.name,
+                    &probe.index,
+                    probe.inner_ordinal,
+                    Some(*key),
+                    None,
+                    None,
+                )?,
+                Some(Value::Null) => Vec::new(),
+                Some(other) => {
+                    return Err(DbError::Internal(format!(
+                        "indexed join key is {other}, not an integer"
+                    )));
+                }
+                None => {
+                    return Err(DbError::Internal(
+                        "indexed join key is outside the outer row".to_string(),
+                    ));
+                }
+            };
+            {
+                let table = self.table(&inner.name)?;
+                for position in positions {
+                    let Some(inner_row) = table.rows().get(position) else {
+                        return Err(DbError::Internal(format!(
+                            "index position {position} is outside table '{}'",
+                            inner.name
+                        )));
+                    };
+                    if !expr::pair_matches(Some(&prepared.on), outer_row, inner_row)? {
+                        continue;
+                    }
+                    matched = true;
+                    if expr::pair_matches(prepared.filter.as_ref(), outer_row, inner_row)? {
+                        visit(outer_row, inner_row)?;
+                    }
+                }
+            }
+            if !matched && expr::pair_matches(prepared.filter.as_ref(), outer_row, &nulls)? {
+                visit(outer_row, &nulls)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The left-join strategy `EXPLAIN` and execution share.
     ///
-    /// This reads schemas only. It does not hash rows or visit pairs.
+    /// This reads schemas, index names, and row counts. It does not hash rows,
+    /// probe an index, or visit pairs. A forced nested loop wins. A forced
+    /// index probe wins only when an index is eligible. Otherwise the size
+    /// rule in [`plan::finish_left_access`] chooses between the index and a
+    /// hash of the right table.
     fn left_access(
         &self,
         outer: &TableRef,
@@ -645,13 +810,23 @@ impl Database {
         }
         let outer_columns = Scope::columns(self.table(&outer.name)?);
         let inner_columns = Scope::columns(self.table(&inner.name)?);
-        Ok(plan::choose_left_join(
+        let images = self.index_images().to_vec();
+        let choices = index_choices(self.table(&inner.name)?, &images)?;
+        let chosen = plan::choose_left_join(
             &outer.alias,
             &outer_columns,
             &inner.alias,
             &inner_columns,
             on,
-        ))
+            &choices,
+        );
+        #[cfg(test)]
+        if force_left_index() && matches!(chosen, plan::LeftAccess::Index { .. }) {
+            return Ok(chosen);
+        }
+        let left_len = self.table(&outer.name)?.rows().len();
+        let right_len = self.table(&inner.name)?.rows().len();
+        Ok(plan::finish_left_access(chosen, left_len, right_len))
     }
 
     fn explain_left_join(
@@ -688,49 +863,35 @@ impl Database {
                     .join(", "),
             )
         };
-        let (access, build, predicate, residual) = match path {
-            plan::LeftAccess::NestedLoop => (
-                "LeftNestedLoopJoin",
-                Value::Null,
-                Value::Null,
-                Value::Text(on.render()),
-            ),
-            plan::LeftAccess::Hash {
-                predicate,
-                residual,
-                ..
-            } => (
-                "HashLeftJoin",
-                Value::Text(inner.explain_name()),
-                Value::Text(predicate),
-                residual.map(Value::Text).unwrap_or(Value::Null),
-            ),
-        };
+        let (access, build, predicate, residual, index) = describe_left_access(&path, inner, on);
+        let mut columns = vec![
+            "access".to_string(),
+            "outer".to_string(),
+            "inner".to_string(),
+            "build".to_string(),
+            "predicate".to_string(),
+            "residual".to_string(),
+            "filter".to_string(),
+            "projection".to_string(),
+            "order_by".to_string(),
+            "limit".to_string(),
+        ];
+        let mut row = vec![
+            Value::Text(access.to_string()),
+            Value::Text(outer.explain_name()),
+            Value::Text(inner.explain_name()),
+            build,
+            predicate,
+            residual,
+            filter,
+            Value::Text(prepared.output_names.join(", ")),
+            order,
+            limit_cell(query.limit),
+        ];
+        push_left_index(&mut columns, &mut row, index);
         Ok(StatementResult::Query(QueryResult {
-            columns: vec![
-                "access".to_string(),
-                "outer".to_string(),
-                "inner".to_string(),
-                "build".to_string(),
-                "predicate".to_string(),
-                "residual".to_string(),
-                "filter".to_string(),
-                "projection".to_string(),
-                "order_by".to_string(),
-                "limit".to_string(),
-            ],
-            rows: vec![vec![
-                Value::Text(access.to_string()),
-                Value::Text(outer.explain_name()),
-                Value::Text(inner.explain_name()),
-                build,
-                predicate,
-                residual,
-                filter,
-                Value::Text(prepared.output_names.join(", ")),
-                order,
-                limit_cell(query.limit),
-            ]],
+            columns,
+            rows: vec![row],
         }))
     }
 
@@ -831,13 +992,33 @@ impl Database {
     }
 
     fn feed_left_aggregate(
-        &self,
+        &mut self,
         outer: &TableRef,
         inner: &TableRef,
         prepared: &PreparedJoin,
         access: &plan::LeftAccess,
         sink: &mut GroupSink<'_>,
     ) -> Result<(), DbError> {
+        if let plan::LeftAccess::Index {
+            name,
+            outer_ordinal,
+            inner_ordinal,
+            ..
+        } = access
+        {
+            let probe = IndexProbe {
+                index: name.clone(),
+                inner_ordinal: *inner_ordinal,
+                outer_ordinal: *outer_ordinal,
+            };
+            return self.visit_index_left(
+                outer,
+                inner,
+                &probe,
+                prepared,
+                |outer_row, inner_row| sink.push(InputRow::Pair(outer_row, inner_row)),
+            );
+        }
         let outer_types = self
             .table(&outer.name)?
             .schema()
@@ -1203,62 +1384,51 @@ impl Database {
                     .join(", "),
             )
         };
-        let (strategy, build, predicate, residual) = match access {
-            plan::LeftAccess::NestedLoop => (
-                "LeftNestedLoopJoin",
-                Value::Null,
-                Value::Null,
-                Value::Text(on.render()),
-            ),
-            plan::LeftAccess::Hash {
-                predicate,
-                residual,
-                ..
-            } => (
-                "HashLeftJoin",
-                Value::Text(inner.explain_name()),
-                Value::Text(predicate),
-                residual.map(Value::Text).unwrap_or(Value::Null),
-            ),
-        };
+        let (strategy, build, predicate, residual, index) =
+            describe_left_access(&access, inner, on);
+        let mut columns = vec![
+            "access".to_string(),
+            "outer".to_string(),
+            "inner".to_string(),
+            "build".to_string(),
+            "predicate".to_string(),
+            "residual".to_string(),
+            "filter".to_string(),
+            "groups".to_string(),
+            "aggregates".to_string(),
+            "having".to_string(),
+            "projection".to_string(),
+            "order_by".to_string(),
+            "limit".to_string(),
+        ];
+        let mut row = vec![
+            Value::Text(strategy.to_string()),
+            Value::Text(outer.explain_name()),
+            Value::Text(inner.explain_name()),
+            build,
+            predicate,
+            residual,
+            filter,
+            text_list(&plan.group_labels),
+            text_list(&plan.aggregate_labels),
+            having,
+            Value::Text(plan.output_names.join(", ")),
+            order,
+            limit_cell(query.limit),
+        ];
+        push_left_index(&mut columns, &mut row, index);
         Ok(StatementResult::Query(QueryResult {
-            columns: vec![
-                "access".to_string(),
-                "outer".to_string(),
-                "inner".to_string(),
-                "build".to_string(),
-                "predicate".to_string(),
-                "residual".to_string(),
-                "filter".to_string(),
-                "groups".to_string(),
-                "aggregates".to_string(),
-                "having".to_string(),
-                "projection".to_string(),
-                "order_by".to_string(),
-                "limit".to_string(),
-            ],
-            rows: vec![vec![
-                Value::Text(strategy.to_string()),
-                Value::Text(outer.explain_name()),
-                Value::Text(inner.explain_name()),
-                build,
-                predicate,
-                residual,
-                filter,
-                text_list(&plan.group_labels),
-                text_list(&plan.aggregate_labels),
-                having,
-                Value::Text(plan.output_names.join(", ")),
-                order,
-                limit_cell(query.limit),
-            ]],
+            columns,
+            rows: vec![row],
         }))
     }
 
     /// `EXPLAIN` for `SELECT DISTINCT` over one `LEFT JOIN`.
     ///
-    /// Binding and the schema decide the strategy. This does not hash rows,
-    /// visit pairs, or write storage.
+    /// Binding, the schema, and the size rule decide the strategy. This does
+    /// not hash rows, probe an index, visit pairs, or write storage. A
+    /// malformed stored cell can still make execution use the nested loop.
+    /// That fallback is not part of this plan.
     fn explain_distinct_left_join(
         &self,
         outer: &TableRef,
@@ -1293,51 +1463,37 @@ impl Database {
                     .join(", "),
             )
         };
-        let (access, build, predicate, residual) = match path {
-            plan::LeftAccess::NestedLoop => (
-                "LeftNestedLoopJoin",
-                Value::Null,
-                Value::Null,
-                Value::Text(on.render()),
-            ),
-            plan::LeftAccess::Hash {
-                predicate,
-                residual,
-                ..
-            } => (
-                "HashLeftJoin",
-                Value::Text(inner.explain_name()),
-                Value::Text(predicate),
-                residual.map(Value::Text).unwrap_or(Value::Null),
-            ),
-        };
+        let (access, build, predicate, residual, index) = describe_left_access(&path, inner, on);
+        let mut columns = vec![
+            "access".to_string(),
+            "outer".to_string(),
+            "inner".to_string(),
+            "build".to_string(),
+            "predicate".to_string(),
+            "residual".to_string(),
+            "filter".to_string(),
+            "distinct".to_string(),
+            "projection".to_string(),
+            "order_by".to_string(),
+            "limit".to_string(),
+        ];
+        let mut row = vec![
+            Value::Text(access.to_string()),
+            Value::Text(outer.explain_name()),
+            Value::Text(inner.explain_name()),
+            build,
+            predicate,
+            residual,
+            filter,
+            Value::Text("HashDistinct".to_string()),
+            Value::Text(projection_label(&query.projection)),
+            order,
+            limit_cell(query.limit),
+        ];
+        push_left_index(&mut columns, &mut row, index);
         Ok(StatementResult::Query(QueryResult {
-            columns: vec![
-                "access".to_string(),
-                "outer".to_string(),
-                "inner".to_string(),
-                "build".to_string(),
-                "predicate".to_string(),
-                "residual".to_string(),
-                "filter".to_string(),
-                "distinct".to_string(),
-                "projection".to_string(),
-                "order_by".to_string(),
-                "limit".to_string(),
-            ],
-            rows: vec![vec![
-                Value::Text(access.to_string()),
-                Value::Text(outer.explain_name()),
-                Value::Text(inner.explain_name()),
-                build,
-                predicate,
-                residual,
-                filter,
-                Value::Text("HashDistinct".to_string()),
-                Value::Text(projection_label(&query.projection)),
-                order,
-                limit_cell(query.limit),
-            ]],
+            columns,
+            rows: vec![row],
         }))
     }
 
@@ -1848,14 +2004,28 @@ impl Database {
         self.indexed_positions(table_name, &index_name, ordinal, equal, low, high)
     }
 
-    /// Row positions for one index lookup, in insertion order.
+    /// Row positions for one index lookup, in heap order.
+    ///
+    /// [`crate::storage::btree::find_equal`] returns row ids in row-id order.
+    /// Each id is mapped to its current heap slot, and those slots are sorted.
+    /// The heap is the insertion order of the rows that remain: insert appends,
+    /// delete keeps the earlier slots, and update leaves the row in place. That
+    /// sorted slot order is the order [`visit_left_pairs`] walks. Live row ids
+    /// increase with those slots because ids are assigned in order and are not
+    /// reused, so the tree's row-id order and the heap order agree. The sort
+    /// is what the join emits. It does not trust posting order by itself.
     ///
     /// Each returned row id must exist, must sit at that position, and must
     /// store `key` in the indexed column. A repeated row id is corrupt. An
     /// empty tree is corrupt when the table still stores an integer in that
-    /// column. A broken leaf link fails the lookup. Positions are sorted so
-    /// duplicate keys keep insertion order. The caller does not replace a
-    /// failed lookup with a scan of the table.
+    /// column. A broken leaf link fails the lookup. The caller does not replace
+    /// a failed lookup with a scan of the table.
+    ///
+    /// The lookup checks the entries it returns. It does not walk the heap
+    /// looking for an integer row whose posting is absent. Open compares the
+    /// whole tree with the heap, so a file that is missing a posting fails to
+    /// open. A posting removed after open can omit a match, and that left row
+    /// can be null-extended, without an error from this function.
     fn indexed_positions(
         &mut self,
         table_name: &str,
@@ -4115,6 +4285,28 @@ impl Drop for ForceIndexJoin {
     }
 }
 
+/// Keeps an eligible left-join index probe for the life of the guard.
+///
+/// The guard does nothing when `ON` has no indexed integer equality. It does
+/// not change an inner join.
+#[cfg(test)]
+pub(crate) struct ForceLeftIndexJoin;
+
+#[cfg(test)]
+impl ForceLeftIndexJoin {
+    pub(crate) fn new() -> Self {
+        FORCE_LEFT_INDEX.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceLeftIndexJoin {
+    fn drop(&mut self) {
+        FORCE_LEFT_INDEX.with(|flag| flag.set(false));
+    }
+}
+
 /// Forces the nested-loop join for the life of the guard.
 #[cfg(test)]
 pub(crate) struct ForceNestedJoin;
@@ -4496,6 +4688,57 @@ fn hash_key(key: KeyRef<'_>) -> u64 {
     hasher.finish()
 }
 
+/// `EXPLAIN` cells shared by every left-join plan.
+///
+/// Hash and nested plans omit the index. An index plan appends it so the
+/// older column positions stay where existing tests read them.
+fn describe_left_access(
+    path: &plan::LeftAccess,
+    inner: &TableRef,
+    on: &Expr,
+) -> (&'static str, Value, Value, Value, Option<String>) {
+    match path {
+        plan::LeftAccess::NestedLoop => (
+            "LeftNestedLoopJoin",
+            Value::Null,
+            Value::Null,
+            Value::Text(on.render()),
+            None,
+        ),
+        plan::LeftAccess::Hash {
+            predicate,
+            residual,
+            ..
+        } => (
+            "HashLeftJoin",
+            Value::Text(inner.explain_name()),
+            Value::Text(predicate.clone()),
+            residual.clone().map(Value::Text).unwrap_or(Value::Null),
+            None,
+        ),
+        plan::LeftAccess::Index {
+            name,
+            predicate,
+            residual,
+            ..
+        } => (
+            "IndexLeftNestedLoopJoin",
+            Value::Null,
+            Value::Text(predicate.clone()),
+            residual.clone().map(Value::Text).unwrap_or(Value::Null),
+            Some(name.clone()),
+        ),
+    }
+}
+
+fn push_left_index(columns: &mut Vec<String>, row: &mut Vec<Value>, index: Option<String>) {
+    let Some(name) = index else {
+        return;
+    };
+    columns.push("index".to_string());
+    row.push(Value::Text(name));
+}
+
 /// Feed every surviving left-join row to `visit`.
 ///
 /// A stored cell that is not NULL and not its declared type uses the nested
@@ -4515,6 +4758,9 @@ fn consume_left_join(
         plan::LeftAccess::NestedLoop => {
             visit_left_pairs(outer_rows, inner_rows, &nulls, prepared, visit)
         }
+        plan::LeftAccess::Index { .. } => Err(DbError::Internal(
+            "index left join is not visited from copied rows".to_string(),
+        )),
         plan::LeftAccess::Hash {
             outer_ordinal,
             inner_ordinal,
@@ -5004,6 +5250,7 @@ thread_local! {
     /// When set, every non-NULL key hashes to this value.
     static FORCED_HASH: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static FORCE_INDEX_JOIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_LEFT_INDEX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// When set, the hash and index paths do not precheck `ON` cell types.
     static SKIP_ON_SCHEMA_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static MATERIALIZE_AGGREGATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -5015,6 +5262,11 @@ thread_local! {
 #[cfg(test)]
 fn force_nested_join() -> bool {
     FORCE_NESTED_JOIN.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn force_left_index() -> bool {
+    FORCE_LEFT_INDEX.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -12363,6 +12615,592 @@ mod tests {
         );
     }
 
+    fn indexed_left(label: &str) -> (crate::test_dir::TestDir, Database) {
+        let dir = crate::test_dir::TestDir::new(label);
+        let path = dir.join("db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INT, name TEXT);")
+                .unwrap();
+            db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+                .unwrap();
+            db.execute(
+                "INSERT INTO users VALUES (1, 'Ada'), (1, 'Ada'), (2, 'Bea'), (3, 'Cy'), (NULL, 'Dee');",
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO orders VALUES (1, 10), (1, 11), (1, NULL), (3, 20), (NULL, 5), (9, 7);",
+            )
+            .unwrap();
+        }
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_orders_user ON orders(user_id);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_id ON users(id);")
+            .unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn index_left_join_matches_hash_and_nested() {
+        let (_dir, mut db) = indexed_left("left-index-eq");
+        let queries = [
+            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+            "SELECT DISTINCT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+            "SELECT COUNT(*), COUNT(o.amount), SUM(o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+            "SELECT u.name, COUNT(*) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name;",
+            "SELECT COUNT(DISTINCT o.amount), SUM(DISTINCT o.amount), AVG(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+            "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount > 15;",
+            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id ORDER BY u.name ASC, o.amount ASC LIMIT 2;",
+            "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id AND FALSE;",
+            "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id AND NULL;",
+            "SELECT DISTINCT a.name, b.name FROM users a LEFT JOIN users b ON a.id = b.id;",
+            "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON o.user_id = u.id AND o.amount > 0;",
+        ];
+        let hashed = queries
+            .iter()
+            .map(|sql| query(&mut db, sql).rows)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hashed[0],
+            vec![
+                vec![Value::Text("Ada".to_string()), Value::Integer(10)],
+                vec![Value::Text("Ada".to_string()), Value::Integer(11)],
+                vec![Value::Text("Ada".to_string()), Value::Null],
+                vec![Value::Text("Ada".to_string()), Value::Integer(10)],
+                vec![Value::Text("Ada".to_string()), Value::Integer(11)],
+                vec![Value::Text("Ada".to_string()), Value::Null],
+                vec![Value::Text("Bea".to_string()), Value::Null],
+                vec![Value::Text("Cy".to_string()), Value::Integer(20)],
+                vec![Value::Text("Dee".to_string()), Value::Null],
+            ]
+        );
+        assert_eq!(
+            hashed[1],
+            vec![
+                vec![Value::Text("Ada".to_string()), Value::Integer(10)],
+                vec![Value::Text("Ada".to_string()), Value::Integer(11)],
+                vec![Value::Text("Ada".to_string()), Value::Null],
+                vec![Value::Text("Bea".to_string()), Value::Null],
+                vec![Value::Text("Cy".to_string()), Value::Integer(20)],
+                vec![Value::Text("Dee".to_string()), Value::Null],
+            ]
+        );
+        assert_eq!(hashed[5], vec![vec![Value::Text("Cy".to_string())]]);
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            queries
+                .iter()
+                .map(|sql| query(&mut db, sql).rows)
+                .collect::<Vec<_>>()
+        };
+        let indexed = {
+            let _force = ForceLeftIndexJoin::new();
+            queries
+                .iter()
+                .map(|sql| query(&mut db, sql).rows)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hashed, nested);
+        assert_eq!(hashed, indexed);
+        let plain = "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id;";
+        assert_eq!(
+            query(&mut db, &format!("EXPLAIN {plain}")).rows[0][0],
+            Value::Text("HashLeftJoin".to_string())
+        );
+        let explained = {
+            let _force = ForceLeftIndexJoin::new();
+            query(&mut db, &format!("EXPLAIN {plain}"))
+        };
+        assert_eq!(
+            explained.rows[0][0],
+            Value::Text("IndexLeftNestedLoopJoin".to_string())
+        );
+        assert_eq!(explained.columns.last().map(String::as_str), Some("index"));
+        assert_eq!(
+            explained.rows[0].last(),
+            Some(&Value::Text("idx_orders_user".to_string()))
+        );
+        assert_eq!(explained.rows[0][3], Value::Null);
+        db.execute("UPDATE orders SET amount = 40 WHERE user_id = 3;")
+            .unwrap();
+        let updated = "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE u.name = 'Cy';";
+        let hashed = query(&mut db, updated).rows;
+        let indexed = {
+            let _force = ForceLeftIndexJoin::new();
+            query(&mut db, updated).rows
+        };
+        assert_eq!(
+            hashed,
+            vec![vec![Value::Text("Cy".to_string()), Value::Integer(40)]]
+        );
+        assert_eq!(hashed, indexed);
+        db.execute("DELETE FROM orders WHERE user_id = 1;").unwrap();
+        let after_delete = "SELECT DISTINCT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE u.name = 'Ada';";
+        let hashed = query(&mut db, after_delete).rows;
+        let indexed = {
+            let _force = ForceLeftIndexJoin::new();
+            query(&mut db, after_delete).rows
+        };
+        assert_eq!(
+            hashed,
+            vec![vec![Value::Text("Ada".to_string()), Value::Null]]
+        );
+        assert_eq!(hashed, indexed);
+    }
+
+    #[test]
+    fn an_empty_left_table_plans_an_index_probe() {
+        let dir = crate::test_dir::TestDir::new("left-index-empty");
+        let path = dir.join("db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INT, name TEXT);")
+                .unwrap();
+            db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+                .unwrap();
+            db.execute("INSERT INTO orders VALUES (1, 10);").unwrap();
+        }
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_orders_user ON orders(user_id);")
+            .unwrap();
+        let sql = "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;";
+        let explained = query(&mut db, &format!("EXPLAIN {sql}"));
+        assert_eq!(
+            explained.rows[0][0],
+            Value::Text("IndexLeftNestedLoopJoin".to_string())
+        );
+        assert!(query(&mut db, sql).rows.is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_left_index_is_not_an_empty_match() {
+        let (_dir, mut db) = indexed_left("left-index-corrupt");
+        let sql = "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id;";
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            query(&mut db, sql).rows
+        };
+        assert!(!nested.is_empty());
+        db.table_mut("orders")
+            .unwrap()
+            .overwrite_cell_for_test(0, 0, Value::Integer(99));
+        let error = {
+            let _force = ForceLeftIndexJoin::new();
+            db.execute(sql).unwrap_err()
+        };
+        assert!(error.to_string().contains("does not match"), "{error}");
+        db.table_mut("orders")
+            .unwrap()
+            .overwrite_cell_for_test(0, 0, Value::Integer(1));
+        let row_id = db.table("orders").unwrap().row_id_at(0).unwrap();
+        db.table_mut("orders")
+            .unwrap()
+            .forget_position_for_test(row_id);
+        let missing = {
+            let _force = ForceLeftIndexJoin::new();
+            db.execute(sql).unwrap_err()
+        };
+        assert!(missing.to_string().contains("corrupt"), "{missing}");
+    }
+
+    #[test]
+    fn a_malformed_left_on_cell_falls_back_before_the_probe() {
+        let (dir, mut db) = indexed_left("left-index-malformed");
+        let path = dir.join("db");
+        let before = std::fs::read(&path).unwrap();
+        let mut wal = path.as_os_str().to_owned();
+        wal.push(".wal");
+        let wal_before = std::fs::read(&wal).unwrap_or_default();
+        replace_cell(&mut db, "orders", 5, 1, Value::Text("later".to_string()));
+        let sql = "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.amount > 0 LIMIT 1;";
+        let indexed = {
+            let _force = ForceLeftIndexJoin::new();
+            db.execute(sql).unwrap_err().to_string()
+        };
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            db.execute(sql).unwrap_err().to_string()
+        };
+        assert!(indexed.contains("different types"), "{indexed}");
+        assert_eq!(indexed, nested);
+        let explained = {
+            let _force = ForceLeftIndexJoin::new();
+            query(&mut db, &format!("EXPLAIN {sql}"))
+        };
+        assert_eq!(
+            explained.rows[0][0],
+            Value::Text("IndexLeftNestedLoopJoin".to_string())
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&wal).unwrap_or_default(), wal_before);
+        let bind = {
+            let _force = ForceLeftIndexJoin::new();
+            db.execute(
+                "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount > 'x' LIMIT 0;",
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(bind.contains("INTEGER") && bind.contains("TEXT"), "{bind}");
+    }
+
+    fn assert_three_left(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
+        let hashed = query(db, sql).rows;
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            query(db, sql).rows
+        };
+        let indexed = {
+            let _force = ForceLeftIndexJoin::new();
+            query(db, sql).rows
+        };
+        assert_eq!(nested, hashed, "{sql}");
+        assert_eq!(indexed, hashed, "{sql}");
+        hashed
+    }
+
+    fn assert_three_left_error(db: &mut Database, sql: &str) -> String {
+        let hashed = db.execute(sql).unwrap_err().to_string();
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            db.execute(sql).unwrap_err().to_string()
+        };
+        let indexed = {
+            let _force = ForceLeftIndexJoin::new();
+            db.execute(sql).unwrap_err().to_string()
+        };
+        assert_eq!(nested, hashed, "{sql}");
+        assert_eq!(indexed, hashed, "{sql}");
+        hashed
+    }
+
+    #[test]
+    fn index_left_order_survives_update_delete_and_a_self_join() {
+        let (_dir, mut db) = indexed_left("left-index-order");
+        db.execute("DELETE FROM orders;").unwrap();
+        db.execute("DELETE FROM users;").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada'), (2, 'Bea'), (1, 'Ann'), (NULL, 'Dee');")
+            .unwrap();
+        db.execute(
+            "INSERT INTO orders VALUES (2, 1), (1, 30), (2, 2), (1, 10), (1, NULL), (3, 3), (1, 20);",
+        )
+        .unwrap();
+        let sql = "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;";
+        let rows = assert_three_left(&mut db, sql);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("Ada".to_string()), Value::Integer(30)],
+                vec![Value::Text("Ada".to_string()), Value::Integer(10)],
+                vec![Value::Text("Ada".to_string()), Value::Null],
+                vec![Value::Text("Ada".to_string()), Value::Integer(20)],
+                vec![Value::Text("Bea".to_string()), Value::Integer(1)],
+                vec![Value::Text("Bea".to_string()), Value::Integer(2)],
+                vec![Value::Text("Ann".to_string()), Value::Integer(30)],
+                vec![Value::Text("Ann".to_string()), Value::Integer(10)],
+                vec![Value::Text("Ann".to_string()), Value::Null],
+                vec![Value::Text("Ann".to_string()), Value::Integer(20)],
+                vec![Value::Text("Dee".to_string()), Value::Null],
+            ]
+        );
+        db.execute("UPDATE orders SET user_id = 1 WHERE amount = 1;")
+            .unwrap();
+        let updated = assert_three_left(&mut db, sql);
+        assert_eq!(
+            updated[0],
+            vec![Value::Text("Ada".to_string()), Value::Integer(1)]
+        );
+        assert_eq!(
+            updated
+                .iter()
+                .filter(|row| row[0] == Value::Text("Bea".to_string()))
+                .count(),
+            1
+        );
+        db.execute("DELETE FROM orders WHERE amount = 10;").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 40);").unwrap();
+        let after = assert_three_left(&mut db, sql);
+        assert!(after.iter().all(|row| row[1] != Value::Integer(10)));
+        assert_eq!(
+            after
+                .iter()
+                .filter(|row| row[0] == Value::Text("Ada".to_string()))
+                .map(|row| row[1].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::Integer(1),
+                Value::Integer(30),
+                Value::Null,
+                Value::Integer(20),
+                Value::Integer(40),
+            ]
+        );
+        let filtered = "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id WHERE o.amount > 15;";
+        let kept = assert_three_left(&mut db, filtered);
+        assert!(
+            kept.iter()
+                .all(|row| matches!(row[1], Value::Integer(amount) if amount > 15))
+        );
+        assert!(
+            kept.iter()
+                .all(|row| row[0] != Value::Text("Bea".to_string()))
+        );
+        let residual = "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.amount > 15;";
+        let residual_rows = assert_three_left(&mut db, residual);
+        assert!(
+            residual_rows
+                .iter()
+                .any(|row| row[0] == Value::Text("Bea".to_string()) && row[1] == Value::Null)
+        );
+        let self_sql = "SELECT a.name, b.name FROM users a LEFT JOIN users b ON a.id = b.id;";
+        assert_eq!(
+            assert_three_left(&mut db, self_sql),
+            vec![
+                vec![
+                    Value::Text("Ada".to_string()),
+                    Value::Text("Ada".to_string())
+                ],
+                vec![
+                    Value::Text("Ada".to_string()),
+                    Value::Text("Ann".to_string())
+                ],
+                vec![
+                    Value::Text("Bea".to_string()),
+                    Value::Text("Bea".to_string())
+                ],
+                vec![
+                    Value::Text("Ann".to_string()),
+                    Value::Text("Ada".to_string())
+                ],
+                vec![
+                    Value::Text("Ann".to_string()),
+                    Value::Text("Ann".to_string())
+                ],
+                vec![Value::Text("Dee".to_string()), Value::Null],
+            ]
+        );
+        let self_residual = "SELECT a.name, b.name FROM users a LEFT JOIN users b ON a.id = b.id AND b.name > 'Ann';";
+        assert_eq!(
+            assert_three_left(&mut db, self_residual),
+            vec![
+                vec![Value::Text("Ada".to_string()), Value::Null],
+                vec![
+                    Value::Text("Bea".to_string()),
+                    Value::Text("Bea".to_string())
+                ],
+                vec![Value::Text("Ann".to_string()), Value::Null],
+                vec![Value::Text("Dee".to_string()), Value::Null],
+            ]
+        );
+        let unknown =
+            "SELECT a.name, b.name FROM users a LEFT JOIN users b ON a.id = b.id AND NULL;";
+        let unknown_rows = assert_three_left(&mut db, unknown);
+        assert!(unknown_rows.iter().all(|row| row[1] == Value::Null));
+        assert_eq!(unknown_rows.len(), 4);
+    }
+
+    #[test]
+    fn a_missing_index_posting_is_not_detected_by_the_probe() {
+        let (dir, mut db) = indexed_left("left-missing-posting");
+        let path = dir.join("db");
+        db.execute("DELETE FROM users;").unwrap();
+        db.execute("DELETE FROM orders;").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada');").unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 10), (1, 11);")
+            .unwrap();
+        let sql = "SELECT o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;";
+        assert_eq!(
+            assert_three_left(&mut db, sql),
+            vec![vec![Value::Integer(10)], vec![Value::Integer(11)]]
+        );
+        let before = std::fs::read(&path).unwrap();
+        db.patch_root_leaf_entry("idx_orders_user", 1, Some(99), None)
+            .unwrap();
+        let indexed = {
+            let _force = ForceLeftIndexJoin::new();
+            query(&mut db, sql).rows
+        };
+        assert_eq!(indexed, vec![vec![Value::Integer(10)]]);
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            query(&mut db, sql).rows
+        };
+        assert_eq!(
+            nested,
+            vec![vec![Value::Integer(10)], vec![Value::Integer(11)]]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(db);
+
+        let (dir, mut db) = indexed_left("left-displaced-key");
+        db.execute("DELETE FROM users;").unwrap();
+        db.execute("DELETE FROM orders;").unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'Ada'), (99, 'Zoe');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 10), (1, 11);")
+            .unwrap();
+        let path = dir.join("db");
+        let before = std::fs::read(&path).unwrap();
+        db.patch_root_leaf_entry("idx_orders_user", 1, Some(99), None)
+            .unwrap();
+        let probed = {
+            let _force = ForceLeftIndexJoin::new();
+            db.execute(sql).unwrap_err().to_string()
+        };
+        assert!(probed.contains("does not match"), "{probed}");
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            query(&mut db, sql).rows
+        };
+        assert_eq!(nested.len(), 3);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_left_probe_rejects_a_corrupt_page_and_a_broken_link() {
+        let (dir, mut db) = indexed_left("left-corrupt-page");
+        let path = dir.join("db");
+        let before = std::fs::read(&path).unwrap();
+        let sql = "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id;";
+        db.corrupt_index_root_type("idx_orders_user").unwrap();
+        let error = {
+            let _force = ForceLeftIndexJoin::new();
+            db.execute(sql).unwrap_err().to_string()
+        };
+        assert!(error.contains("corrupt"), "{error}");
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            query(&mut db, sql).rows
+        };
+        assert!(!nested.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(db);
+
+        let dir = crate::test_dir::TestDir::new("left-broken-link");
+        let path = dir.join("db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INT, name TEXT);")
+                .unwrap();
+            db.execute("CREATE TABLE orders (user_id INT, amount INT);")
+                .unwrap();
+            db.execute("INSERT INTO users VALUES (1, 'Ada');").unwrap();
+            db.execute("INSERT INTO orders VALUES (1, 0);").unwrap();
+        }
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_orders_user ON orders(user_id);")
+            .unwrap();
+        let mut values = String::new();
+        for id in 1..310 {
+            if id > 1 {
+                values.push(',');
+            }
+            values.push_str(&format!("(1, {id})"));
+        }
+        db.execute(&format!("INSERT INTO orders VALUES {values};"))
+            .unwrap();
+        let sql = "SELECT o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;";
+        assert_eq!(
+            query(&mut db, &format!("EXPLAIN {sql}")).rows[0][0],
+            Value::Text("IndexLeftNestedLoopJoin".to_string())
+        );
+        db.zero_leftmost_leaf_right("idx_orders_user").unwrap();
+        let error = db.execute(sql).unwrap_err().to_string();
+        assert!(error.contains("corrupt"), "{error}");
+        let nested = {
+            let _force = ForceNestedJoin::new();
+            query(&mut db, sql).rows
+        };
+        assert_eq!(nested.len(), 310);
+    }
+
+    #[test]
+    fn indexed_left_runtime_errors_match_the_other_strategies() {
+        let (dir, mut db) = indexed_left("left-index-errors");
+        let path = dir.join("db");
+        let mut wal = path.as_os_str().to_owned();
+        wal.push(".wal");
+        let before = std::fs::read(&path).unwrap();
+        let wal_before = std::fs::read(&wal).unwrap_or_default();
+        replace_cell(&mut db, "users", 0, 0, Value::Text("bad".to_string()));
+        let left_key = assert_three_left_error(
+            &mut db,
+            "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id LIMIT 1;",
+        );
+        assert!(left_key.contains("different types"), "{left_key}");
+        replace_cell(&mut db, "users", 0, 0, Value::Integer(1));
+        replace_cell(&mut db, "orders", 0, 0, Value::Text("bad".to_string()));
+        let right_key = assert_three_left_error(
+            &mut db,
+            "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id LIMIT 0;",
+        );
+        assert!(right_key.contains("different types"), "{right_key}");
+        replace_cell(&mut db, "orders", 0, 0, Value::Integer(1));
+        replace_cell(&mut db, "orders", 5, 1, Value::Text("later".to_string()));
+        let residual = assert_three_left_error(
+            &mut db,
+            "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.amount > 0 LIMIT 1;",
+        );
+        assert!(residual.contains("different types"), "{residual}");
+        let late = assert_three_left_error(
+            &mut db,
+            "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.amount > 0 ORDER BY u.name LIMIT 1;",
+        );
+        assert_eq!(late, residual);
+        replace_cell(&mut db, "orders", 5, 1, Value::Integer(7));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(&wal).unwrap_or_default(), wal_before);
+        db.execute("DELETE FROM orders;").unwrap();
+        db.execute("DELETE FROM users;").unwrap();
+        db.execute("INSERT INTO users VALUES (NULL, 'Dee'), (9, 'No'), (1, 'Ada');")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 10), (2, 20);")
+            .unwrap();
+        let loaded = std::fs::read(&path).unwrap();
+        let wal_loaded = std::fs::read(&wal).unwrap_or_default();
+        replace_cell(&mut db, "orders", 1, 1, Value::Text("later".to_string()));
+        let null_probe = assert_three_left_error(
+            &mut db,
+            "SELECT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id AND o.amount > 0 LIMIT 0;",
+        );
+        assert!(null_probe.contains("different types"), "{null_probe}");
+        assert_eq!(std::fs::read(&path).unwrap(), loaded);
+        assert_eq!(std::fs::read(&wal).unwrap_or_default(), wal_loaded);
+        replace_cell(&mut db, "orders", 1, 1, Value::Integer(20));
+        db.execute("UPDATE orders SET amount = 9223372036854775807 WHERE user_id = 1;")
+            .unwrap();
+        db.execute("INSERT INTO orders VALUES (1, 1);").unwrap();
+        let written = std::fs::read(&path).unwrap();
+        let wal_written = std::fs::read(&wal).unwrap_or_default();
+        let overflow = assert_three_left_error(
+            &mut db,
+            "SELECT SUM(o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id LIMIT 1;",
+        );
+        assert_eq!(overflow, "SUM overflows INTEGER");
+        {
+            let _budget = DistinctReserveBudget::limit(0);
+            let distinct = assert_three_left_error(
+                &mut db,
+                "SELECT COUNT(DISTINCT o.amount) FROM users u LEFT JOIN orders o ON u.id = o.user_id LIMIT 1;",
+            );
+            assert!(distinct.contains("DISTINCT set is too large"), "{distinct}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), written);
+        assert_eq!(std::fs::read(&wal).unwrap_or_default(), wal_written);
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT COUNT(*) FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
+            )
+            .rows,
+            vec![vec![Value::Integer(4)]]
+        );
+    }
+
     #[test]
     #[ignore = "release profile of DISTINCT aggregates over LEFT JOIN"]
     fn profile_milestone22() {
@@ -12800,5 +13638,373 @@ mod tests {
             row.iter()
                 .fold(sum, |sum, cell| sum.wrapping_add(profile_cell(cell)))
         })
+    }
+
+    #[test]
+    #[ignore = "release profile of index nested-loop LEFT JOIN"]
+    fn profile_milestone24() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone24 cpu={cpu} mem_bytes={mem} rustc={rustc} value_bytes={}",
+            std::mem::size_of::<Value>()
+        );
+        for rows in [100_i64, 1_000, 4_000, 10_000] {
+            for shape in ["matched", "none", "duplicates", "selective", "residual"] {
+                let nested = rows <= 4_000 || (rows == 10_000 && shape == "matched");
+                profile_left_index(rows, rows, shape, nested);
+            }
+        }
+        profile_left_index(100, 10_000, "matched", true);
+        profile_left_index(10_000, 100, "matched", true);
+        repeat_left_index_warm(100, 10_000, "matched", 7);
+    }
+
+    /// Seven fresh databases. Each warm time is the median of five runs after
+    /// one cold run. `on_comparisons` is the index entries visited: every
+    /// returned posting is evaluated, and that count is not the nested-loop
+    /// pair count.
+    fn repeat_left_index_warm(users: i64, orders: i64, shape: &str, runs: usize) {
+        let totals = left_index_totals(users, orders, shape);
+        let plain = "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id;";
+        let mut hash_warms = Vec::with_capacity(runs);
+        let mut index_warms = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let dir = crate::test_dir::TestDir::new("m24-repeat");
+            let path = dir.join("db");
+            let mut database = Database::open(&path).unwrap();
+            database
+                .execute("CREATE TABLE users (id INT, name TEXT);")
+                .unwrap();
+            database
+                .execute("CREATE TABLE orders (user_id INT, amount INT);")
+                .unwrap();
+            load_left_index(&mut database, users, orders, shape);
+            let (_cold, warm, checksum, _) = time_agg(&mut database, plain);
+            assert_eq!(checksum, totals.plain_checksum);
+            hash_warms.push(warm);
+            drop(database);
+            Database::migrate(&path).unwrap();
+            let mut database = Database::open(&path).unwrap();
+            database
+                .execute("CREATE INDEX idx_orders_user ON orders(user_id);")
+                .unwrap();
+            let (_cold, warm, checksum, _) = {
+                let _force = ForceLeftIndexJoin::new();
+                time_agg(&mut database, plain)
+            };
+            assert_eq!(checksum, totals.plain_checksum);
+            index_warms.push(warm);
+        }
+        let median = |samples: &[u128]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        };
+        println!(
+            "milestone24 repeat shape={shape} users={users} orders={orders} runs={runs} probes={} entries={} on_comparisons={} hits={} null_extended={} hash_warm_us={hash_warms:?} index_warm_us={index_warms:?} hash_median_us={} index_median_us={} hash_min_us={} hash_max_us={} index_min_us={} index_max_us={} hash_bytes={} index_bytes=0 plain_checksum={}",
+            totals.probes,
+            totals.entries,
+            totals.entries,
+            totals.hits,
+            totals.null_extended,
+            median(&hash_warms),
+            median(&index_warms),
+            hash_warms.iter().copied().min().unwrap_or(0),
+            hash_warms.iter().copied().max().unwrap_or(0),
+            index_warms.iter().copied().min().unwrap_or(0),
+            index_warms.iter().copied().max().unwrap_or(0),
+            hash_table_bytes(totals.hash_groups, totals.hash_positions),
+            totals.plain_checksum
+        );
+    }
+
+    fn profile_left_index(users: i64, orders: i64, shape: &str, nested: bool) {
+        let dir = crate::test_dir::TestDir::new("m24-profile");
+        let path = dir.join("db");
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE TABLE users (id INT, name TEXT);")
+            .unwrap();
+        database
+            .execute("CREATE TABLE orders (user_id INT, amount INT);")
+            .unwrap();
+        load_left_index(&mut database, users, orders, shape);
+        let on = if shape == "residual" {
+            "u.id = o.user_id AND o.amount > 3"
+        } else {
+            "u.id = o.user_id"
+        };
+        let plain = format!("SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON {on};");
+        let distinct =
+            format!("SELECT DISTINCT u.name, o.amount FROM users u LEFT JOIN orders o ON {on};");
+        let aggregate =
+            format!("SELECT COUNT(*), SUM(o.amount) FROM users u LEFT JOIN orders o ON {on};");
+        let limited = format!(
+            "SELECT DISTINCT u.name, o.amount FROM users u LEFT JOIN orders o ON {on} ORDER BY u.name ASC, o.amount ASC LIMIT 10;"
+        );
+        let totals = left_index_totals(users, orders, shape);
+        let (plain_hash_cold, plain_hash_warm, plain_checksum, plain_rows) =
+            time_agg(&mut database, &plain);
+        let (distinct_hash_cold, distinct_hash_warm, distinct_checksum, distinct_rows) =
+            time_agg(&mut database, &distinct);
+        let (_agg_cold, agg_hash_warm, agg_checksum, agg_rows) =
+            time_agg(&mut database, &aggregate);
+        let (_limit_cold, limit_hash_warm, limit_checksum, limit_rows) =
+            time_agg(&mut database, &limited);
+        assert_eq!(
+            plain_checksum, totals.plain_checksum,
+            "{shape} {users}x{orders}"
+        );
+        assert_eq!(distinct_checksum, totals.distinct_checksum);
+        assert_eq!(agg_checksum, totals.agg_checksum);
+        assert_eq!(limit_checksum, totals.limit_checksum);
+        assert_eq!(plain_rows, totals.inputs);
+        assert_eq!(distinct_rows, totals.uniques);
+        assert_eq!(agg_rows, 1);
+        assert_eq!(limit_rows, totals.limited);
+        drop(database);
+        Database::migrate(&path).unwrap();
+        let mut database = Database::open(&path).unwrap();
+        database
+            .execute("CREATE INDEX idx_orders_user ON orders(user_id);")
+            .unwrap();
+        let natural = query(&mut database, &format!("EXPLAIN {plain}"));
+        let users_n = usize::try_from(users).unwrap();
+        let orders_n = usize::try_from(orders).unwrap();
+        let expect = if users_n == 0 || orders_n > users_n.saturating_mul(64) {
+            "IndexLeftNestedLoopJoin"
+        } else {
+            "HashLeftJoin"
+        };
+        assert_eq!(
+            natural.rows[0][0],
+            Value::Text(expect.to_string()),
+            "{shape} {users}x{orders}"
+        );
+        let (index_cold, index_warm, index_checksum, _) = {
+            let _force = ForceLeftIndexJoin::new();
+            let explained = query(&mut database, &format!("EXPLAIN {plain}"));
+            assert_eq!(
+                explained.rows[0][0],
+                Value::Text("IndexLeftNestedLoopJoin".to_string())
+            );
+            time_agg(&mut database, &plain)
+        };
+        let (distinct_index_cold, distinct_index_warm, distinct_index_checksum, _) = {
+            let _force = ForceLeftIndexJoin::new();
+            time_agg(&mut database, &distinct)
+        };
+        let (_agg_index_cold, agg_index_warm, agg_index_checksum, _) = {
+            let _force = ForceLeftIndexJoin::new();
+            time_agg(&mut database, &aggregate)
+        };
+        let (_limit_index_cold, limit_index_warm, limit_index_checksum, _) = {
+            let _force = ForceLeftIndexJoin::new();
+            time_agg(&mut database, &limited)
+        };
+        assert_eq!(index_checksum, plain_checksum);
+        assert_eq!(distinct_index_checksum, distinct_checksum);
+        assert_eq!(agg_index_checksum, agg_checksum);
+        assert_eq!(limit_index_checksum, limit_checksum);
+        let (nested_warm, distinct_nested_warm, agg_nested_warm, limit_nested_warm) = if nested {
+            let _force = ForceNestedJoin::new();
+            let (_cold, warm, checksum, _) = time_agg(&mut database, &plain);
+            assert_eq!(checksum, plain_checksum);
+            let (_cold, distinct_warm, checksum, _) = time_agg(&mut database, &distinct);
+            assert_eq!(checksum, distinct_checksum);
+            let (_cold, agg_warm, checksum, _) = time_agg(&mut database, &aggregate);
+            assert_eq!(checksum, agg_checksum);
+            let (_cold, limit_warm, checksum, _) = time_agg(&mut database, &limited);
+            assert_eq!(checksum, limit_checksum);
+            (warm, distinct_warm, agg_warm, limit_warm)
+        } else {
+            (0, 0, 0, 0)
+        };
+        let hash_bytes = hash_table_bytes(totals.hash_groups, totals.hash_positions);
+        println!(
+            "milestone24 shape={shape} users={users} orders={orders} hits={} null_extended={} inputs={} uniques={} probes={} entries={} nested_candidates={} hash_bytes={hash_bytes} index_bytes=0 distinct_bytes={} plain_hash_cold_us={plain_hash_cold} plain_hash_warm_us={plain_hash_warm} plain_index_cold_us={index_cold} plain_index_warm_us={index_warm} plain_nested_warm_us={nested_warm} distinct_hash_cold_us={distinct_hash_cold} distinct_hash_warm_us={distinct_hash_warm} distinct_index_cold_us={distinct_index_cold} distinct_index_warm_us={distinct_index_warm} distinct_nested_warm_us={distinct_nested_warm} agg_hash_warm_us={agg_hash_warm} agg_index_warm_us={agg_index_warm} agg_nested_warm_us={agg_nested_warm} limit_hash_warm_us={limit_hash_warm} limit_index_warm_us={limit_index_warm} limit_nested_warm_us={limit_nested_warm} plain_checksum={plain_checksum} distinct_checksum={distinct_checksum} agg_checksum={agg_checksum} limit_checksum={limit_checksum}",
+            totals.hits,
+            totals.null_extended,
+            totals.inputs,
+            totals.uniques,
+            totals.probes,
+            totals.entries,
+            totals.nested_candidates,
+            distinct_output_bytes(totals.uniques, 2, totals.uniques)
+        );
+    }
+
+    fn load_left_index(database: &mut Database, users: i64, orders: i64, shape: &str) {
+        let mut start = 0_i64;
+        while start < users {
+            let end = (start + 400).min(users);
+            let mut sql = String::from("INSERT INTO users VALUES ");
+            for id in start..end {
+                if id > start {
+                    sql.push(',');
+                }
+                let name = (b'a' + u8::try_from(id % 8).unwrap_or(0)) as char;
+                sql.push_str(&format!("({id}, '{name}')"));
+            }
+            sql.push(';');
+            database.execute(&sql).unwrap();
+            start = end;
+        }
+        start = 0;
+        while start < orders {
+            let end = (start + 400).min(orders);
+            let mut sql = String::from("INSERT INTO orders VALUES ");
+            for id in start..end {
+                if id > start {
+                    sql.push(',');
+                }
+                let (user_id, amount) = left_index_order(id, users, shape);
+                match (user_id, amount) {
+                    (Some(user_id), Some(amount)) => {
+                        sql.push_str(&format!("({user_id}, {amount})"));
+                    }
+                    (Some(user_id), None) => sql.push_str(&format!("({user_id}, NULL)")),
+                    (None, Some(amount)) => sql.push_str(&format!("(NULL, {amount})")),
+                    (None, None) => sql.push_str("(NULL, NULL)"),
+                }
+            }
+            sql.push(';');
+            database.execute(&sql).unwrap();
+            start = end;
+        }
+    }
+
+    fn left_index_order(id: i64, users: i64, shape: &str) -> (Option<i64>, Option<i64>) {
+        let users = users.max(1);
+        match shape {
+            "none" => (Some(-1), Some(id % 7)),
+            "duplicates" => (Some(id % 10), Some(id % 5)),
+            "selective" => {
+                if id % 100 == 0 {
+                    (Some(0), Some(id % 17))
+                } else {
+                    (Some(-1), Some(id % 17))
+                }
+            }
+            _ => {
+                if id % 11 == 0 {
+                    (Some(id % users), None)
+                } else {
+                    (Some(id % users), Some(id % 97))
+                }
+            }
+        }
+    }
+
+    struct LeftIndexTotals {
+        hits: i64,
+        null_extended: i64,
+        inputs: usize,
+        uniques: usize,
+        limited: usize,
+        probes: usize,
+        entries: usize,
+        nested_candidates: usize,
+        hash_groups: usize,
+        hash_positions: usize,
+        plain_checksum: i64,
+        distinct_checksum: i64,
+        agg_checksum: i64,
+        limit_checksum: i64,
+    }
+
+    fn left_index_totals(users: i64, orders: i64, shape: &str) -> LeftIndexTotals {
+        let mut logical = Vec::new();
+        let mut hits = 0_i64;
+        let mut null_extended = 0_i64;
+        let mut probes = 0_usize;
+        let mut entries = 0_usize;
+        let mut groups = std::collections::HashSet::new();
+        let mut positions = 0_usize;
+        let mut amount_sum = 0_i64;
+        let mut summed = false;
+        for user in 0..users {
+            let name =
+                Value::Text(((b'a' + u8::try_from(user % 8).unwrap_or(0)) as char).to_string());
+            probes += 1;
+            let mut matched = false;
+            for order in 0..orders {
+                let (user_id, amount) = left_index_order(order, users, shape);
+                if user == 0
+                    && let Some(key) = user_id
+                {
+                    groups.insert(key);
+                    positions += 1;
+                }
+                if user_id == Some(user) {
+                    entries += 1;
+                    let keep = shape != "residual" || amount.is_some_and(|amount| amount > 3);
+                    if keep {
+                        matched = true;
+                        hits += 1;
+                        if let Some(amount) = amount {
+                            summed = true;
+                            amount_sum = amount_sum.wrapping_add(amount);
+                        }
+                        logical.push(vec![name.clone(), left_amount_cell(amount)]);
+                    }
+                }
+            }
+            if !matched {
+                null_extended += 1;
+                logical.push(vec![name, Value::Null]);
+            }
+        }
+        let mut distinct = Vec::new();
+        for row in &logical {
+            if !distinct.contains(row) {
+                distinct.push(row.clone());
+            }
+        }
+        let mut ordered = distinct.clone();
+        ordered.sort_by(|left, right| {
+            compare_rows(
+                left,
+                right,
+                &[
+                    SortKey {
+                        index: 0,
+                        ascending: true,
+                        nulls_first: false,
+                    },
+                    SortKey {
+                        index: 1,
+                        ascending: true,
+                        nulls_first: false,
+                    },
+                ],
+            )
+        });
+        let limited = ordered.len().min(10);
+        let inputs = usize::try_from(hits + null_extended).unwrap_or(logical.len());
+        LeftIndexTotals {
+            hits,
+            null_extended,
+            inputs,
+            uniques: distinct.len(),
+            limited,
+            probes,
+            entries,
+            nested_candidates: usize::try_from(users.saturating_mul(orders)).unwrap_or(usize::MAX),
+            hash_groups: groups.len(),
+            hash_positions: positions,
+            plain_checksum: checksum_rows(&logical),
+            distinct_checksum: checksum_rows(&distinct),
+            agg_checksum: profile_cell(&Value::Integer(hits + null_extended)).wrapping_add(
+                profile_cell(&if summed {
+                    Value::Integer(amount_sum)
+                } else {
+                    Value::Null
+                }),
+            ),
+            limit_checksum: checksum_rows(&ordered[..limited]),
+        }
     }
 }
