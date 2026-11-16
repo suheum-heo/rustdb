@@ -230,6 +230,8 @@ impl Database {
         self.clear_delete_undo();
         #[cfg(test)]
         crate::database::reset_table_snapshots();
+        #[cfg(test)]
+        crate::database::reset_publish_images();
         if !self.stores_on_disk() {
             return match self.apply(statement) {
                 Ok(result) => {
@@ -2761,13 +2763,15 @@ impl Database {
         })
     }
 
-    /// Capture the removed rows, then compact.
+    /// Capture the removed rows, then compact, then stage their ids.
     ///
     /// The journal is stored before `retain_indexes` moves any survivor. A
     /// snapshot guard skips the journal because the table was cloned before
     /// `apply`. Index pages are not edited here. `next_row_id` is left as it
     /// was. A no-match delete keeps the existing vector and still records an
-    /// empty journal when the snapshot guard is off.
+    /// empty journal when the snapshot guard is off. The ids staged for
+    /// publish are a copy of the originals. The journal is not moved. A test
+    /// can force the full table image instead of that id list.
     fn install_delete(
         &mut self,
         table_name: &str,
@@ -2794,6 +2798,9 @@ impl Database {
         let apply_started = std::time::Instant::now();
         let positions_us = self.table_mut(table_name)?.retain_indexes(kept_indexes)?;
         self.mark_delete_undo_applied()?;
+        if !force_full_delete_publish() {
+            self.stage_selective_delete(table_name, deleted_ids.to_vec());
+        }
         let apply_us = apply_started.elapsed().as_micros();
         Ok(DeleteInstall {
             staged_rows,
@@ -5234,11 +5241,10 @@ impl Drop for ForceFullUpdate {
 /// Keeps the pre-statement table clone for `UPDATE` and `DELETE`.
 ///
 /// `UPDATE` publish stays selective unless [`ForceFullUpdate`] is also set.
-/// `DELETE` publish is unchanged either way: the editor still unlinks the
-/// removed row ids. The guard is the old undo path, used to compare a journal
-/// with a snapshot that is not produced by the journal. The clone is taken
-/// only for a database that has a file. An in-memory database does not call
-/// `prepare_durable`.
+/// `DELETE` publish stays selective unless [`ForceFullDelete`] is also set.
+/// The guard is the old undo path, used to compare a journal with a snapshot
+/// that is not produced by the journal. The clone is taken only for a database
+/// that has a file. An in-memory database does not call `prepare_durable`.
 #[cfg(test)]
 pub(crate) struct ForceFullUndo;
 
@@ -5254,6 +5260,29 @@ impl ForceFullUndo {
 impl Drop for ForceFullUndo {
     fn drop(&mut self) {
         FORCE_FULL_UNDO.with(|flag| flag.set(false));
+    }
+}
+
+/// Publishes `DELETE` through the full table image.
+///
+/// Discovery and the undo journal stay as they are. The guard rebuilds the
+/// image the selective path does not build, so a test can compare the two
+/// publication paths. It does not change `UPDATE`.
+#[cfg(test)]
+pub(crate) struct ForceFullDelete;
+
+#[cfg(test)]
+impl ForceFullDelete {
+    pub(crate) fn new() -> Self {
+        FORCE_FULL_DELETE.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceFullDelete {
+    fn drop(&mut self) {
+        FORCE_FULL_DELETE.with(|flag| flag.set(false));
     }
 }
 
@@ -6210,6 +6239,7 @@ thread_local! {
     static FORCE_HEAP_MUTATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FORCE_FULL_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FORCE_FULL_UNDO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_FULL_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// When set, an indexed `UPDATE` or `DELETE` does not precheck `WHERE` cells.
     static SKIP_WHERE_SCHEMA_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LAST_MUTATION: std::cell::RefCell<Option<MutationNote>> =
@@ -6240,6 +6270,17 @@ fn force_full_undo() -> bool {
     #[cfg(test)]
     {
         FORCE_FULL_UNDO.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn force_full_delete_publish() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_FULL_DELETE.with(std::cell::Cell::get)
     }
     #[cfg(not(test))]
     {
@@ -20835,5 +20876,1309 @@ mod tests {
             other_pages: 0,
             frames: frames[frames.len() - 1],
         }
+    }
+
+    fn open_copy(
+        src: &std::path::Path,
+        label: &str,
+    ) -> (crate::test_dir::TestDir, std::path::PathBuf, Database) {
+        let dir = crate::test_dir::TestDir::new(label);
+        let path = dir.join("db");
+        std::fs::copy(src, &path).unwrap();
+        let db = Database::open(&path).unwrap();
+        (dir, path, db)
+    }
+
+    /// Rows the predicate does not remove, with the ids they already had.
+    ///
+    /// This does not call the executor, the editor, or an index.
+    fn reference_kept(
+        rows: &[Vec<Value>],
+        ids: &[u64],
+        pred: CampaignPred,
+    ) -> (Vec<Vec<Value>>, Vec<u64>, usize) {
+        let mut kept_rows = Vec::new();
+        let mut kept_ids = Vec::new();
+        let mut removed = 0;
+        for (row, id) in rows.iter().zip(ids) {
+            if pred.matches(row) {
+                removed += 1;
+            } else {
+                kept_rows.push(row.clone());
+                kept_ids.push(*id);
+            }
+        }
+        (kept_rows, kept_ids, removed)
+    }
+
+    fn agree_publish(
+        left: &mut Database,
+        left_path: &std::path::Path,
+        right: &mut Database,
+        right_path: &std::path::Path,
+        sql: &str,
+        images: u64,
+    ) -> (usize, u64) {
+        crate::storage::reset_phases();
+        let left_count = change_count(left, sql);
+        let left_phases = crate::storage::take_phases();
+        let left_images = crate::database::publish_images();
+        crate::storage::reset_phases();
+        let right_count = {
+            let _guard = ForceFullDelete::new();
+            change_count(right, sql)
+        };
+        let right_phases = crate::storage::take_phases();
+        let right_images = crate::database::publish_images();
+        assert_eq!(left_count, right_count, "{sql}");
+        assert_eq!(left_images, 0, "{sql}");
+        assert_eq!(right_images, images, "{sql}");
+        assert_eq!(left_phases.wal_bytes, right_phases.wal_bytes, "{sql}");
+        assert_eq!(left_phases.heap_pages, right_phases.heap_pages, "{sql}");
+        assert_eq!(left_phases.index_pages, right_phases.index_pages, "{sql}");
+        assert_eq!(left_phases.frames, right_phases.frames, "{sql}");
+        assert_eq!(left_phases.row_compares, right_phases.row_compares, "{sql}");
+        assert_eq!(table_rows(left), table_rows(right), "{sql}");
+        let ids = left.table("users").unwrap().row_ids().to_vec();
+        let next = left.table("users").unwrap().next_row_id();
+        assert_eq!(
+            right.table("users").unwrap().row_ids(),
+            ids.as_slice(),
+            "{sql}"
+        );
+        assert_eq!(right.table("users").unwrap().next_row_id(), next, "{sql}");
+        assert_positions(left.table("users").unwrap(), &ids);
+        assert_eq!(
+            index_postings(left, "idx_users_id"),
+            index_postings(right, "idx_users_id"),
+            "{sql}"
+        );
+        assert_eq!(
+            index_postings(left, "idx_users_bucket"),
+            index_postings(right, "idx_users_bucket"),
+            "{sql}"
+        );
+        assert_eq!(
+            index_postings(left, "idx_users_id"),
+            reference_postings(&table_rows(left), &ids, 0),
+            "{sql}"
+        );
+        assert_eq!(
+            index_postings(left, "idx_users_bucket"),
+            reference_postings(&table_rows(left), &ids, 3),
+            "{sql}"
+        );
+        assert_eq!(db_file(left_path), db_file(right_path), "{sql}");
+        assert_checksums(left_path);
+        assert_checksums(right_path);
+        assert_eq!(wal_len(left_path), 0, "{sql}");
+        assert_eq!(wal_len(right_path), 0, "{sql}");
+        assert_eq!(mutation_checksum(left), mutation_checksum(right), "{sql}");
+        if left_count == 0 {
+            assert_eq!(left_phases.wal_bytes, 0, "{sql}");
+        } else {
+            assert!(left_phases.wal_bytes > 0, "{sql}");
+        }
+        (left_count, left_phases.row_compares)
+    }
+
+    fn expect_kept(
+        db: &mut Database,
+        rows: &[Vec<Value>],
+        ids: &[u64],
+        next: u64,
+        pred: CampaignPred,
+        count: usize,
+    ) {
+        let (kept_rows, kept_ids, removed) = reference_kept(rows, ids, pred);
+        assert_eq!(removed, count, "{}", pred.sql());
+        assert_user_identity(db, &kept_rows, &kept_ids, next);
+    }
+
+    #[test]
+    fn selective_delete_publish_matches_the_full_image() {
+        let _phases = crate::storage::enable_phases();
+        let (base_dir, mut base) = open_mutation("m29-base");
+        let base_path = base_dir.join("db");
+        let base_rows = table_rows(&mut base);
+        let base_ids = base.table("users").unwrap().row_ids().to_vec();
+        let base_next = base.table("users").unwrap().next_row_id();
+        assert_eq!(base_ids, vec![1, 2, 3, 4, 5]);
+        assert_eq!(base_next, 6);
+        drop(base);
+
+        let shapes = [
+            (
+                "none",
+                "DELETE FROM users WHERE id = -1;",
+                vec![1, 2, 3, 4, 5],
+                5_u64,
+            ),
+            (
+                "ada",
+                "DELETE FROM users WHERE name = 'Ada';",
+                vec![2, 3, 4, 5],
+                0,
+            ),
+            (
+                "bea",
+                "DELETE FROM users WHERE name = 'Bea';",
+                vec![1, 2, 4, 5],
+                0,
+            ),
+            (
+                "cy",
+                "DELETE FROM users WHERE name = 'Cy';",
+                vec![1, 2, 3, 4],
+                0,
+            ),
+            (
+                "adjacent",
+                "DELETE FROM users WHERE id = 1;",
+                vec![3, 4, 5],
+                0,
+            ),
+            (
+                "false",
+                "DELETE FROM users WHERE active = FALSE;",
+                vec![1, 3, 4],
+                0,
+            ),
+            (
+                "alt",
+                "DELETE FROM users WHERE active = TRUE;",
+                vec![2, 5],
+                0,
+            ),
+            (
+                "names",
+                "DELETE FROM users WHERE name = 'Ada' OR name = 'Bea' OR name = 'Cy';",
+                vec![2, 4],
+                0,
+            ),
+            (
+                "null-id",
+                "DELETE FROM users WHERE id IS NULL;",
+                vec![1, 2, 3, 5],
+                0,
+            ),
+            (
+                "bucket",
+                "DELETE FROM users WHERE bucket = 1;",
+                vec![3, 4],
+                0,
+            ),
+            ("all", "DELETE FROM users WHERE TRUE OR id = 0;", vec![], 0),
+        ];
+        for (label, sql, ids, compares) in shapes {
+            let (_left_dir, left_path, mut left) = open_copy(&base_path, &format!("m29-{label}-s"));
+            let (_right_dir, right_path, mut right) =
+                open_copy(&base_path, &format!("m29-{label}-f"));
+            let (count, seen) =
+                agree_publish(&mut left, &left_path, &mut right, &right_path, sql, 1);
+            assert_eq!(seen, compares, "{sql}");
+            assert_eq!(count, base_ids.len() - ids.len(), "{sql}");
+            assert_eq!(
+                left.table("users").unwrap().row_ids(),
+                ids.as_slice(),
+                "{sql}"
+            );
+            assert_eq!(
+                left.table("users").unwrap().next_row_id(),
+                base_next,
+                "{sql}"
+            );
+            let kept: Vec<Vec<Value>> = base_rows
+                .iter()
+                .zip(&base_ids)
+                .filter(|(_, id)| ids.contains(id))
+                .map(|(row, _)| row.clone())
+                .collect();
+            assert_eq!(table_rows(&mut left), kept, "{sql}");
+        }
+
+        let (_left_dir, left_path, mut left) = open_copy(&base_path, "m29-repeat-s");
+        let (_right_dir, right_path, mut right) = open_copy(&base_path, "m29-repeat-f");
+        agree_publish(
+            &mut left,
+            &left_path,
+            &mut right,
+            &right_path,
+            "DELETE FROM users WHERE name = 'Bea';",
+            1,
+        );
+        let after = db_file(&left_path);
+        let (again, compares) = agree_publish(
+            &mut left,
+            &left_path,
+            &mut right,
+            &right_path,
+            "DELETE FROM users WHERE name = 'Bea';",
+            1,
+        );
+        assert_eq!(again, 0);
+        assert_eq!(compares, 4);
+        assert_eq!(db_file(&left_path), after);
+        assert_eq!(db_file(&right_path), after);
+
+        let (_left_dir, left_path, mut left) = open_copy(&base_path, "m29-seq-s");
+        let (_right_dir, right_path, mut right) = open_copy(&base_path, "m29-seq-f");
+        agree_publish(
+            &mut left,
+            &left_path,
+            &mut right,
+            &right_path,
+            "DELETE FROM users WHERE name = 'Bea';",
+            1,
+        );
+        left.execute("INSERT INTO users VALUES (9, 'Eve', TRUE, 1);")
+            .unwrap();
+        right
+            .execute("INSERT INTO users VALUES (9, 'Eve', TRUE, 1);")
+            .unwrap();
+        assert_eq!(left.table("users").unwrap().row_ids(), &[1, 2, 4, 5, 6]);
+        assert_eq!(right.table("users").unwrap().row_ids(), &[1, 2, 4, 5, 6]);
+        assert_eq!(left.table("users").unwrap().next_row_id(), 7);
+        assert!(!left.table("users").unwrap().row_ids().contains(&3));
+        left.execute("UPDATE users SET name = 'Z' WHERE name = 'Ada';")
+            .unwrap();
+        right
+            .execute("UPDATE users SET name = 'Z' WHERE name = 'Ada';")
+            .unwrap();
+        assert_eq!(db_file(&left_path), db_file(&right_path));
+        assert_eq!(table_rows(&mut left)[0][1], text_z());
+        agree_publish(
+            &mut left,
+            &left_path,
+            &mut right,
+            &right_path,
+            "DELETE FROM users WHERE name = 'Z';",
+            1,
+        );
+        assert_eq!(left.table("users").unwrap().row_ids(), &[2, 4, 5, 6]);
+
+        let (_left_dir, left_path, mut left) = open_copy(&base_path, "m29-upd-s");
+        let (_right_dir, right_path, mut right) = open_copy(&base_path, "m29-upd-f");
+        left.execute("UPDATE users SET name = 'Zed' WHERE name = 'Bea';")
+            .unwrap();
+        right
+            .execute("UPDATE users SET name = 'Zed' WHERE name = 'Bea';")
+            .unwrap();
+        assert_eq!(db_file(&left_path), db_file(&right_path));
+        agree_publish(
+            &mut left,
+            &left_path,
+            &mut right,
+            &right_path,
+            "DELETE FROM users WHERE name = 'Zed';",
+            1,
+        );
+        assert_eq!(left.table("users").unwrap().row_ids(), &[1, 2, 4, 5]);
+
+        let wide = "w".repeat(1_800);
+        let (_left_dir, left_path, mut left) = open_copy(&base_path, "m29-wide-s");
+        let (_right_dir, right_path, mut right) = open_copy(&base_path, "m29-wide-f");
+        left.execute(&format!(
+            "UPDATE users SET name = '{wide}' WHERE name = 'Dee';"
+        ))
+        .unwrap();
+        right
+            .execute(&format!(
+                "UPDATE users SET name = '{wide}' WHERE name = 'Dee';"
+            ))
+            .unwrap();
+        assert_eq!(db_file(&left_path), db_file(&right_path));
+        agree_publish(
+            &mut left,
+            &left_path,
+            &mut right,
+            &right_path,
+            &format!("DELETE FROM users WHERE name = '{wide}';"),
+            1,
+        );
+        assert_eq!(left.table("users").unwrap().row_ids(), &[1, 2, 3, 5]);
+
+        let relocated = "w".repeat(3_200);
+        let (_left_dir, left_path, mut left) = open_copy(&base_path, "m29-move-s");
+        let (_right_dir, right_path, mut right) = open_copy(&base_path, "m29-move-f");
+        left.execute(&format!(
+            "UPDATE users SET name = '{relocated}' WHERE name = 'Cy';"
+        ))
+        .unwrap();
+        right
+            .execute(&format!(
+                "UPDATE users SET name = '{relocated}' WHERE name = 'Cy';"
+            ))
+            .unwrap();
+        assert_eq!(db_file(&left_path), db_file(&right_path));
+        agree_publish(
+            &mut left,
+            &left_path,
+            &mut right,
+            &right_path,
+            &format!("DELETE FROM users WHERE name = '{relocated}';"),
+            1,
+        );
+        assert_eq!(left.table("users").unwrap().row_ids(), &[1, 2, 3, 4]);
+        drop(left);
+        let left = Database::open(&left_path).unwrap();
+        assert_eq!(left.table("users").unwrap().row_ids(), &[1, 2, 3, 4]);
+        assert_checksums(&left_path);
+
+        let (_span_dir, mut spanning) = open_spanning("m29-span");
+        let span_path = _span_dir.join("db");
+        let span_rows = table_rows(&mut spanning);
+        let span_ids = spanning.table("users").unwrap().row_ids().to_vec();
+        let span_next = spanning.table("users").unwrap().next_row_id();
+        drop(spanning);
+        let (_left_dir, left_path, mut left) = open_copy(&span_path, "m29-span-s");
+        let (_right_dir, right_path, mut right) = open_copy(&span_path, "m29-span-f");
+        let (count, compares) = agree_publish(
+            &mut left,
+            &left_path,
+            &mut right,
+            &right_path,
+            "DELETE FROM users WHERE id >= 100 AND id < 110;",
+            1,
+        );
+        assert_eq!(count, 10);
+        assert_eq!(compares, 0);
+        expect_kept(
+            &mut left,
+            &span_rows,
+            &span_ids,
+            span_next,
+            CampaignPred::Range {
+                low: 100,
+                high: 110,
+            },
+            10,
+        );
+
+        let (_scan_dir, scan_path, mut scanned) = open_copy(&base_path, "m29-scan");
+        let (_index_dir, index_path, mut indexed) = open_copy(&base_path, "m29-index");
+        let scan_count = {
+            let _force = ForceHeapMutation::new();
+            change_count(&mut scanned, "DELETE FROM users WHERE id = 1;")
+        };
+        let index_count = change_count(&mut indexed, "DELETE FROM users WHERE id = 1;");
+        assert_eq!(scan_count, index_count);
+        assert_eq!(table_rows(&mut scanned), table_rows(&mut indexed));
+        assert_eq!(
+            scanned.table("users").unwrap().row_ids(),
+            indexed.table("users").unwrap().row_ids()
+        );
+        assert_eq!(
+            index_postings(&mut scanned, "idx_users_id"),
+            index_postings(&mut indexed, "idx_users_id")
+        );
+        assert_eq!(
+            index_postings(&mut scanned, "idx_users_bucket"),
+            index_postings(&mut indexed, "idx_users_bucket")
+        );
+        assert_eq!(db_file(&scan_path), db_file(&index_path));
+
+        let (join_dir, join) = open_joined("m29-join");
+        let join_path = join_dir.join("db");
+        drop(join);
+        let (_left_dir, left_path, mut left) = open_copy(&join_path, "m29-join-s");
+        let (_right_dir, right_path, mut right) = open_copy(&join_path, "m29-join-f");
+        left.table_mut("orders")
+            .unwrap()
+            .overwrite_cell_for_test(0, 1, Value::Integer(99));
+        right
+            .table_mut("orders")
+            .unwrap()
+            .overwrite_cell_for_test(0, 1, Value::Integer(99));
+        crate::storage::reset_phases();
+        let left_count = change_count(&mut left, "DELETE FROM users WHERE id = 1;");
+        let left_phases = crate::storage::take_phases();
+        assert_eq!(crate::database::publish_images(), 0);
+        crate::storage::reset_phases();
+        let right_count = {
+            let _guard = ForceFullDelete::new();
+            change_count(&mut right, "DELETE FROM users WHERE id = 1;")
+        };
+        let right_phases = crate::storage::take_phases();
+        assert_eq!(left_count, 1);
+        assert_eq!(right_count, 1);
+        assert_eq!(crate::database::publish_images(), 2);
+        assert_eq!(left_phases.row_compares, 4);
+        assert_eq!(right_phases.row_compares, 4);
+        assert_eq!(left_phases.wal_bytes, right_phases.wal_bytes);
+        let names = query(
+            &mut left,
+            "SELECT id, name FROM users WHERE TRUE OR id = 1;",
+        )
+        .rows;
+        assert_eq!(
+            names,
+            query(
+                &mut right,
+                "SELECT id, name FROM users WHERE TRUE OR id = 1;"
+            )
+            .rows
+        );
+        assert_eq!(left.table("users").unwrap().row_ids(), &[2, 3]);
+        assert_eq!(db_file(&left_path), db_file(&right_path));
+        assert_checksums(&left_path);
+        drop(left);
+        drop(right);
+        let mut left = Database::open(&left_path).unwrap();
+        let orders = query(&mut left, "SELECT amount FROM orders WHERE user_id = 1;").rows;
+        assert_eq!(orders[0][0], Value::Integer(99));
+
+        let (_left_dir, left_path, mut left) = open_copy(&base_path, "m29-type-s");
+        let (_right_dir, right_path, mut right) = open_copy(&base_path, "m29-type-f");
+        let before = db_file(&left_path);
+        left.table_mut("users")
+            .unwrap()
+            .overwrite_cell_for_test(3, 1, Value::Integer(9));
+        right
+            .table_mut("users")
+            .unwrap()
+            .overwrite_cell_for_test(3, 1, Value::Integer(9));
+        let left_error = left
+            .execute("DELETE FROM users WHERE id = -1;")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(crate::database::publish_images(), 0);
+        let right_error = {
+            let _guard = ForceFullDelete::new();
+            right
+                .execute("DELETE FROM users WHERE id = -1;")
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(
+            left_error.contains("does not match its column"),
+            "{left_error}"
+        );
+        assert_eq!(left_error, right_error);
+        assert_eq!(db_file(&left_path), before);
+        assert_eq!(db_file(&right_path), before);
+        assert_eq!(wal_len(&left_path), 0);
+        let left_error = left
+            .execute("DELETE FROM users WHERE id = 2;")
+            .unwrap_err()
+            .to_string();
+        let right_error = {
+            let _guard = ForceFullDelete::new();
+            right
+                .execute("DELETE FROM users WHERE id = 2;")
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(left_error, right_error);
+        assert!(
+            left_error.contains("does not match its column"),
+            "{left_error}"
+        );
+        assert_eq!(left.table("users").unwrap().rows().len(), 5);
+        assert_eq!(db_file(&left_path), before);
+
+        let (_left_dir, left_path, mut left) = open_copy(&base_path, "m29-huge-s");
+        let (_right_dir, _right_path, mut right) = open_copy(&base_path, "m29-huge-f");
+        let before = db_file(&left_path);
+        let huge = "h".repeat(crate::MAX_RECORD_LEN);
+        left.table_mut("users")
+            .unwrap()
+            .overwrite_cell_for_test(4, 1, Value::Text(huge.clone()));
+        right
+            .table_mut("users")
+            .unwrap()
+            .overwrite_cell_for_test(4, 1, Value::Text(huge));
+        let left_error = left
+            .execute("DELETE FROM users WHERE name = 'Ada';")
+            .unwrap_err()
+            .to_string();
+        let right_error = {
+            let _guard = ForceFullDelete::new();
+            right
+                .execute("DELETE FROM users WHERE name = 'Ada';")
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(left_error.contains("maximum record size"), "{left_error}");
+        assert_eq!(left_error, right_error);
+        assert_eq!(db_file(&left_path), before);
+        assert_eq!(left.table("users").unwrap().rows().len(), 5);
+
+        let (_left_dir, left_path, mut left) = open_copy(&base_path, "m29-drop-bad-s");
+        let (_right_dir, right_path, mut right) = open_copy(&base_path, "m29-drop-bad-f");
+        left.table_mut("users")
+            .unwrap()
+            .overwrite_cell_for_test(2, 1, Value::Integer(7));
+        right
+            .table_mut("users")
+            .unwrap()
+            .overwrite_cell_for_test(2, 1, Value::Integer(7));
+        agree_publish(
+            &mut left,
+            &left_path,
+            &mut right,
+            &right_path,
+            "DELETE FROM users WHERE id = 2;",
+            1,
+        );
+        assert_eq!(left.table("users").unwrap().row_ids(), &[1, 2, 4, 5]);
+
+        let (_dir, path, mut db) = open_copy(&base_path, "m29-where");
+        let before = db_file(&path);
+        let error = db
+            .execute("DELETE FROM users WHERE name = 1;")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot apply operator"), "{error}");
+        assert_eq!(crate::database::publish_images(), 0);
+        assert_eq!(db_file(&path), before);
+        db.drop_root_leaf_entry("idx_users_id", 0).unwrap();
+        let error = db
+            .execute("DELETE FROM users WHERE id = 1;")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not match"), "{error}");
+        assert_eq!(crate::database::publish_images(), 0);
+        assert_eq!(db_file(&path), before);
+        assert_eq!(table_rows(&mut db), base_rows);
+
+        let (_dir, path, mut db) = open_copy(&base_path, "m29-maintain");
+        let before = db_file(&path);
+        db.corrupt_index_root_type("idx_users_id").unwrap();
+        let error = {
+            let _scan = ForceHeapMutation::new();
+            db.execute("DELETE FROM users WHERE name = 'Bea';")
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(error.contains("corrupt"), "{error}");
+        assert!(!error.contains("outcome is unknown"), "{error}");
+        assert_eq!(table_rows(&mut db), base_rows);
+        assert_eq!(db_file(&path), before);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(
+            change_count(&mut db, "DELETE FROM users WHERE name = 'Bea';"),
+            1
+        );
+
+        let (_dir, path, held) = open_copy(&base_path, "m29-lock");
+        let error = match Database::open(&path) {
+            Ok(_) => panic!("second open acquired the lock"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("is locked"), "{error}");
+        drop(held);
+
+        let seeds = [
+            (0x2900_u64, 0_usize, false),
+            (0x2901, 1, false),
+            (0x2908, 8, false),
+            (0x2964, 64, false),
+            (0x29a0, 256, false),
+            (0x29f8, 8, true),
+        ];
+        for (seed, count, wide) in seeds {
+            let generated = campaign_rows(seed, count, wide);
+            let (dir, mut db) = open_generated(&format!("m29-seed-{seed:x}"), &generated, true);
+            let path = dir.join("db");
+            let rows = table_rows(&mut db);
+            let ids = db.table("users").unwrap().row_ids().to_vec();
+            let next = db.table("users").unwrap().next_row_id();
+            assert_eq!(ids.len(), count, "{seed:x}");
+            drop(db);
+            let mut preds = vec![
+                CampaignPred::None,
+                CampaignPred::Id(0),
+                CampaignPred::Bucket(0),
+                CampaignPred::BucketNull,
+                CampaignPred::Active,
+                CampaignPred::All,
+            ];
+            if count > 1 {
+                preds.push(CampaignPred::Below(i64::try_from(count / 2).unwrap()));
+                preds.push(CampaignPred::Or(0, 1, i64::try_from(count - 1).unwrap()));
+            }
+            for pred in preds {
+                let sql = pred.sql();
+                let (_left_dir, left_path, mut left) = open_copy(&path, &format!("m29-{seed:x}-s"));
+                let (_right_dir, right_path, mut right) =
+                    open_copy(&path, &format!("m29-{seed:x}-f"));
+                let (removed, _compares) =
+                    agree_publish(&mut left, &left_path, &mut right, &right_path, &sql, 1);
+                expect_kept(&mut left, &rows, &ids, next, pred, removed);
+                if seed == 0x2908 && matches!(pred, CampaignPred::Bucket(0)) {
+                    let (_scan_dir, scan_path, mut scanned) = open_copy(&path, "m29-2908-scan");
+                    let scan_count = {
+                        let _force = ForceHeapMutation::new();
+                        change_count(&mut scanned, &sql)
+                    };
+                    assert_eq!(scan_count, removed);
+                    assert_eq!(db_file(&scan_path), db_file(&left_path));
+                    assert_eq!(
+                        index_postings(&mut scanned, "idx_users_bucket"),
+                        index_postings(&mut left, "idx_users_bucket")
+                    );
+                }
+                if seed == 0x2908 && matches!(pred, CampaignPred::Active) {
+                    let (_undo_dir, undo_path, mut undo) = open_copy(&path, "m29-2908-undo");
+                    let (_both_dir, both_path, mut both) = open_copy(&path, "m29-2908-both");
+                    let undo_count = {
+                        let _guard = ForceFullUndo::new();
+                        change_count(&mut undo, &sql)
+                    };
+                    let both_count = {
+                        let _undo = ForceFullUndo::new();
+                        let _full = ForceFullDelete::new();
+                        change_count(&mut both, &sql)
+                    };
+                    assert_eq!(undo_count, removed);
+                    assert_eq!(both_count, removed);
+                    assert_eq!(db_file(&undo_path), db_file(&left_path));
+                    assert_eq!(db_file(&both_path), db_file(&left_path));
+                    assert_eq!(crate::database::table_snapshots(), 1);
+                }
+            }
+        }
+
+        let generated = campaign_rows(0x2918, 12, false);
+        let (dir, mut db) = open_generated("m29-2918", &generated, true);
+        let path = dir.join("db");
+        let mut rows = table_rows(&mut db);
+        let mut ids = db.table("users").unwrap().row_ids().to_vec();
+        let mut next = db.table("users").unwrap().next_row_id();
+        drop(db);
+        let (_left_dir, left_path, mut left) = open_copy(&path, "m29-2918-s");
+        let (_right_dir, right_path, mut right) = open_copy(&path, "m29-2918-f");
+        let steps = [
+            CampaignPred::Id(0),
+            CampaignPred::None,
+            CampaignPred::BucketNull,
+            CampaignPred::Active,
+            CampaignPred::All,
+        ];
+        for pred in steps {
+            let (removed, _) = agree_publish(
+                &mut left,
+                &left_path,
+                &mut right,
+                &right_path,
+                &pred.sql(),
+                1,
+            );
+            let (kept_rows, kept_ids, expected) = reference_kept(&rows, &ids, pred);
+            assert_eq!(removed, expected);
+            rows = kept_rows;
+            ids = kept_ids;
+            assert_user_identity(&mut left, &rows, &ids, next);
+        }
+        left.execute("INSERT INTO users VALUES (9, 'Eve', TRUE, 1);")
+            .unwrap();
+        right
+            .execute("INSERT INTO users VALUES (9, 'Eve', TRUE, 1);")
+            .unwrap();
+        rows.push(vec![
+            Value::Integer(9),
+            Value::Text("Eve".to_string()),
+            Value::Boolean(true),
+            Value::Integer(1),
+        ]);
+        ids.push(next);
+        next += 1;
+        assert_user_identity(&mut left, &rows, &ids, next);
+        assert_eq!(db_file(&left_path), db_file(&right_path));
+        assert_eq!(right.table("users").unwrap().next_row_id(), next);
+
+        let generated = campaign_rows(0x2919, 8, false);
+        let (dir, db) = open_generated("m29-2919", &generated, true);
+        let path = dir.join("db");
+        let next = db.table("users").unwrap().next_row_id();
+        drop(db);
+        let (_left_dir, left_path, mut left) = open_copy(&path, "m29-2919-s");
+        let (_right_dir, right_path, mut right) = open_copy(&path, "m29-2919-f");
+        agree_publish(
+            &mut left,
+            &left_path,
+            &mut right,
+            &right_path,
+            "DELETE FROM users WHERE TRUE OR id = 0;",
+            1,
+        );
+        assert!(table_rows(&mut left).is_empty());
+        assert_eq!(left.table("users").unwrap().next_row_id(), next);
+        left.execute("INSERT INTO users VALUES (1, 'again', FALSE, 0);")
+            .unwrap();
+        right
+            .execute("INSERT INTO users VALUES (1, 'again', FALSE, 0);")
+            .unwrap();
+        assert_eq!(left.table("users").unwrap().row_ids(), &[next]);
+        assert_eq!(right.table("users").unwrap().row_ids(), &[next]);
+        assert_eq!(left.table("users").unwrap().next_row_id(), next + 1);
+        assert_eq!(db_file(&left_path), db_file(&right_path));
+        drop(left);
+        let mut left = Database::open(&left_path).unwrap();
+        assert_eq!(left.table("users").unwrap().row_ids(), &[next]);
+        assert_eq!(index_postings(&mut left, "idx_users_id"), vec![(1, next)]);
+
+        let generated = campaign_rows(0x2920, 4, false);
+        let (dir, mut db) = open_generated("m29-2920", &generated, true);
+        let path = dir.join("db");
+        let rows = table_rows(&mut db);
+        let ids = db.table("users").unwrap().row_ids().to_vec();
+        let next = db.table("users").unwrap().next_row_id();
+        drop(db);
+        let relocated = "w".repeat(3_200);
+        let (_left_dir, left_path, mut left) = open_copy(&path, "m29-2920-s");
+        let (_right_dir, right_path, mut right) = open_copy(&path, "m29-2920-f");
+        left.execute(&format!(
+            "UPDATE users SET name = '{relocated}' WHERE id = 0;"
+        ))
+        .unwrap();
+        right
+            .execute(&format!(
+                "UPDATE users SET name = '{relocated}' WHERE id = 0;"
+            ))
+            .unwrap();
+        assert_eq!(db_file(&left_path), db_file(&right_path));
+        let (removed, _) = agree_publish(
+            &mut left,
+            &left_path,
+            &mut right,
+            &right_path,
+            "DELETE FROM users WHERE id = 0;",
+            1,
+        );
+        expect_kept(&mut left, &rows, &ids, next, CampaignPred::Id(0), removed);
+        drop(left);
+        let mut left = Database::open(&left_path).unwrap();
+        expect_kept(&mut left, &rows, &ids, next, CampaignPred::Id(0), removed);
+        assert_checksums(&left_path);
+    }
+
+    fn clean_delete(
+        src: &std::path::Path,
+        label: &str,
+        sql: &str,
+    ) -> (Vec<Vec<Value>>, Vec<u64>, Vec<u8>) {
+        let (dir, path, mut db) = open_copy(src, label);
+        db.execute(sql).unwrap();
+        let rows = table_rows(&mut db);
+        let ids = db.table("users").unwrap().row_ids().to_vec();
+        drop(db);
+        let bytes = db_file(&path);
+        drop(dir);
+        (rows, ids, bytes)
+    }
+
+    fn assert_precommit(
+        src: &std::path::Path,
+        label: &str,
+        sql: &str,
+        inject: crate::storage::Inject,
+    ) {
+        let (_dir, path, mut db) = open_copy(src, label);
+        let before = db_file(&path);
+        let rows = table_rows(&mut db);
+        let ids = db.table("users").unwrap().row_ids().to_vec();
+        let posted = index_postings(&mut db, "idx_users_id");
+        db.set_inject(inject);
+        let error = db.execute(sql).unwrap_err().to_string();
+        assert!(
+            error.contains("injected failure before the redo log was synced"),
+            "{label}: {error}"
+        );
+        assert!(!error.contains("outcome is unknown"), "{label}: {error}");
+        assert_eq!(table_rows(&mut db), rows, "{label}");
+        assert_eq!(
+            db.table("users").unwrap().row_ids(),
+            ids.as_slice(),
+            "{label}"
+        );
+        assert_eq!(index_postings(&mut db, "idx_users_id"), posted, "{label}");
+        assert_eq!(db_file(&path), before, "{label}");
+        assert_eq!(
+            change_count(&mut db, "DELETE FROM users WHERE id = -1;"),
+            0,
+            "{label}"
+        );
+        drop(db);
+        let mut reopened = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut reopened), rows, "{label}");
+        assert_eq!(wal_len(&path), 0, "{label}");
+        drop(reopened);
+        let mut again = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut again), rows, "{label}");
+    }
+
+    fn assert_postcommit(
+        src: &std::path::Path,
+        label: &str,
+        sql: &str,
+        inject: crate::storage::Inject,
+    ) {
+        let (expected_rows, expected_ids, expected_bytes) =
+            clean_delete(src, &format!("{label}-clean"), sql);
+        let (_dir, path, mut db) = open_copy(src, label);
+        db.set_inject(inject);
+        let error = db.execute(sql).unwrap_err().to_string();
+        assert!(
+            error.contains("outcome is unknown") || error.contains("durability is unknown"),
+            "{label}: {error}"
+        );
+        let refused = db
+            .execute("DELETE FROM users WHERE id = -1;")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("outcome is unknown") || refused.contains("Reopen"),
+            "{label}: {refused}"
+        );
+        drop(db);
+        let mut reopened = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut reopened), expected_rows, "{label}");
+        assert_eq!(
+            reopened.table("users").unwrap().row_ids(),
+            expected_ids.as_slice(),
+            "{label}"
+        );
+        assert_eq!(
+            index_postings(&mut reopened, "idx_users_id"),
+            reference_postings(&expected_rows, &expected_ids, 0),
+            "{label}"
+        );
+        drop(reopened);
+        let mut again = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut again), expected_rows, "{label}");
+        assert_eq!(db_file(&path), expected_bytes, "{label}");
+        assert_checksums(&path);
+    }
+
+    #[test]
+    fn selective_delete_publish_respects_wal_boundaries() {
+        let (base_dir, base) = open_mutation("m29-wal-base");
+        let base_path = base_dir.join("db");
+        drop(base);
+        let (_span_dir, spanning) = open_spanning("m29-wal-span");
+        let span_path = _span_dir.join("db");
+        drop(spanning);
+
+        let (_dir, path, mut db) = open_copy(&base_path, "m29-wal-miss");
+        let before = db_file(&path);
+        db.set_inject(crate::storage::Inject::BeforeLogSync);
+        assert_eq!(change_count(&mut db, "DELETE FROM users WHERE id = -1;"), 0);
+        assert_eq!(db_file(&path), before);
+        assert_eq!(wal_len(&path), 0);
+        let (_dir, path, mut db) = open_copy(&base_path, "m29-wal-miss-full");
+        let before = db_file(&path);
+        db.set_inject(crate::storage::Inject::BeforeLogSync);
+        let count = {
+            let _guard = ForceFullDelete::new();
+            change_count(&mut db, "DELETE FROM users WHERE id = -1;")
+        };
+        assert_eq!(count, 0);
+        assert_eq!(db_file(&path), before);
+        assert_eq!(wal_len(&path), 0);
+        assert_eq!(crate::database::publish_images(), 1);
+
+        let statements = [
+            ("one", "DELETE FROM users WHERE name = 'Bea';"),
+            ("multi", "DELETE FROM users WHERE id = 1;"),
+            ("all", "DELETE FROM users WHERE TRUE OR id = 0;"),
+        ];
+        for (label, sql) in statements {
+            assert_precommit(
+                &base_path,
+                &format!("m29-pre-{label}"),
+                sql,
+                crate::storage::Inject::BeforeLogSync,
+            );
+            let (_dir, path, mut db) = open_copy(&base_path, &format!("m29-pre-image-{label}"));
+            let before = db_file(&path);
+            let rows = table_rows(&mut db);
+            db.set_inject(crate::storage::Inject::BeforeLogSync);
+            let error = {
+                let _guard = ForceFullDelete::new();
+                db.execute(sql).unwrap_err().to_string()
+            };
+            assert!(
+                error.contains("injected failure before the redo log was synced"),
+                "{error}"
+            );
+            assert_eq!(table_rows(&mut db), rows, "{label}");
+            assert_eq!(db_file(&path), before, "{label}");
+            assert_postcommit(
+                &base_path,
+                &format!("m29-post-{label}"),
+                sql,
+                crate::storage::Inject::AfterLogSync,
+            );
+            assert_postcommit(
+                &base_path,
+                &format!("m29-sync-{label}"),
+                sql,
+                crate::storage::Inject::CommitSyncFailed,
+            );
+            assert_postcommit(
+                &base_path,
+                &format!("m29-check-{label}"),
+                sql,
+                crate::storage::Inject::DuringCheckpoint(1),
+            );
+        }
+        assert_precommit(
+            &span_path,
+            "m29-pre-pages",
+            "DELETE FROM users WHERE id >= 100 AND id < 120;",
+            crate::storage::Inject::BeforeLogSync,
+        );
+        assert_postcommit(
+            &span_path,
+            "m29-post-pages",
+            "DELETE FROM users WHERE id >= 100 AND id < 120;",
+            crate::storage::Inject::AfterLogSync,
+        );
+
+        let relocated = "w".repeat(3_200);
+        let (_dir, path, mut db) = open_copy(&base_path, "m29-relocated");
+        db.execute(&format!(
+            "UPDATE users SET name = '{relocated}' WHERE name = 'Cy';"
+        ))
+        .unwrap();
+        drop(db);
+        let delete_moved = format!("DELETE FROM users WHERE name = '{relocated}';");
+        assert_precommit(
+            &path,
+            "m29-pre-reloc",
+            &delete_moved,
+            crate::storage::Inject::BeforeLogSync,
+        );
+        assert_postcommit(
+            &path,
+            "m29-post-reloc",
+            &delete_moved,
+            crate::storage::Inject::AfterLogSync,
+        );
+
+        let (_dir, path, mut db) = open_copy(&base_path, "m29-rekey");
+        db.execute("UPDATE users SET id = 40 WHERE name = 'Cy';")
+            .unwrap();
+        drop(db);
+        assert_precommit(
+            &path,
+            "m29-pre-rekey",
+            "DELETE FROM users WHERE id = 40;",
+            crate::storage::Inject::BeforeLogSync,
+        );
+        assert_postcommit(
+            &path,
+            "m29-post-rekey",
+            "DELETE FROM users WHERE id = 40;",
+            crate::storage::Inject::CommitSyncFailed,
+        );
+    }
+
+    struct TimedDeletePublish {
+        cold: u128,
+        warm: u128,
+        wal_warm: u128,
+        publish_warm: u128,
+        compare_warm: u128,
+        compares: u64,
+        prepare_warm: u128,
+        wal_bytes: u64,
+        heap_pages: u32,
+        index_pages: u32,
+        frames: u32,
+    }
+
+    fn time_delete_publish(
+        db: &mut Database,
+        statements: &[String],
+        full: bool,
+    ) -> TimedDeletePublish {
+        let mut totals = Vec::with_capacity(statements.len());
+        let mut wal = Vec::with_capacity(statements.len());
+        let mut publish = Vec::with_capacity(statements.len());
+        let mut compare = Vec::with_capacity(statements.len());
+        let mut compares = Vec::with_capacity(statements.len());
+        let mut prepare = Vec::with_capacity(statements.len());
+        let mut wal_bytes = Vec::with_capacity(statements.len());
+        let mut heap_pages = Vec::with_capacity(statements.len());
+        let mut index_pages = Vec::with_capacity(statements.len());
+        let mut frames = Vec::with_capacity(statements.len());
+        for statement in statements {
+            crate::storage::reset_phases();
+            let started = std::time::Instant::now();
+            if full {
+                let _guard = ForceFullDelete::new();
+                db.execute(statement).unwrap();
+            } else {
+                db.execute(statement).unwrap();
+            }
+            totals.push(started.elapsed().as_micros());
+            let taken = crate::storage::take_phases();
+            wal.push(
+                (taken.wal_write
+                    + taken.wal_sync
+                    + taken.db_write
+                    + taken.db_sync
+                    + taken.wal_clear)
+                    .as_micros(),
+            );
+            publish.push(taken.apply.as_micros());
+            compare.push(taken.compare.as_micros());
+            compares.push(taken.row_compares);
+            prepare.push(taken.prepare.as_micros());
+            wal_bytes.push(taken.wal_bytes);
+            heap_pages.push(taken.heap_pages);
+            index_pages.push(taken.index_pages);
+            frames.push(taken.frames);
+        }
+        let warm = |values: &[u128]| {
+            if values.len() == 1 {
+                values[0]
+            } else {
+                median(&values[1..])
+            }
+        };
+        let warm_pages = |values: &[u64]| {
+            if values.len() == 1 {
+                values[0]
+            } else {
+                median_u64(&values[1..])
+            }
+        };
+        TimedDeletePublish {
+            cold: totals[0],
+            warm: warm(&totals),
+            wal_warm: warm(&wal),
+            publish_warm: warm(&publish),
+            compare_warm: warm(&compare),
+            compares: if compares.len() == 1 {
+                compares[0]
+            } else {
+                median_u64(&compares[1..])
+            },
+            prepare_warm: warm(&prepare),
+            wal_bytes: warm_pages(&wal_bytes),
+            heap_pages: heap_pages[heap_pages.len() - 1],
+            index_pages: index_pages[index_pages.len() - 1],
+            frames: frames[frames.len() - 1],
+        }
+    }
+
+    #[test]
+    #[ignore = "release profile of selective DELETE publication"]
+    fn profile_milestone29() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone29 cpu={cpu} mem_bytes={mem} rustc={rustc} value_bytes={} vec_bytes={} usize_bytes={}",
+            std::mem::size_of::<Value>(),
+            std::mem::size_of::<Vec<Value>>(),
+            std::mem::size_of::<usize>()
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            let (base_dir, base) = open_profile_db("m29-base", rows);
+            let base_path = base_dir.join("db");
+            drop(base);
+            for workload in [
+                "miss",
+                "one",
+                "ten",
+                "duplicates",
+                "half",
+                "all",
+                "updated",
+                "wide",
+                "rollback",
+            ] {
+                profile_delete_publish(&base_path, rows, workload);
+            }
+        }
+    }
+
+    fn profile_delete_publish(base: &std::path::Path, rows: i64, workload: &str) {
+        if workload == "rollback" {
+            profile_delete_publish_rollback(base, rows);
+            return;
+        }
+        let (_selective_dir, mut selective) = copied_profile_db(base, "m29-selective");
+        let (_full_dir, mut full) = copied_profile_db(base, "m29-full");
+        prepare_delete(&mut selective, workload);
+        prepare_delete(&mut full, workload);
+        let sql = delete_sample(workload, rows, 0);
+        crate::storage::reset_phases();
+        let selective_count = change_count(&mut selective, &sql);
+        let selective_note = mutation_note();
+        let selective_phases = crate::storage::take_phases();
+        let selective_images = crate::database::publish_images();
+        crate::storage::reset_phases();
+        let full_count = {
+            let _guard = ForceFullDelete::new();
+            change_count(&mut full, &sql)
+        };
+        let full_note = mutation_note();
+        let full_phases = crate::storage::take_phases();
+        let full_images = crate::database::publish_images();
+        assert_eq!(selective_count, full_count, "{workload}");
+        assert_eq!(selective_images, 0, "{workload}");
+        assert_eq!(full_images, 1, "{workload}");
+        assert!(!selective_note.undo_snapshot, "{workload}");
+        assert!(!full_note.undo_snapshot, "{workload}");
+        let checksum = mutation_checksum(&mut selective);
+        assert_eq!(checksum, mutation_checksum(&mut full), "{workload}");
+        assert_eq!(
+            selective_phases.wal_bytes, full_phases.wal_bytes,
+            "{workload}"
+        );
+        assert_eq!(
+            selective_phases.heap_pages, full_phases.heap_pages,
+            "{workload}"
+        );
+        assert_eq!(
+            selective_phases.index_pages, full_phases.index_pages,
+            "{workload}"
+        );
+        assert_eq!(selective_phases.frames, full_phases.frames, "{workload}");
+        assert_eq!(
+            selective_phases.row_compares, full_phases.row_compares,
+            "{workload}"
+        );
+        let survivors = u64::try_from(rows).unwrap() - u64::try_from(selective_count).unwrap();
+        let image_bytes = estimated_snapshot_bytes(usize::try_from(survivors).unwrap(), 4);
+        let id_bytes = u64::try_from(selective_count).unwrap().saturating_mul(8);
+        if workload == "miss" {
+            assert_eq!(selective_phases.wal_bytes, 0, "{workload}");
+            assert_eq!(
+                selective_phases.row_compares,
+                u64::try_from(rows).unwrap(),
+                "{workload}"
+            );
+            assert_eq!(selective_count, 0, "{workload}");
+        } else {
+            assert_eq!(selective_phases.row_compares, 0, "{workload}");
+            assert!(selective_phases.wal_bytes > 0, "{workload}");
+        }
+        let samples = if delete_is_repeatable(workload) {
+            if rows >= 100_000 { 3 } else { 6 }
+        } else {
+            1
+        };
+        let (_timed_selective_dir, mut timed_selective) = copied_profile_db(base, "m29-time-s");
+        let (_timed_full_dir, mut timed_full) = copied_profile_db(base, "m29-time-f");
+        prepare_delete(&mut timed_selective, workload);
+        prepare_delete(&mut timed_full, workload);
+        let statements: Vec<String> = (0..samples)
+            .map(|sample| delete_sample(workload, rows, sample))
+            .collect();
+        let selective_time = time_delete_publish(&mut timed_selective, &statements, false);
+        let full_time = time_delete_publish(&mut timed_full, &statements, true);
+        assert_eq!(selective_time.wal_bytes, full_time.wal_bytes, "{workload}");
+        assert_eq!(
+            selective_time.heap_pages, full_time.heap_pages,
+            "{workload}"
+        );
+        assert_eq!(
+            selective_time.index_pages, full_time.index_pages,
+            "{workload}"
+        );
+        assert_eq!(selective_time.frames, full_time.frames, "{workload}");
+        assert_eq!(selective_time.compares, full_time.compares, "{workload}");
+        println!(
+            "milestone29 workload={workload} rows={rows} count={selective_count} discover_us={} probe_us={} validate_us={} filter_us={} undo_us={} full_undo_us={} apply_us={} positions_us={} id_bytes={id_bytes} image_bytes={image_bytes} undo_bytes={} snapshot_bytes={} selective_cold_us={} selective_warm_us={} full_cold_us={} full_warm_us={} selective_prepare_us={} full_prepare_us={} selective_publish_us={} full_publish_us={} selective_compare_us={} full_compare_us={} compares={} selective_wal_us={} full_wal_us={} wal_bytes={} heap_pages={} index_pages={} frames={} checksum={checksum}",
+            selective_note.discover_us,
+            selective_note.probe_us,
+            selective_note.validate_us,
+            selective_note.filter_us,
+            selective_note.undo_us,
+            full_note.undo_us,
+            selective_note.apply_us,
+            selective_note.positions_us,
+            selective_note.undo_bytes,
+            selective_note.snapshot_bytes,
+            selective_time.cold,
+            selective_time.warm,
+            full_time.cold,
+            full_time.warm,
+            selective_time.prepare_warm,
+            full_time.prepare_warm,
+            selective_time.publish_warm,
+            full_time.publish_warm,
+            selective_time.compare_warm,
+            full_time.compare_warm,
+            selective_time.compares,
+            selective_time.wal_warm,
+            full_time.wal_warm,
+            selective_time.wal_bytes,
+            selective_time.heap_pages,
+            selective_time.index_pages,
+            selective_time.frames,
+        );
+    }
+
+    fn profile_delete_publish_rollback(base: &std::path::Path, rows: i64) {
+        let (_selective_dir, selective_path, mut selective) =
+            copied_profile_rollback(base, "m29-rollback-s");
+        let (_full_dir, full_path, mut full) = copied_profile_rollback(base, "m29-rollback-f");
+        let before = mutation_checksum(&mut selective);
+        assert_eq!(before, mutation_checksum(&mut full));
+        let sql = "DELETE FROM users WHERE id = 1;";
+        crate::storage::reset_phases();
+        selective.set_inject(crate::storage::Inject::BeforeLogSync);
+        let started = std::time::Instant::now();
+        let error = selective.execute(sql).unwrap_err();
+        let selective_us = started.elapsed().as_micros();
+        let selective_phases = crate::storage::take_phases();
+        assert!(
+            error
+                .to_string()
+                .contains("injected failure before the redo log was synced"),
+            "{error}"
+        );
+        assert_eq!(mutation_checksum(&mut selective), before);
+        full.set_inject(crate::storage::Inject::BeforeLogSync);
+        let started = std::time::Instant::now();
+        let error = {
+            let _guard = ForceFullDelete::new();
+            full.execute(sql).unwrap_err()
+        };
+        let full_us = started.elapsed().as_micros();
+        assert!(
+            error
+                .to_string()
+                .contains("injected failure before the redo log was synced"),
+            "{error}"
+        );
+        assert_eq!(mutation_checksum(&mut full), before);
+        assert_eq!(db_file(&selective_path), db_file(&full_path));
+        drop(selective);
+        drop(full);
+        let mut selective = Database::open(&selective_path).unwrap();
+        let mut full = Database::open(&full_path).unwrap();
+        assert_eq!(mutation_checksum(&mut selective), before);
+        assert_eq!(mutation_checksum(&mut full), before);
+        let retry = mutation_checksum_after_delete(&mut selective);
+        assert_eq!(retry, mutation_checksum_after_delete(&mut full));
+        println!(
+            "milestone29 workload=rollback rows={rows} selective_us={selective_us} full_us={full_us} wal_bytes={} checksum={before} retry_checksum={retry}",
+            selective_phases.wal_bytes,
+        );
+    }
+
+    fn copied_profile_rollback(
+        base: &std::path::Path,
+        label: &str,
+    ) -> (crate::test_dir::TestDir, std::path::PathBuf, Database) {
+        let (dir, db) = copied_profile_db(base, label);
+        let path = dir.join("db");
+        (dir, path, db)
+    }
+
+    fn mutation_checksum_after_delete(db: &mut Database) -> i64 {
+        change_count(db, "DELETE FROM users WHERE id = 1;");
+        mutation_checksum(db)
     }
 }

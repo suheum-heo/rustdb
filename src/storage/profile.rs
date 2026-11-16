@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Profile {
     pub compare: Duration,
+    /// Building the table image, or auditing memory when that image is skipped.
+    pub prepare: Duration,
     pub apply: Duration,
     pub wal_write: Duration,
     pub wal_sync: Duration,
@@ -33,6 +35,7 @@ thread_local! {
     static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DATA: std::cell::Cell<Profile> = const { std::cell::Cell::new(Profile {
         compare: Duration::ZERO,
+        prepare: Duration::ZERO,
         apply: Duration::ZERO,
         wal_write: Duration::ZERO,
         wal_sync: Duration::ZERO,
@@ -61,6 +64,10 @@ pub(crate) fn start() -> Option<Instant> {
 
 pub(crate) fn add_compare(mark: Option<Instant>) {
     add(|profile| &mut profile.compare, mark);
+}
+
+pub(crate) fn add_prepare(mark: Option<Instant>) {
+    add(|profile| &mut profile.prepare, mark);
 }
 
 pub(crate) fn add_apply(mark: Option<Instant>) {

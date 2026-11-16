@@ -292,6 +292,19 @@ impl Table {
         Ok(())
     }
 
+    /// Check every in-memory row the way a full publish does, without cloning it.
+    ///
+    /// [`Self::audit`] is the check a selective `UPDATE` uses. `DELETE` also
+    /// rejects a survivor that does not fit in one record, which is what
+    /// `validate` did on the table image. Neither check encodes the row.
+    pub(crate) fn audit_for_publish(&self) -> Result<(), DbError> {
+        self.audit()?;
+        for values in &self.rows {
+            ensure_record_fits(values)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn row_ids(&self) -> &[u64] {
         &self.row_ids
     }

@@ -31,6 +31,16 @@ pub(crate) struct IndexImage {
     pub column: String,
 }
 
+/// Borrowed rows of one table.
+///
+/// `DELETE` publish uses this so a no-match can compare stored records without
+/// cloning the values into a [`TableImage`]. A real delete does not include
+/// the table it is unlinking: those survivors are not value-compared.
+pub(crate) struct MemoryRows<'a> {
+    pub name: &'a str,
+    pub rows: &'a [Vec<Value>],
+}
+
 /// One table, in the order its rows should be stored.
 #[derive(Clone, Debug)]
 pub(crate) struct TableImage {
@@ -262,7 +272,9 @@ impl Store {
         let mut ordered: Vec<&TableImage> = tables.iter().collect();
         ordered.sort_by(|left, right| left.name.cmp(&right.name));
         validate(&ordered).map_err(StepError::BeforeCommit)?;
+        let prepare = profile::start();
         let owned: Vec<TableImage> = ordered.into_iter().cloned().collect();
+        profile::add_prepare(prepare);
         let base_commit = self.state.commit_id;
         let nonce = self.state.nonce;
         let apply_mark = profile::start();
@@ -302,6 +314,46 @@ impl Store {
         let apply_mark = profile::start();
         let prepared = Editor::new(self.state.clone())
             .rewrite_changes(&mut self.pager, table, changes)
+            .map_err(StepError::BeforeCommit)?;
+        profile::add_apply(apply_mark);
+        self.commit_prepared(prepared, nonce, base_commit)
+    }
+
+    /// Row ids stored for `table`, in insertion order.
+    pub(crate) fn stored_row_ids(&self, table: &str) -> Option<&[u64]> {
+        self.state
+            .tables
+            .get(table)
+            .map(|live| live.row_ids.as_slice())
+    }
+
+    /// Row-id counter stored for `table`.
+    pub(crate) fn stored_next_row_id(&self, table: &str) -> Option<u64> {
+        self.state.tables.get(table).map(|live| live.next_row_id)
+    }
+
+    /// Unlink `deleted` row ids and compare `scans` without a table image.
+    ///
+    /// `deleted` is the original id set, not a position in the compacted
+    /// vector. The editor removes those stored rows from the high index down
+    /// and drops their index postings. `next_row_id` is not changed. An empty
+    /// set writes a log only when a scanned row differs from memory. The page
+    /// format and the WAL record are the ones `publish_indexes` already uses.
+    pub(crate) fn publish_deletes(
+        &mut self,
+        table: &str,
+        deleted: &[u64],
+        scans: &[MemoryRows<'_>],
+        indexes: &[IndexImage],
+    ) -> Result<(), StepError> {
+        if let Some(error) = &self.fence {
+            return Err(StepError::AfterCommit(error.clone()));
+        }
+        let base_commit = self.state.commit_id;
+        let nonce = self.state.nonce;
+        let apply_mark = profile::start();
+        let prepared = Editor::new(self.state.clone())
+            .unlink_deleted(&mut self.pager, table, deleted, scans, indexes)
             .map_err(StepError::BeforeCommit)?;
         profile::add_apply(apply_mark);
         self.commit_prepared(prepared, nonce, base_commit)

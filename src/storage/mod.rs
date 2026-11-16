@@ -25,7 +25,15 @@ pub(crate) use profile::{enable as enable_phases, reset as reset_phases, take as
 #[cfg(test)]
 pub(crate) use record::{NULL_LINK, StoredRecord, encode_record};
 pub(crate) use record::{decode_catalog, decode_index, decode_record, ensure_record_fits};
-pub(crate) use store::{IndexImage, Store, TableImage};
+pub(crate) use store::{IndexImage, MemoryRows, Store, TableImage};
+
+pub(crate) fn publish_timer() -> Option<std::time::Instant> {
+    profile::start()
+}
+
+pub(crate) fn add_publish_prepare(mark: Option<std::time::Instant>) {
+    profile::add_prepare(mark);
+}
 #[cfg(test)]
 pub(crate) use wal::Inject;
 pub(crate) use wal::{LogClass, StepError, classify_log};
