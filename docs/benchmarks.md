@@ -1348,3 +1348,51 @@ Deleting every row is 1,396,383 µs versus 1,383,504 µs. Both write 12,275,496 
 At 100 rows the warm deletes sit inside the WAL, about 10–12 ms, and the image clone is a few microseconds. A miss is 30 µs versus 38 µs and compares all 100 rows. At 1,000 rows a miss is 387 µs versus 396 µs. A one-row delete is 12,066 µs versus 12,957 µs with the same 28,796 WAL bytes. At 10,000 rows a miss is 1,460 µs versus 2,102 µs. A one-row delete is 11,783 µs versus 12,086 µs with the same 28,796 WAL bytes. Deleting half of 10,000 rows is 47,323 µs versus 194,636 µs with the same 758,596 WAL bytes. Deleting every row at 10,000 is 61,803 µs versus 61,917 µs with the same 1,205,496 WAL bytes.
 
 The selective path removes the survivor-image clone and the repeated keep-set scan. It does not reduce WAL bytes when the same pages are dirty. A miss still decodes every stored row. Deleting every row still unlinks every row. `INSERT` still snapshots the table. Peak RSS was not measured, so this run does not claim a smaller process.
+
+## Milestone 30 batched DELETE unlinking
+
+16 Nov 2026, Apple M5, 17179869184 bytes of memory, rustc 1.100.0. The ignored test is `profile_milestone30`. It copies one database per size and runs the batched unlink against the Milestone 29 per-row loop. Both sides use the same deleted-id list, the same undo journal, and the same page-image WAL. Samples are 6 below 100,000 rows and 3 at 100,000 for a miss, a one-row delete, a ten-row delete, and a duplicate-key delete. Cold is the first sample. Warm is the median of the rest. Deleting half the rows, every row, one row after an indexed key change, one wide text value, and the precommit failure are one sample each. Injected errors are not a power-loss test.
+
+`id_bytes` is the deleted row-id list, `count * 8`. `temp_bytes` for two or more deleted rows is `rows * 17 + count * 32`: a one-byte mark per stored row, 16 bytes of cloned id and link, and 32 bytes of key scratch per deleted row for two indexes. A miss and a one-row delete do not clone those chains, so their estimate is `count * 32` (0 for a miss, 32 for one row). It does not include the next-survivor index, a decoded value after its key is taken, allocator slack, or process RSS. `batched_postings` is the number of index pairs removed in one leaf rewrite. `singles` is the number removed by the single-entry delete. Their sum is `count` times the number of indexes that store a key for that row. The per-row path reports every posting as a single. One deleted row uses that path.
+
+The sealed database matched on every workload: same WAL bytes, same heap, index, and frame counts, and same checksum. Those durable figures are the Milestone 29 numbers.
+
+| Rows | Workload | Id bytes | Temp bytes | WAL bytes | Heap | Index | Frames | Checksum |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100,000 | miss | 0 | 0 | 0 | 0 | 0 | 0 | 5,001,088,890 |
+| 100,000 | one | 8 | 32 | 36,996 | 1 | 6 | 9 | 5,001,088,887 |
+| 100,000 | ten | 80 | 1,700,320 | 94,396 | 1 | 20 | 23 | 5,001,088,770 |
+| 100,000 | duplicates | 80,000 | 2,020,000 | 7,749,096 | 1,407 | 403 | 1,890 | 4,501,070,001 |
+| 100,000 | half | 400,000 | 3,300,000 | 6,314,096 | 1 | 42 | 1,540 | 3,750,550,000 |
+| 100,000 | all | 800,000 | 4,900,000 | 12,275,496 | 0 | 1 | 2,994 | 0 |
+| 100,000 | updated | 8 | 32 | 45,196 | 1 | 7 | 11 | 5,001,088,887 |
+| 100,000 | wide | 8 | 32 | 61,596 | 1 | 8 | 15 | 5,001,088,887 |
+| 100,000 | rollback | 8 | — | 0 durable | 0 | 0 | 0 | 5,001,088,890 restored |
+
+Rollback's encoded log was not a synced commit. The retry checksum is 5,001,088,885, the same one-row result as Milestone 29.
+
+Warm latency, batched unlink then the per-row loop, in microseconds. `heap` is slot removal, link repair, the catalog head, and releasing empty pages. `index` is posting removal. `publish` is the whole editor, including those two and sealing dirty pages. `compare` is the stored-row decode. A real delete compares nothing. A miss compares every row.
+
+| Rows | Workload | Batch | Per row | Heap | Per-row heap | Index | Per-row index | Publish | Per-row publish | Batched postings | Singles | WAL bytes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100,000 | miss | 16,112 | 16,130 | 0 | 0 | 0 | 0 | 12,917 | 13,191 | 0 | 0 | 0 |
+| 100,000 | one | 18,862 | 19,968 | 48 | 52 | 105 | 110 | 1,496 | 1,616 | 0 | 2 | 36,996 |
+| 100,000 | ten | 20,853 | 22,182 | 680 | 263 | 653 | 650 | 3,404 | 2,981 | 10 | 10 | 94,396 |
+| 100,000 | duplicates | 206,318 | 393,425 | 2,905 | 161,384 | 21,450 | 50,908 | 138,069 | 323,068 | 18,666 | 1,334 | 7,749,096 |
+| 100,000 | half | 395,651 | 1,152,486 | 17,759 | 782,024 | 248,161 | 232,694 | 337,589 | 1,092,107 | 34,786 | 65,214 | 6,314,096 |
+| 100,000 | all | 539,959 | 1,371,010 | 16,512 | 757,180 | 287,613 | 365,429 | 443,491 | 1,273,094 | 100,648 | 99,352 | 12,275,496 |
+| 100,000 | updated | 19,982 | 19,969 | 49 | 47 | 128 | 129 | 1,623 | 1,661 | 0 | 2 | 45,196 |
+| 100,000 | wide | 22,706 | 20,997 | 93 | 91 | 212 | 208 | 2,066 | 1,945 | 0 | 2 | 61,596 |
+| 100,000 | rollback | 13,427 | 13,612 | — | — | — | — | — | — | — | — | 0 durable |
+
+At 100,000 rows the per-row half delete spends 782,024 µs in the heap editor and 232,694 µs in the index. The heap time is the repeated `Vec::remove` on the id and link vectors and the scan of every remaining link inside each page-free check. The batched path does that work once: 17,759 µs. The index time stays 248,161 µs because 65,214 of the 100,000 postings still go through the single-entry delete. Those are the postings that would drop a leaf below its minimum, so each one still borrows or merges. Grouping the other 34,786 does not move the total. Publish falls from 1,092,107 µs to 337,589 µs. The statement falls from 1,152,486 µs to 395,651 µs. The log is still 6,314,096 bytes.
+
+Deleting 10,000 duplicate keys is the case the leaf group helps. 18,666 postings share a leaf and stay at the minimum, and 1,334 still delete one at a time. Index time falls from 50,908 µs to 21,450 µs. Heap time falls from 161,384 µs to 2,905 µs. Publish falls from 323,068 µs to 138,069 µs. Both logs are 7,749,096 bytes.
+
+Deleting every row falls from 1,371,010 µs to 539,959 µs. Heap time falls from 757,180 µs to 16,512 µs. Index time falls from 365,429 µs to 287,613 µs, with 99,352 postings still on the single-entry path because emptying a leaf merges it. The log stays 12,275,496 bytes.
+
+A miss is 16,112 µs on the batched path and 16,130 µs on the per-row path. It still decodes all 100,000 stored rows, about 8,504 µs, and writes no log. A one-row delete stays on the per-row unlink, so there is no chain clone and no grouped posting. It is 18,862 µs versus 19,968 µs, and the heap pass is 48 µs versus 52 µs. Both remove 2 postings one at a time. The log sync is about 12 ms on both. Ten rows are 20,853 µs versus 22,182 µs, both logs 94,396 bytes. The ten-row heap pass is 680 µs versus 263 µs: cloning both chains shows up before the repeated shifts dominate.
+
+At 10,000 rows a half delete is 46,248 µs versus 45,985 µs, and publish is 30,630 µs versus 31,509 µs. The per-row heap pass is 8,834 µs there, so the vector shift has not yet dominated. Deleting every row is 50,439 µs versus 63,027 µs. The duplicate-key delete is 30,788 µs versus 33,019 µs. A miss decodes all 10,000 rows and writes nothing. At 1,000 rows and at 100 rows the warm deletes sit inside the log sync, about 11–17 ms, on both paths.
+
+The batched path removes the repeated vector shift and the repeated free-page scan, and it rewrites a leaf once when several postings can leave without a borrow. One deleted row keeps the per-row unlink. The batched path does not reduce WAL bytes. It does not skip the no-match decode. A unique-key delete that empties leaves is still limited by one borrow or merge per posting. Peak RSS was not measured.

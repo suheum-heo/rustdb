@@ -38,7 +38,11 @@
 //! commit fails before the log sync. A `DELETE` saves each removed row's
 //! image and original position and puts that row back, with the same id, if
 //! the commit fails before the log sync. Publish unlinks those ids and does
-//! not clone the surviving values. A delete that matches nothing still audits
+//! not clone the surviving values. One deleted row keeps the per-row unlink.
+//! Two or more repair heap links in one descending pass. Index postings that
+//! share a leaf are removed together when the leaf
+//! stays at its minimum; a borrow or merge still deletes one posting at a
+//! time, and the sealed pages match that loop. A delete that matches nothing still audits
 //! memory and decodes the stored rows, and it writes no log when they already
 //! match. `INSERT` still snapshots the table.
 //! `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,

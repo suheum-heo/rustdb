@@ -11,6 +11,14 @@ pub(crate) struct Profile {
     /// Building the table image, or auditing memory when that image is skipped.
     pub prepare: Duration,
     pub apply: Duration,
+    /// Checking deleted ids against the stored row-id vector.
+    pub validate_ids: Duration,
+    /// Decoding deleted heap records, or the stored rows of a no-match.
+    pub decode: Duration,
+    /// Heap slot removal, link repair, catalog head, and empty-page release.
+    pub heap_edit: Duration,
+    /// Removing index postings for a delete.
+    pub index_edit: Duration,
     pub wal_write: Duration,
     pub wal_sync: Duration,
     pub db_write: Duration,
@@ -28,6 +36,12 @@ pub(crate) struct Profile {
     pub other_pages: u32,
     #[cfg_attr(not(test), allow(dead_code))]
     pub wal_bytes: u64,
+    /// Postings removed from a leaf in one rewrite.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub leaf_batches: u64,
+    /// Postings removed by the single-entry index delete.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub index_singles: u64,
 }
 
 #[cfg(test)]
@@ -37,6 +51,10 @@ thread_local! {
         compare: Duration::ZERO,
         prepare: Duration::ZERO,
         apply: Duration::ZERO,
+        validate_ids: Duration::ZERO,
+        decode: Duration::ZERO,
+        heap_edit: Duration::ZERO,
+        index_edit: Duration::ZERO,
         wal_write: Duration::ZERO,
         wal_sync: Duration::ZERO,
         db_write: Duration::ZERO,
@@ -48,6 +66,8 @@ thread_local! {
         index_pages: 0,
         other_pages: 0,
         wal_bytes: 0,
+        leaf_batches: 0,
+        index_singles: 0,
     }) };
 }
 
@@ -72,6 +92,48 @@ pub(crate) fn add_prepare(mark: Option<Instant>) {
 
 pub(crate) fn add_apply(mark: Option<Instant>) {
     add(|profile| &mut profile.apply, mark);
+}
+
+pub(crate) fn add_validate(mark: Option<Instant>) {
+    add(|profile| &mut profile.validate_ids, mark);
+}
+
+pub(crate) fn add_decode(mark: Option<Instant>) {
+    add(|profile| &mut profile.decode, mark);
+}
+
+pub(crate) fn add_heap_edit(mark: Option<Instant>) {
+    add(|profile| &mut profile.heap_edit, mark);
+}
+
+pub(crate) fn add_index_edit(mark: Option<Instant>) {
+    add(|profile| &mut profile.index_edit, mark);
+}
+
+pub(crate) fn note_leaf_batch(entries: u64) {
+    #[cfg(test)]
+    if ENABLED.with(std::cell::Cell::get) {
+        DATA.with(|data| {
+            let mut profile = data.get();
+            profile.leaf_batches = profile.leaf_batches.saturating_add(entries);
+            data.set(profile);
+        });
+    }
+    #[cfg(not(test))]
+    {
+        let _ = entries;
+    }
+}
+
+pub(crate) fn note_index_single() {
+    #[cfg(test)]
+    if ENABLED.with(std::cell::Cell::get) {
+        DATA.with(|data| {
+            let mut profile = data.get();
+            profile.index_singles = profile.index_singles.saturating_add(1);
+            data.set(profile);
+        });
+    }
 }
 
 pub(crate) fn add_wal_write(mark: Option<Instant>) {

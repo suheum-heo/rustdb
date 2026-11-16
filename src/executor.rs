@@ -21967,6 +21967,843 @@ mod tests {
         }
     }
 
+    fn seed_delete_db(
+        label: &str,
+        rows: i64,
+        seed: u64,
+    ) -> (crate::test_dir::TestDir, std::path::PathBuf) {
+        let dir = crate::test_dir::TestDir::new(label);
+        let path = dir.join("db");
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT, active BOOLEAN, bucket INT);")
+            .unwrap();
+        let wide = "w".repeat(80);
+        let mut start = 1_i64;
+        while start <= rows {
+            let end = (start + 199).min(rows);
+            let mut sql = String::from("INSERT INTO users VALUES ");
+            for id in start..=end {
+                if id > start {
+                    sql.push(',');
+                }
+                let mixed = seed.wrapping_add(u64::try_from(id).unwrap());
+                let name = if id % 11 == 0 {
+                    wide.clone()
+                } else {
+                    format!("n{id}")
+                };
+                let active = if id % 2 == 0 { "TRUE" } else { "FALSE" };
+                let bucket = if mixed % 5 == 0 {
+                    "NULL".to_string()
+                } else {
+                    format!("{}", mixed % 4)
+                };
+                sql.push_str(&format!("({id}, '{name}', {active}, {bucket})"));
+            }
+            sql.push(';');
+            db.execute(&sql).unwrap();
+            start = end + 1;
+        }
+        drop(db);
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_users_id ON users(id);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_bucket ON users(bucket);")
+            .unwrap();
+        drop(db);
+        (dir, path)
+    }
+
+    enum DeleteCut {
+        None,
+        Id(i64),
+        Below(i64),
+        Range(i64, i64),
+        Active(bool),
+        Bucket(i64),
+        BucketNull,
+        All,
+        Wide,
+    }
+
+    fn cut_removes(row: &[Value], cut: &DeleteCut, wide: &str) -> bool {
+        match cut {
+            DeleteCut::None => false,
+            DeleteCut::Id(id) => row[0] == Value::Integer(*id),
+            DeleteCut::Below(limit) => {
+                matches!(row[0], Value::Integer(id) if id < *limit)
+            }
+            DeleteCut::Range(low, high) => {
+                matches!(row[0], Value::Integer(id) if id >= *low && id < *high)
+            }
+            DeleteCut::Active(flag) => row[2] == Value::Boolean(*flag),
+            DeleteCut::Bucket(key) => row[3] == Value::Integer(*key),
+            DeleteCut::BucketNull => row[3] == Value::Null,
+            DeleteCut::All => true,
+            DeleteCut::Wide => row[1] == Value::Text(wide.to_string()),
+        }
+    }
+
+    enum UnlinkMode {
+        Batch,
+        PerRow,
+        FullImage,
+    }
+
+    fn apply_unlink(
+        src: &std::path::Path,
+        label: &str,
+        sql: &str,
+        mode: UnlinkMode,
+    ) -> (
+        crate::test_dir::TestDir,
+        std::path::PathBuf,
+        Database,
+        usize,
+    ) {
+        let (dir, path, mut db) = open_copy(src, label);
+        crate::storage::reset_phases();
+        let count = match mode {
+            UnlinkMode::Batch => change_count(&mut db, sql),
+            UnlinkMode::PerRow => {
+                let _guard = crate::storage::ForcePerRowUnlink::new();
+                change_count(&mut db, sql)
+            }
+            UnlinkMode::FullImage => {
+                let _guard = ForceFullDelete::new();
+                change_count(&mut db, sql)
+            }
+        };
+        (dir, path, db, count)
+    }
+
+    #[test]
+    fn batched_unlink_matches_per_row_unlink_and_reference() {
+        let _phases = crate::storage::enable_phases();
+        let wide = "w".repeat(80);
+        let plans = [
+            (0_i64, 0x3000_u64),
+            (1, 0x3001),
+            (8, 0x3008),
+            (64, 0x3040),
+            (256, 0x3100),
+            (1_024, 0x3400),
+            (10_000, 0x3a00),
+        ];
+        for (rows, seed) in plans {
+            let (_base_dir, base_path) =
+                seed_delete_db(&format!("m30-seed-{seed:x}-{rows}"), rows, seed);
+            let (_origin_dir, _, mut origin) = open_copy(&base_path, &format!("m30-origin-{rows}"));
+            let origin_rows = table_rows(&mut origin);
+            let origin_ids = origin.table("users").unwrap().row_ids().to_vec();
+            let origin_next = origin.table("users").unwrap().next_row_id();
+            assert_eq!(origin_ids.len(), usize::try_from(rows).unwrap());
+            assert_eq!(origin_next, u64::try_from(rows).unwrap() + 1);
+            drop(origin);
+
+            let mut cases = vec![
+                (
+                    "miss",
+                    "DELETE FROM users WHERE id = -1;".to_string(),
+                    DeleteCut::None,
+                ),
+                (
+                    "first",
+                    "DELETE FROM users WHERE id = 1;".to_string(),
+                    DeleteCut::Id(1),
+                ),
+                (
+                    "middle",
+                    format!("DELETE FROM users WHERE id = {};", (rows / 2).max(1)),
+                    DeleteCut::Id((rows / 2).max(1)),
+                ),
+                (
+                    "last",
+                    format!("DELETE FROM users WHERE id = {rows};"),
+                    DeleteCut::Id(rows),
+                ),
+                (
+                    "adjacent",
+                    "DELETE FROM users WHERE id >= 2 AND id < 6;".to_string(),
+                    DeleteCut::Range(2, 6),
+                ),
+                (
+                    "alternating",
+                    "DELETE FROM users WHERE active = TRUE;".to_string(),
+                    DeleteCut::Active(true),
+                ),
+                (
+                    "sparse",
+                    "DELETE FROM users WHERE bucket = 0;".to_string(),
+                    DeleteCut::Bucket(0),
+                ),
+                (
+                    "duplicates",
+                    "DELETE FROM users WHERE bucket = 1;".to_string(),
+                    DeleteCut::Bucket(1),
+                ),
+                (
+                    "nulls",
+                    "DELETE FROM users WHERE bucket IS NULL;".to_string(),
+                    DeleteCut::BucketNull,
+                ),
+                (
+                    "half",
+                    format!("DELETE FROM users WHERE id < {};", rows / 2),
+                    DeleteCut::Below(rows / 2),
+                ),
+                (
+                    "all",
+                    "DELETE FROM users WHERE TRUE OR id = 0;".to_string(),
+                    DeleteCut::All,
+                ),
+                (
+                    "wide",
+                    format!("DELETE FROM users WHERE name = '{wide}';"),
+                    DeleteCut::Wide,
+                ),
+            ];
+            if rows >= 10_000 {
+                cases.retain(|(label, _, _)| {
+                    matches!(
+                        *label,
+                        "miss" | "first" | "sparse" | "duplicates" | "half" | "all" | "wide"
+                    )
+                });
+            }
+            for (label, sql, cut) in &cases {
+                let kept_rows: Vec<_> = origin_rows
+                    .iter()
+                    .zip(&origin_ids)
+                    .filter(|(row, _)| !cut_removes(row, cut, &wide))
+                    .map(|(row, _)| row.clone())
+                    .collect();
+                let kept_ids: Vec<_> = origin_rows
+                    .iter()
+                    .zip(&origin_ids)
+                    .filter(|(row, _)| !cut_removes(row, cut, &wide))
+                    .map(|(_, id)| *id)
+                    .collect();
+                let removed = origin_ids.len() - kept_ids.len();
+                let (_batch_dir, batch_path, mut batch, batch_count) = apply_unlink(
+                    &base_path,
+                    &format!("m30-batch-{rows}-{label}"),
+                    sql,
+                    UnlinkMode::Batch,
+                );
+                let batch_phases = crate::storage::take_phases();
+                let (_row_dir, row_path, mut per_row, row_count) = apply_unlink(
+                    &base_path,
+                    &format!("m30-row-{rows}-{label}"),
+                    sql,
+                    UnlinkMode::PerRow,
+                );
+                let row_phases = crate::storage::take_phases();
+                let (_full_dir, full_path, mut full, full_count) = apply_unlink(
+                    &base_path,
+                    &format!("m30-full-{rows}-{label}"),
+                    sql,
+                    UnlinkMode::FullImage,
+                );
+                let full_phases = crate::storage::take_phases();
+                assert_eq!(batch_count, removed, "{rows} {label} seed {seed:#x}");
+                assert_eq!(row_count, removed, "{rows} {label}");
+                assert_eq!(full_count, removed, "{rows} {label}");
+                assert_eq!(crate::database::publish_images(), 1, "{rows} {label}");
+                assert_eq!(table_rows(&mut batch), kept_rows, "{rows} {label}");
+                assert_eq!(table_rows(&mut per_row), kept_rows, "{rows} {label}");
+                assert_eq!(table_rows(&mut full), kept_rows, "{rows} {label}");
+                assert_eq!(
+                    batch.table("users").unwrap().row_ids(),
+                    kept_ids.as_slice(),
+                    "{rows} {label}"
+                );
+                assert_eq!(
+                    per_row.table("users").unwrap().row_ids(),
+                    kept_ids.as_slice()
+                );
+                assert_eq!(batch.table("users").unwrap().next_row_id(), origin_next);
+                assert_eq!(per_row.table("users").unwrap().next_row_id(), origin_next);
+                assert_positions(batch.table("users").unwrap(), &kept_ids);
+                assert_eq!(
+                    index_postings(&mut batch, "idx_users_id"),
+                    reference_postings(&kept_rows, &kept_ids, 0),
+                    "{rows} {label}"
+                );
+                assert_eq!(
+                    index_postings(&mut batch, "idx_users_bucket"),
+                    reference_postings(&kept_rows, &kept_ids, 3),
+                    "{rows} {label}"
+                );
+                assert_eq!(
+                    index_postings(&mut per_row, "idx_users_id"),
+                    index_postings(&mut batch, "idx_users_id")
+                );
+                assert_eq!(
+                    index_postings(&mut full, "idx_users_bucket"),
+                    index_postings(&mut batch, "idx_users_bucket")
+                );
+                assert_eq!(
+                    batch_phases.wal_bytes, row_phases.wal_bytes,
+                    "{rows} {label}"
+                );
+                assert_eq!(
+                    batch_phases.wal_bytes, full_phases.wal_bytes,
+                    "{rows} {label}"
+                );
+                assert_eq!(
+                    batch_phases.heap_pages, row_phases.heap_pages,
+                    "{rows} {label}"
+                );
+                assert_eq!(
+                    batch_phases.index_pages, row_phases.index_pages,
+                    "{rows} {label}"
+                );
+                assert_eq!(batch_phases.frames, full_phases.frames, "{rows} {label}");
+                assert_eq!(
+                    batch_phases.row_compares, row_phases.row_compares,
+                    "{rows} {label}"
+                );
+                if removed == 0 {
+                    assert_eq!(batch_phases.wal_bytes, 0, "{rows} {label}");
+                    assert_eq!(
+                        batch_phases.row_compares,
+                        u64::try_from(rows).unwrap(),
+                        "{rows} {label}"
+                    );
+                } else {
+                    assert!(batch_phases.wal_bytes > 0, "{rows} {label}");
+                    assert_eq!(batch_phases.row_compares, 0, "{rows} {label}");
+                }
+                if rows >= 64 && *label == "half" {
+                    assert!(batch_phases.leaf_batches > 0, "{rows}");
+                    assert_eq!(row_phases.leaf_batches, 0, "{rows}");
+                }
+                assert_eq!(db_file(&batch_path), db_file(&row_path), "{rows} {label}");
+                assert_eq!(db_file(&batch_path), db_file(&full_path), "{rows} {label}");
+                assert_eq!(wal_len(&batch_path), 0, "{rows} {label}");
+                assert_checksums(&batch_path);
+                assert_eq!(
+                    mutation_checksum(&mut batch),
+                    mutation_checksum(&mut per_row),
+                    "{rows} {label}"
+                );
+            }
+
+            if rows == 64 {
+                let (_dir, path, mut db) = open_copy(&base_path, "m30-repeat");
+                let once = change_count(&mut db, "DELETE FROM users WHERE bucket = 1;");
+                let file = db_file(&path);
+                assert_eq!(
+                    change_count(&mut db, "DELETE FROM users WHERE bucket = 1;"),
+                    0
+                );
+                assert_eq!(db_file(&path), file);
+                assert!(once > 0);
+                db.execute("INSERT INTO users VALUES (100, 'Eve', TRUE, 1);")
+                    .unwrap();
+                assert_eq!(db.table("users").unwrap().next_row_id(), origin_next + 1);
+                assert!(!db.table("users").unwrap().row_ids().contains(&100));
+                let (_moved_dir, moved_path, mut moved) = open_copy(&base_path, "m30-moved");
+                let relocated = "w".repeat(3_200);
+                moved
+                    .execute(&format!(
+                        "UPDATE users SET name = '{relocated}' WHERE id = 4;"
+                    ))
+                    .unwrap();
+                drop(moved);
+                let sql = format!("DELETE FROM users WHERE name = '{relocated}';");
+                let (_batch_dir, batch_path, mut batch, batch_count) =
+                    apply_unlink(&moved_path, "m30-moved-batch", &sql, UnlinkMode::Batch);
+                let (_row_dir, row_path, mut per_row, row_count) =
+                    apply_unlink(&moved_path, "m30-moved-row", &sql, UnlinkMode::PerRow);
+                assert_eq!(batch_count, 1);
+                assert_eq!(row_count, 1);
+                assert_eq!(db_file(&batch_path), db_file(&row_path));
+                assert_eq!(table_rows(&mut batch), table_rows(&mut per_row));
+                let (_rekey_dir, rekey_path, mut rekey) = open_copy(&base_path, "m30-rekey");
+                rekey
+                    .execute("UPDATE users SET id = 400 WHERE id = 7;")
+                    .unwrap();
+                drop(rekey);
+                let (_batch_dir, batch_path, batch, _) = apply_unlink(
+                    &rekey_path,
+                    "m30-rekey-batch",
+                    "DELETE FROM users WHERE id = 400;",
+                    UnlinkMode::Batch,
+                );
+                let (_row_dir, row_path, per_row, _) = apply_unlink(
+                    &rekey_path,
+                    "m30-rekey-row",
+                    "DELETE FROM users WHERE id = 400;",
+                    UnlinkMode::PerRow,
+                );
+                assert_eq!(db_file(&batch_path), db_file(&row_path));
+                assert_eq!(batch.table("users").unwrap().next_row_id(), origin_next);
+                assert_eq!(per_row.table("users").unwrap().next_row_id(), origin_next);
+                for inject in [
+                    crate::storage::Inject::BeforeLogSync,
+                    crate::storage::Inject::AfterLogSync,
+                    crate::storage::Inject::CommitSyncFailed,
+                    crate::storage::Inject::DuringCheckpoint(1),
+                ] {
+                    let (_batch_dir, batch_path, mut batch) =
+                        open_copy(&base_path, "m30-inject-batch");
+                    let (_row_dir, row_path, mut per_row) = open_copy(&base_path, "m30-inject-row");
+                    batch.set_inject(inject);
+                    per_row.set_inject(inject);
+                    let batch_error = batch
+                        .execute("DELETE FROM users WHERE id < 32;")
+                        .unwrap_err()
+                        .to_string();
+                    let row_error = {
+                        let _guard = crate::storage::ForcePerRowUnlink::new();
+                        per_row
+                            .execute("DELETE FROM users WHERE id < 32;")
+                            .unwrap_err()
+                            .to_string()
+                    };
+                    assert_eq!(batch_error, row_error, "{inject:?}");
+                    drop(batch);
+                    drop(per_row);
+                    let mut batch = Database::open(&batch_path).unwrap();
+                    let mut per_row = Database::open(&row_path).unwrap();
+                    assert_eq!(
+                        table_rows(&mut batch),
+                        table_rows(&mut per_row),
+                        "{inject:?}"
+                    );
+                    assert_eq!(
+                        index_postings(&mut batch, "idx_users_id"),
+                        index_postings(&mut per_row, "idx_users_id"),
+                        "{inject:?}"
+                    );
+                    assert_eq!(db_file(&batch_path), db_file(&row_path), "{inject:?}");
+                    assert_checksums(&batch_path);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_late_missing_posting_does_not_publish_a_grouped_prefix() {
+        let (dir, mut db) = open_mutation("m30-late-missing");
+        let path = dir.join("db");
+        let rows = table_rows(&mut db);
+        db.drop_root_leaf_entry("idx_users_id", 0).unwrap();
+        let damaged = index_postings(&mut db, "idx_users_id");
+        assert_eq!(damaged.len(), 3, "{damaged:?}");
+        let before = db_file(&path);
+        let error = db
+            .execute("DELETE FROM users WHERE id = 1 OR id = 4;")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("index entry is missing"), "{error}");
+        assert!(!error.contains("rows deleted"), "{error}");
+        assert!(!error.contains("outcome is unknown"), "{error}");
+        assert_eq!(table_rows(&mut db), rows);
+        assert_eq!(index_postings(&mut db, "idx_users_id"), damaged);
+        assert_eq!(db_file(&path), before);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut db), rows);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut db), rows);
+        assert!(index_postings(&mut db, "idx_users_id").len() > damaged.len());
+        assert_eq!(change_count(&mut db, "DELETE FROM users WHERE id = 4;"), 1);
+    }
+
+    #[test]
+    fn grouped_fallback_and_multipage_deletes_share_wal_boundaries() {
+        let (_dir, base) = seed_delete_db("m30-bounds", 400, 0x3c00);
+        let statements = [
+            ("one", "DELETE FROM users WHERE id = 1;"),
+            ("grouped", "DELETE FROM users WHERE id > 390;"),
+            ("fallback", "DELETE FROM users WHERE id > 0 AND id <= 3;"),
+            ("mixed", "DELETE FROM users WHERE id > 370;"),
+            ("all", "DELETE FROM users WHERE TRUE OR id = 0;"),
+            ("half", "DELETE FROM users WHERE id < 200;"),
+        ];
+        let _phases = crate::storage::enable_phases();
+        for (label, sql) in statements {
+            let (_batch_dir, batch_path, mut batch) = open_copy(&base, &format!("m30-{label}-b"));
+            let (_row_dir, row_path, mut per_row) = open_copy(&base, &format!("m30-{label}-r"));
+            let origin_next = batch.table("users").unwrap().next_row_id();
+            crate::storage::reset_phases();
+            batch.execute(sql).unwrap();
+            let batch_phases = crate::storage::take_phases();
+            {
+                let _guard = crate::storage::ForcePerRowUnlink::new();
+                per_row.execute(sql).unwrap();
+            }
+            assert_eq!(db_file(&batch_path), db_file(&row_path), "{label}");
+            assert_eq!(wal_len(&batch_path), wal_len(&row_path), "{label}");
+            assert_eq!(table_rows(&mut batch), table_rows(&mut per_row), "{label}");
+            assert_eq!(
+                batch.table("users").unwrap().row_ids(),
+                per_row.table("users").unwrap().row_ids(),
+                "{label}"
+            );
+            assert_eq!(
+                batch.table("users").unwrap().next_row_id(),
+                origin_next,
+                "{label}"
+            );
+            assert_eq!(
+                index_postings(&mut batch, "idx_users_id"),
+                index_postings(&mut per_row, "idx_users_id"),
+                "{label}"
+            );
+            let rows = table_rows(&mut batch);
+            let ids = batch.table("users").unwrap().row_ids().to_vec();
+            assert_eq!(
+                index_postings(&mut batch, "idx_users_id"),
+                reference_postings(&rows, &ids, 0),
+                "{label}"
+            );
+            assert_eq!(
+                index_postings(&mut batch, "idx_users_bucket"),
+                reference_postings(&rows, &ids, 3),
+                "{label}"
+            );
+            assert_checksums(&batch_path);
+            match label {
+                "one" => {
+                    assert_eq!(batch_phases.leaf_batches, 0, "{label}");
+                    assert!(batch_phases.index_singles >= 1, "{label}");
+                }
+                "grouped" => assert!(batch_phases.leaf_batches > 0, "{label}"),
+                "fallback" => assert!(
+                    batch_phases.index_singles > 0,
+                    "{label} singles {} batches {}",
+                    batch_phases.index_singles,
+                    batch_phases.leaf_batches
+                ),
+                "mixed" | "all" => {
+                    assert!(batch_phases.leaf_batches > 0, "{label}");
+                    assert!(batch_phases.index_singles > 0, "{label}");
+                }
+                "half" => assert!(batch_phases.index_singles > 0, "{label}"),
+                _ => {}
+            }
+            drop(batch);
+            drop(per_row);
+            let mut again = Database::open(&batch_path).unwrap();
+            let once = table_rows(&mut again);
+            drop(again);
+            let mut twice = Database::open(&batch_path).unwrap();
+            assert_eq!(table_rows(&mut twice), once, "{label}");
+        }
+        for (label, sql) in statements {
+            assert_precommit(
+                &base,
+                &format!("m30-pre-{label}"),
+                sql,
+                crate::storage::Inject::BeforeLogSync,
+            );
+            for inject in [
+                crate::storage::Inject::AfterLogSync,
+                crate::storage::Inject::CommitSyncFailed,
+                crate::storage::Inject::DuringCheckpoint(1),
+            ] {
+                assert_postcommit(&base, &format!("m30-post-{label}-{inject:?}"), sql, inject);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release profile of batched DELETE unlinking"]
+    fn profile_milestone30() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone30 cpu={cpu} mem_bytes={mem} rustc={rustc} value_bytes={} vec_bytes={} usize_bytes={}",
+            std::mem::size_of::<Value>(),
+            std::mem::size_of::<Vec<Value>>(),
+            std::mem::size_of::<usize>()
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            let (base_dir, base) = open_profile_db("m30-base", rows);
+            let base_path = base_dir.join("db");
+            drop(base);
+            for workload in [
+                "miss",
+                "one",
+                "ten",
+                "duplicates",
+                "half",
+                "all",
+                "updated",
+                "wide",
+                "rollback",
+            ] {
+                profile_batched_unlink(&base_path, rows, workload);
+            }
+        }
+    }
+
+    fn profile_batched_unlink(base: &std::path::Path, rows: i64, workload: &str) {
+        if workload == "rollback" {
+            let (_batch_dir, batch_path, mut batch) = copied_profile_rollback(base, "m30-roll-b");
+            let (_row_dir, row_path, mut per_row) = copied_profile_rollback(base, "m30-roll-r");
+            let before = mutation_checksum(&mut batch);
+            assert_eq!(before, mutation_checksum(&mut per_row));
+            let sql = "DELETE FROM users WHERE id = 1;";
+            crate::storage::reset_phases();
+            batch.set_inject(crate::storage::Inject::BeforeLogSync);
+            let started = std::time::Instant::now();
+            let error = batch.execute(sql).unwrap_err();
+            let batch_us = started.elapsed().as_micros();
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected failure before the redo log was synced"),
+                "{error}"
+            );
+            per_row.set_inject(crate::storage::Inject::BeforeLogSync);
+            let started = std::time::Instant::now();
+            let error = {
+                let _guard = crate::storage::ForcePerRowUnlink::new();
+                per_row.execute(sql).unwrap_err()
+            };
+            let row_us = started.elapsed().as_micros();
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected failure before the redo log was synced"),
+                "{error}"
+            );
+            assert_eq!(mutation_checksum(&mut batch), before);
+            assert_eq!(mutation_checksum(&mut per_row), before);
+            assert_eq!(db_file(&batch_path), db_file(&row_path));
+            drop(batch);
+            drop(per_row);
+            let mut batch = Database::open(&batch_path).unwrap();
+            let retry = mutation_checksum_after_delete(&mut batch);
+            println!(
+                "milestone30 workload=rollback rows={rows} batch_us={batch_us} per_row_us={row_us} checksum={before} retry_checksum={retry}"
+            );
+            return;
+        }
+        let (_batch_dir, mut batch) = copied_profile_db(base, "m30-batch");
+        let (_row_dir, mut per_row) = copied_profile_db(base, "m30-row");
+        prepare_delete(&mut batch, workload);
+        prepare_delete(&mut per_row, workload);
+        let sql = delete_sample(workload, rows, 0);
+        crate::storage::reset_phases();
+        let batch_count = change_count(&mut batch, &sql);
+        let batch_note = mutation_note();
+        let batch_phases = crate::storage::take_phases();
+        crate::storage::reset_phases();
+        let row_count = {
+            let _guard = crate::storage::ForcePerRowUnlink::new();
+            change_count(&mut per_row, &sql)
+        };
+        let row_phases = crate::storage::take_phases();
+        assert_eq!(batch_count, row_count, "{workload}");
+        assert_eq!(crate::database::publish_images(), 0, "{workload}");
+        assert!(!batch_note.undo_snapshot, "{workload}");
+        let checksum = mutation_checksum(&mut batch);
+        assert_eq!(checksum, mutation_checksum(&mut per_row), "{workload}");
+        assert_eq!(batch_phases.wal_bytes, row_phases.wal_bytes, "{workload}");
+        assert_eq!(batch_phases.heap_pages, row_phases.heap_pages, "{workload}");
+        assert_eq!(
+            batch_phases.index_pages, row_phases.index_pages,
+            "{workload}"
+        );
+        assert_eq!(batch_phases.frames, row_phases.frames, "{workload}");
+        assert_eq!(
+            batch_phases.row_compares, row_phases.row_compares,
+            "{workload}"
+        );
+        if workload == "miss" {
+            assert_eq!(batch_phases.wal_bytes, 0);
+            assert_eq!(batch_phases.row_compares, u64::try_from(rows).unwrap());
+            assert_eq!(batch_count, 0);
+        } else {
+            assert_eq!(batch_phases.row_compares, 0, "{workload}");
+            assert!(batch_phases.wal_bytes > 0, "{workload}");
+        }
+        if workload == "one" {
+            assert_eq!(batch_phases.leaf_batches, 0, "{workload}");
+            assert_eq!(
+                batch_phases.index_singles, row_phases.index_singles,
+                "{workload}"
+            );
+        }
+        if rows >= 1_000 && matches!(workload, "duplicates" | "half" | "all" | "ten") {
+            assert!(
+                batch_phases.leaf_batches > 0,
+                "{workload} batches {}",
+                batch_phases.leaf_batches
+            );
+            assert_eq!(row_phases.leaf_batches, 0, "{workload}");
+        }
+        let samples = if delete_is_repeatable(workload) {
+            if rows >= 100_000 { 3 } else { 6 }
+        } else {
+            1
+        };
+        let (_timed_batch_dir, mut timed_batch) = copied_profile_db(base, "m30-time-b");
+        let (_timed_row_dir, mut timed_row) = copied_profile_db(base, "m30-time-r");
+        prepare_delete(&mut timed_batch, workload);
+        prepare_delete(&mut timed_row, workload);
+        let statements: Vec<String> = (0..samples)
+            .map(|sample| delete_sample(workload, rows, sample))
+            .collect();
+        let batch_time = time_unlink(&mut timed_batch, &statements, false);
+        let row_time = time_unlink(&mut timed_row, &statements, true);
+        assert_eq!(batch_time.wal_bytes, row_time.wal_bytes, "{workload}");
+        assert_eq!(batch_time.heap_pages, row_time.heap_pages, "{workload}");
+        assert_eq!(batch_time.index_pages, row_time.index_pages, "{workload}");
+        assert_eq!(batch_time.frames, row_time.frames, "{workload}");
+        let survivors = u64::try_from(rows).unwrap() - u64::try_from(batch_count).unwrap();
+        let id_bytes = u64::try_from(batch_count).unwrap().saturating_mul(8);
+        // One row does not clone the heap chains. The 32 bytes per deleted
+        // row are the two index keys. Larger deletes also mark every row and
+        // clone both id and link vectors.
+        let temp_bytes = if batch_count <= 1 {
+            id_bytes.saturating_mul(4)
+        } else {
+            u64::try_from(rows).unwrap().saturating_mul(1 + 16) + id_bytes.saturating_mul(4)
+        };
+        println!(
+            "milestone30 workload={workload} rows={rows} count={batch_count} id_bytes={id_bytes} temp_bytes={temp_bytes} survivors={survivors} batch_cold_us={} batch_warm_us={} per_row_cold_us={} per_row_warm_us={} batch_validate_us={} per_row_validate_us={} batch_decode_us={} per_row_decode_us={} batch_heap_us={} per_row_heap_us={} batch_index_us={} per_row_index_us={} batch_publish_us={} per_row_publish_us={} batch_compare_us={} per_row_compare_us={} batch_wal_us={} per_row_wal_us={} leaf_batches={} index_singles={} per_row_singles={} compares={} wal_bytes={} heap_pages={} index_pages={} frames={} checksum={checksum}",
+            batch_time.cold,
+            batch_time.warm,
+            row_time.cold,
+            row_time.warm,
+            batch_time.validate_us,
+            row_time.validate_us,
+            batch_time.decode_us,
+            row_time.decode_us,
+            batch_time.heap_us,
+            row_time.heap_us,
+            batch_time.index_us,
+            row_time.index_us,
+            batch_time.publish_us,
+            row_time.publish_us,
+            batch_time.compare_us,
+            row_time.compare_us,
+            batch_time.wal_us,
+            row_time.wal_us,
+            batch_time.leaf_batches,
+            batch_time.index_singles,
+            row_time.index_singles,
+            batch_time.compares,
+            batch_time.wal_bytes,
+            batch_time.heap_pages,
+            batch_time.index_pages,
+            batch_time.frames,
+        );
+    }
+
+    struct TimedUnlink {
+        cold: u128,
+        warm: u128,
+        validate_us: u128,
+        decode_us: u128,
+        heap_us: u128,
+        index_us: u128,
+        publish_us: u128,
+        compare_us: u128,
+        wal_us: u128,
+        compares: u64,
+        leaf_batches: u64,
+        index_singles: u64,
+        wal_bytes: u64,
+        heap_pages: u32,
+        index_pages: u32,
+        frames: u32,
+    }
+
+    fn time_unlink(db: &mut Database, statements: &[String], per_row: bool) -> TimedUnlink {
+        let mut totals = Vec::with_capacity(statements.len());
+        let mut validate = Vec::with_capacity(statements.len());
+        let mut decode = Vec::with_capacity(statements.len());
+        let mut heap = Vec::with_capacity(statements.len());
+        let mut index = Vec::with_capacity(statements.len());
+        let mut publish = Vec::with_capacity(statements.len());
+        let mut compare = Vec::with_capacity(statements.len());
+        let mut wal = Vec::with_capacity(statements.len());
+        let mut compares = Vec::with_capacity(statements.len());
+        let mut batches = Vec::with_capacity(statements.len());
+        let mut singles = Vec::with_capacity(statements.len());
+        let mut wal_bytes = Vec::with_capacity(statements.len());
+        let mut heap_pages = Vec::with_capacity(statements.len());
+        let mut index_pages = Vec::with_capacity(statements.len());
+        let mut frames = Vec::with_capacity(statements.len());
+        for statement in statements {
+            crate::storage::reset_phases();
+            let started = std::time::Instant::now();
+            if per_row {
+                let _guard = crate::storage::ForcePerRowUnlink::new();
+                db.execute(statement).unwrap();
+            } else {
+                db.execute(statement).unwrap();
+            }
+            totals.push(started.elapsed().as_micros());
+            let taken = crate::storage::take_phases();
+            validate.push(taken.validate_ids.as_micros());
+            decode.push(taken.decode.as_micros());
+            heap.push(taken.heap_edit.as_micros());
+            index.push(taken.index_edit.as_micros());
+            publish.push(taken.apply.as_micros());
+            compare.push(taken.compare.as_micros());
+            wal.push(
+                (taken.wal_write
+                    + taken.wal_sync
+                    + taken.db_write
+                    + taken.db_sync
+                    + taken.wal_clear)
+                    .as_micros(),
+            );
+            compares.push(taken.row_compares);
+            batches.push(taken.leaf_batches);
+            singles.push(taken.index_singles);
+            wal_bytes.push(taken.wal_bytes);
+            heap_pages.push(taken.heap_pages);
+            index_pages.push(taken.index_pages);
+            frames.push(taken.frames);
+        }
+        let warm = |values: &[u128]| {
+            if values.len() == 1 {
+                values[0]
+            } else {
+                median(&values[1..])
+            }
+        };
+        let warm_u64 = |values: &[u64]| {
+            if values.len() == 1 {
+                values[0]
+            } else {
+                median_u64(&values[1..])
+            }
+        };
+        TimedUnlink {
+            cold: totals[0],
+            warm: warm(&totals),
+            validate_us: warm(&validate),
+            decode_us: warm(&decode),
+            heap_us: warm(&heap),
+            index_us: warm(&index),
+            publish_us: warm(&publish),
+            compare_us: warm(&compare),
+            wal_us: warm(&wal),
+            compares: warm_u64(&compares),
+            leaf_batches: batches[batches.len() - 1],
+            index_singles: singles[singles.len() - 1],
+            wal_bytes: warm_u64(&wal_bytes),
+            heap_pages: heap_pages[heap_pages.len() - 1],
+            index_pages: index_pages[index_pages.len() - 1],
+            frames: frames[frames.len() - 1],
+        }
+    }
+
     #[test]
     #[ignore = "release profile of selective DELETE publication"]
     fn profile_milestone29() {
