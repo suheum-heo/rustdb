@@ -162,6 +162,18 @@ impl Store {
             .ok_or_else(|| DbError::Storage("database file is corrupt".to_string()))
     }
 
+    /// Height and reachable page count of one index. Height 0 is an empty tree.
+    #[cfg(test)]
+    pub(crate) fn index_shape(&mut self, name: &str) -> Result<(u32, usize), DbError> {
+        let root = self.index_root(name)?;
+        let mut nodes = PagerNodes {
+            pager: &mut self.pager,
+        };
+        let height = btree::height(&mut nodes, root)?;
+        let pages = btree::owned_pages(&mut nodes, root)?.len();
+        Ok((height, pages))
+    }
+
     pub(crate) fn read_index_equal(
         &mut self,
         root: u32,

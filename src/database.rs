@@ -909,6 +909,15 @@ impl Database {
         Ok((root, entries))
     }
 
+    /// Height and reachable page count of one stored index.
+    #[cfg(test)]
+    pub(crate) fn index_shape(&mut self, index: &str) -> Result<(u32, usize), DbError> {
+        self.store
+            .as_mut()
+            .ok_or_else(|| DbError::Internal("index scan requires a database file".to_string()))?
+            .index_shape(index)
+    }
+
     /// Minimum and maximum keys stored in `index`, or `None` when the tree is empty.
     pub(crate) fn index_key_span(&mut self, index: &str) -> Result<Option<(i64, i64)>, DbError> {
         self.store

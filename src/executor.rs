@@ -22245,22 +22245,24 @@ mod tests {
                     index_postings(&mut batch, "idx_users_bucket")
                 );
                 assert_eq!(
-                    batch_phases.wal_bytes, row_phases.wal_bytes,
-                    "{rows} {label}"
-                );
-                assert_eq!(
-                    batch_phases.wal_bytes, full_phases.wal_bytes,
-                    "{rows} {label}"
-                );
-                assert_eq!(
                     batch_phases.heap_pages, row_phases.heap_pages,
                     "{rows} {label}"
                 );
-                assert_eq!(
-                    batch_phases.index_pages, row_phases.index_pages,
-                    "{rows} {label}"
-                );
-                assert_eq!(batch_phases.frames, full_phases.frames, "{rows} {label}");
+                if batch_phases.bulk_spans == 0 {
+                    assert_eq!(
+                        batch_phases.wal_bytes, row_phases.wal_bytes,
+                        "{rows} {label}"
+                    );
+                    assert_eq!(
+                        batch_phases.wal_bytes, full_phases.wal_bytes,
+                        "{rows} {label}"
+                    );
+                    assert_eq!(
+                        batch_phases.index_pages, row_phases.index_pages,
+                        "{rows} {label}"
+                    );
+                    assert_eq!(batch_phases.frames, full_phases.frames, "{rows} {label}");
+                }
                 assert_eq!(
                     batch_phases.row_compares, row_phases.row_compares,
                     "{rows} {label}"
@@ -22277,11 +22279,19 @@ mod tests {
                     assert_eq!(batch_phases.row_compares, 0, "{rows} {label}");
                 }
                 if rows >= 64 && *label == "half" {
-                    assert!(batch_phases.leaf_batches > 0, "{rows}");
+                    assert!(
+                        batch_phases.leaf_batches > 0 || batch_phases.bulk_spans > 0,
+                        "{rows} batches {} spans {}",
+                        batch_phases.leaf_batches,
+                        batch_phases.bulk_spans
+                    );
                     assert_eq!(row_phases.leaf_batches, 0, "{rows}");
+                    assert_eq!(row_phases.bulk_spans, 0, "{rows}");
                 }
-                assert_eq!(db_file(&batch_path), db_file(&row_path), "{rows} {label}");
-                assert_eq!(db_file(&batch_path), db_file(&full_path), "{rows} {label}");
+                if batch_phases.bulk_spans == 0 {
+                    assert_eq!(db_file(&batch_path), db_file(&row_path), "{rows} {label}");
+                    assert_eq!(db_file(&batch_path), db_file(&full_path), "{rows} {label}");
+                }
                 assert_eq!(wal_len(&batch_path), 0, "{rows} {label}");
                 assert_checksums(&batch_path);
                 assert_eq!(
@@ -22438,8 +22448,10 @@ mod tests {
                 let _guard = crate::storage::ForcePerRowUnlink::new();
                 per_row.execute(sql).unwrap();
             }
-            assert_eq!(db_file(&batch_path), db_file(&row_path), "{label}");
-            assert_eq!(wal_len(&batch_path), wal_len(&row_path), "{label}");
+            if batch_phases.bulk_spans == 0 {
+                assert_eq!(db_file(&batch_path), db_file(&row_path), "{label}");
+                assert_eq!(wal_len(&batch_path), wal_len(&row_path), "{label}");
+            }
             assert_eq!(table_rows(&mut batch), table_rows(&mut per_row), "{label}");
             assert_eq!(
                 batch.table("users").unwrap().row_ids(),
@@ -22475,26 +22487,58 @@ mod tests {
                     assert!(batch_phases.index_singles >= 1, "{label}");
                 }
                 "grouped" => assert!(batch_phases.leaf_batches > 0, "{label}"),
-                "fallback" => assert!(
-                    batch_phases.index_singles > 0,
-                    "{label} singles {} batches {}",
+                "fallback" | "mixed" | "all" | "half" => assert!(
+                    batch_phases.index_singles > 0 || batch_phases.bulk_spans > 0,
+                    "{label} singles {} batches {} spans {}",
                     batch_phases.index_singles,
-                    batch_phases.leaf_batches
+                    batch_phases.leaf_batches,
+                    batch_phases.bulk_spans
                 ),
-                "mixed" | "all" => {
-                    assert!(batch_phases.leaf_batches > 0, "{label}");
-                    assert!(batch_phases.index_singles > 0, "{label}");
-                }
-                "half" => assert!(batch_phases.index_singles > 0, "{label}"),
                 _ => {}
             }
+            if matches!(label, "half" | "all") {
+                assert!(
+                    batch_phases.bulk_spans > 0,
+                    "{label} spans {}",
+                    batch_phases.bulk_spans
+                );
+            }
+            let id_shape = batch.index_shape("idx_users_id").unwrap();
+            let bucket_shape = batch.index_shape("idx_users_bucket").unwrap();
+            let bucket_posted = index_postings(&mut batch, "idx_users_bucket");
             drop(batch);
             drop(per_row);
             let mut again = Database::open(&batch_path).unwrap();
             let once = table_rows(&mut again);
+            assert_eq!(
+                again.index_shape("idx_users_id").unwrap(),
+                id_shape,
+                "{label}"
+            );
+            assert_eq!(
+                again.index_shape("idx_users_bucket").unwrap(),
+                bucket_shape,
+                "{label}"
+            );
             drop(again);
             let mut twice = Database::open(&batch_path).unwrap();
             assert_eq!(table_rows(&mut twice), once, "{label}");
+            assert_eq!(
+                twice.index_shape("idx_users_id").unwrap(),
+                id_shape,
+                "{label}"
+            );
+            assert_eq!(
+                index_postings(&mut twice, "idx_users_bucket"),
+                bucket_posted,
+                "{label}"
+            );
+            let twice_ids = twice.table("users").unwrap().row_ids().to_vec();
+            assert_eq!(
+                index_postings(&mut twice, "idx_users_id"),
+                reference_postings(&once, &twice_ids, 0),
+                "{label}"
+            );
         }
         for (label, sql) in statements {
             assert_precommit(
@@ -22543,6 +22587,480 @@ mod tests {
             ] {
                 profile_batched_unlink(&base_path, rows, workload);
             }
+        }
+    }
+
+    #[test]
+    fn bulk_rebuild_then_ordinary_mutations_agree_with_the_heap() {
+        let _phases = crate::storage::enable_phases();
+        let (_dir, base) = seed_delete_db("m31-mutate", 1_000, 0x3100);
+        let (_copy_dir, path, mut db) = open_copy(&base, "m31-mutate-live");
+        let origin_next = db.table("users").unwrap().next_row_id();
+        let (before_height, _) = db.index_shape("idx_users_id").unwrap();
+        assert!(before_height >= 2, "height {before_height}");
+        crate::storage::reset_phases();
+        let deleted = change_count(&mut db, "DELETE FROM users WHERE id < 500;");
+        let phases = crate::storage::take_phases();
+        assert_eq!(deleted, 499);
+        assert!(phases.bulk_spans > 0, "{phases:?}");
+        let mut rows = table_rows(&mut db);
+        let mut ids = db.table("users").unwrap().row_ids().to_vec();
+        assert_eq!(
+            index_postings(&mut db, "idx_users_id"),
+            reference_postings(&rows, &ids, 0)
+        );
+        assert_eq!(
+            index_postings(&mut db, "idx_users_bucket"),
+            reference_postings(&rows, &ids, 3)
+        );
+        let shape = db.index_shape("idx_users_id").unwrap();
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(db.index_shape("idx_users_id").unwrap(), shape);
+        assert_eq!(db.table("users").unwrap().next_row_id(), origin_next);
+
+        db.execute("INSERT INTO users VALUES (-5, 'min', TRUE, 1);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (100000, 'max', FALSE, 2);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (200, 'gap', TRUE, 3);")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (600, 'dup-id', FALSE, 1);")
+            .unwrap();
+        assert_eq!(db.table("users").unwrap().next_row_id(), origin_next + 4);
+        let new_ids: Vec<u64> = ((origin_next)..(origin_next + 4)).collect();
+        let live_ids = db.table("users").unwrap().row_ids().to_vec();
+        assert!(new_ids.iter().all(|id| live_ids.contains(id)));
+        assert!(live_ids.iter().all(|id| *id >= origin_next || *id > 499));
+        assert!(
+            !live_ids
+                .iter()
+                .any(|id| (1..origin_next).contains(id) && *id < 500)
+        );
+        rows = table_rows(&mut db);
+        ids = live_ids;
+        assert_eq!(
+            index_postings(&mut db, "idx_users_id"),
+            reference_postings(&rows, &ids, 0)
+        );
+        let same_key: Vec<u64> = index_postings(&mut db, "idx_users_id")
+            .into_iter()
+            .filter(|(key, _)| *key == 600)
+            .map(|(_, row)| row)
+            .collect();
+        assert!(same_key.len() >= 2, "{same_key:?}");
+        let mut ordered = same_key.clone();
+        ordered.sort_unstable();
+        assert_eq!(same_key, ordered);
+        let same_bucket: Vec<u64> = index_postings(&mut db, "idx_users_bucket")
+            .into_iter()
+            .filter(|(key, _)| *key == 1)
+            .map(|(_, row)| row)
+            .collect();
+        let mut bucket_order = same_bucket.clone();
+        bucket_order.sort_unstable();
+        assert_eq!(same_bucket, bucket_order);
+
+        change_count(&mut db, "UPDATE users SET id = -40 WHERE id = 500;");
+        change_count(&mut db, "UPDATE users SET bucket = NULL WHERE id = 501;");
+        change_count(&mut db, "UPDATE users SET bucket = 7 WHERE id = 501;");
+        assert_eq!(db.table("users").unwrap().next_row_id(), origin_next + 4);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        rows = table_rows(&mut db);
+        ids = db.table("users").unwrap().row_ids().to_vec();
+        assert_eq!(
+            index_postings(&mut db, "idx_users_id"),
+            reference_postings(&rows, &ids, 0)
+        );
+        assert_eq!(
+            index_postings(&mut db, "idx_users_bucket"),
+            reference_postings(&rows, &ids, 3)
+        );
+        assert!(
+            index_postings(&mut db, "idx_users_id")
+                .iter()
+                .any(|(key, _)| *key == -40)
+        );
+        assert!(
+            index_postings(&mut db, "idx_users_id")
+                .iter()
+                .all(|(key, _)| *key != 500)
+        );
+        assert_eq!(
+            query(&mut db, "SELECT id FROM users WHERE id = 1;")
+                .rows
+                .len(),
+            0
+        );
+        assert_eq!(
+            query(&mut db, "SELECT id FROM users WHERE id = -40;")
+                .rows
+                .len(),
+            1
+        );
+
+        crate::storage::reset_phases();
+        assert_eq!(change_count(&mut db, "DELETE FROM users WHERE id = -5;"), 1);
+        let single = crate::storage::take_phases();
+        assert_eq!(single.bulk_spans, 0);
+        assert!(single.index_singles >= 1, "{single:?}");
+        crate::storage::reset_phases();
+        let grouped = change_count(&mut db, "DELETE FROM users WHERE id >= 900 AND id < 904;");
+        let grouped_phases = crate::storage::take_phases();
+        assert_eq!(grouped, 4);
+        assert!(grouped_phases.leaf_batches > 0, "{grouped_phases:?}");
+        assert_eq!(grouped_phases.bulk_spans, 0, "{grouped_phases:?}");
+        crate::storage::reset_phases();
+        let bulk = change_count(&mut db, "DELETE FROM users WHERE id < 800;");
+        let bulk_phases = crate::storage::take_phases();
+        assert!(bulk > 2, "{bulk}");
+        assert!(bulk_phases.bulk_spans > 0, "{bulk_phases:?}");
+        assert_eq!(db.table("users").unwrap().next_row_id(), origin_next + 4);
+        rows = table_rows(&mut db);
+        ids = db.table("users").unwrap().row_ids().to_vec();
+        assert!(!ids.contains(&1));
+        assert!(
+            !ids.iter()
+                .any(|id| new_ids.contains(id) && *id == origin_next)
+        );
+        assert_eq!(
+            index_postings(&mut db, "idx_users_id"),
+            reference_postings(&rows, &ids, 0)
+        );
+        assert_eq!(
+            index_postings(&mut db, "idx_users_bucket"),
+            reference_postings(&rows, &ids, 3)
+        );
+        let final_shape = db.index_shape("idx_users_id").unwrap();
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut db), rows);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(db.index_shape("idx_users_id").unwrap(), final_shape);
+        assert_eq!(
+            index_postings(&mut db, "idx_users_id"),
+            reference_postings(&rows, &ids, 0)
+        );
+        assert_eq!(db.table("users").unwrap().next_row_id(), origin_next + 4);
+    }
+
+    #[test]
+    fn bulk_delete_does_not_repair_or_commit_a_corrupt_tree() {
+        let (_dir, base) = seed_delete_db("m31-corrupt", 400, 0x3100);
+        let (_copy_dir, path, mut db) = open_copy(&base, "m31-corrupt-span");
+        let before = db_file(&path);
+        let rows = table_rows(&mut db);
+        db.zero_leftmost_leaf_right("idx_users_id").unwrap();
+        let error = db
+            .execute("DELETE FROM users WHERE id < 200;")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("corrupt"), "{error}");
+        assert!(!error.contains("rows deleted"), "{error}");
+        assert!(!error.contains("outcome is unknown"), "{error}");
+        assert_eq!(db_file(&path), before);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut db), rows);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut db), rows);
+
+        let (_one_dir, one_path, mut one) = open_copy(&base, "m31-corrupt-one");
+        let one_before = db_file(&one_path);
+        one.zero_leftmost_leaf_right("idx_users_id").unwrap();
+        let one_result = one.execute("DELETE FROM users WHERE id = 400;");
+        match one_result {
+            Ok(_) => {
+                drop(one);
+                let mut reopened = Database::open(&one_path).unwrap();
+                assert_eq!(
+                    query(&mut reopened, "SELECT id FROM users WHERE id = 400;")
+                        .rows
+                        .len(),
+                    0
+                );
+            }
+            Err(error) => {
+                let error = error.to_string();
+                assert!(error.contains("corrupt"), "{error}");
+                assert!(!error.contains("rows deleted"), "{error}");
+                assert_eq!(db_file(&one_path), one_before);
+            }
+        }
+
+        let (_root_dir, root_path, mut root) = open_copy(&base, "m31-corrupt-root");
+        let root_before = db_file(&root_path);
+        root.corrupt_index_root_type("idx_users_id").unwrap();
+        let error = root
+            .execute("DELETE FROM users WHERE id < 200;")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("corrupt"), "{error}");
+        assert!(!error.contains("rows deleted"), "{error}");
+        assert_eq!(db_file(&root_path), root_before);
+        drop(root);
+        let root = Database::open(&root_path).unwrap();
+        assert_eq!(root.table("users").unwrap().row_ids().len(), 400);
+    }
+
+    #[test]
+    fn bulk_multilevel_delete_respects_wal_boundaries() {
+        let (_dir, base) = seed_delete_db("m31-tall", 26_100, 0x3100);
+        let (_probe_dir, _, mut probe) = open_copy(&base, "m31-tall-shape");
+        let (height, pages) = probe.index_shape("idx_users_id").unwrap();
+        assert!(height >= 3, "height {height} pages {pages}");
+        drop(probe);
+        let statements = [
+            ("half", "DELETE FROM users WHERE id < 13050;"),
+            ("all", "DELETE FROM users WHERE TRUE OR id = 0;"),
+        ];
+        for (label, sql) in statements {
+            assert_precommit(
+                &base,
+                &format!("m31-tall-pre-{label}"),
+                sql,
+                crate::storage::Inject::BeforeLogSync,
+            );
+            for inject in [
+                crate::storage::Inject::AfterLogSync,
+                crate::storage::Inject::CommitSyncFailed,
+                crate::storage::Inject::DuringCheckpoint(1),
+            ] {
+                assert_postcommit(
+                    &base,
+                    &format!("m31-tall-post-{label}-{inject:?}"),
+                    sql,
+                    inject,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release profile of bulk B+ tree deletion"]
+    fn profile_milestone31() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!("milestone31 cpu={cpu} mem_bytes={mem} rustc={rustc}");
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            let (_base_dir, base) = seed_delete_db("m31-base", rows, 0x3100);
+            let samples = if rows == 100_000 { 3 } else { 1 };
+            for workload in [
+                "one",
+                "sparse",
+                "duplicates",
+                "half",
+                "all",
+                "alternating",
+                "consecutive",
+                "wide",
+            ] {
+                let mut taken = Vec::with_capacity(samples);
+                for sample in 0..samples {
+                    taken.push(profile_bulk_delete(&base, rows, workload, sample));
+                }
+                if samples > 1 {
+                    for sample in &taken[1..] {
+                        assert_eq!(sample.bulk_wal, taken[0].bulk_wal, "{workload}");
+                        assert_eq!(sample.spans, taken[0].spans, "{workload}");
+                        assert_eq!(sample.checksum, taken[0].checksum, "{workload}");
+                        assert_eq!(sample.id_height, taken[0].id_height, "{workload}");
+                        assert_eq!(sample.id_pages, taken[0].id_pages, "{workload}");
+                    }
+                    let median_us = median(
+                        &taken
+                            .iter()
+                            .map(|sample| sample.bulk_us)
+                            .collect::<Vec<_>>(),
+                    );
+                    let grouped_us = median(
+                        &taken
+                            .iter()
+                            .map(|sample| sample.grouped_us)
+                            .collect::<Vec<_>>(),
+                    );
+                    let bulk_index = median(
+                        &taken
+                            .iter()
+                            .map(|sample| sample.bulk_index_us)
+                            .collect::<Vec<_>>(),
+                    );
+                    let grouped_index = median(
+                        &taken
+                            .iter()
+                            .map(|sample| sample.grouped_index_us)
+                            .collect::<Vec<_>>(),
+                    );
+                    println!(
+                        "milestone31 median workload={workload} rows={rows} samples={samples} bulk_us={median_us} grouped_us={grouped_us} bulk_index_us={bulk_index} grouped_index_us={grouped_index} bulk_wal={} grouped_wal={} spans={} merges={} internal_merges={} contractions={} allocated={} freed={} scratch={} singles={} grouped_singles={} descents={} id_height={} id_pages={} checksum={}",
+                        taken[0].bulk_wal,
+                        taken[0].grouped_wal,
+                        taken[0].spans,
+                        taken[0].merges,
+                        taken[0].internal_merges,
+                        taken[0].contractions,
+                        taken[0].allocated,
+                        taken[0].freed,
+                        taken[0].scratch,
+                        taken[0].singles,
+                        taken[0].grouped_singles,
+                        taken[0].descents,
+                        taken[0].id_height,
+                        taken[0].id_pages,
+                        taken[0].checksum
+                    );
+                }
+            }
+        }
+    }
+
+    struct BulkSample {
+        bulk_us: u128,
+        grouped_us: u128,
+        bulk_index_us: u128,
+        grouped_index_us: u128,
+        bulk_wal: u64,
+        grouped_wal: u64,
+        spans: u64,
+        merges: u64,
+        internal_merges: u64,
+        contractions: u64,
+        allocated: u64,
+        freed: u64,
+        scratch: u64,
+        singles: u64,
+        grouped_singles: u64,
+        descents: u64,
+        id_height: u32,
+        id_pages: usize,
+        checksum: i64,
+    }
+
+    fn profile_bulk_delete(
+        base: &std::path::Path,
+        rows: i64,
+        workload: &str,
+        sample: usize,
+    ) -> BulkSample {
+        let sql = match workload {
+            "one" => "DELETE FROM users WHERE id = 1;".to_string(),
+            "sparse" => "DELETE FROM users WHERE bucket IS NULL;".to_string(),
+            "duplicates" => "DELETE FROM users WHERE bucket = 1;".to_string(),
+            "half" => format!("DELETE FROM users WHERE id < {};", rows / 2),
+            "all" => "DELETE FROM users WHERE TRUE OR id = 0;".to_string(),
+            "alternating" => "DELETE FROM users WHERE active = TRUE;".to_string(),
+            "consecutive" => format!(
+                "DELETE FROM users WHERE id >= 1 AND id < {};",
+                (rows / 4).max(1)
+            ),
+            "wide" => format!("DELETE FROM users WHERE name = '{}';", "w".repeat(80)),
+            _ => unreachable!(),
+        };
+        let (_bulk_dir, mut bulk) = {
+            let (dir, _path, db) = open_copy(base, "m31-bulk");
+            (dir, db)
+        };
+        let (_grouped_dir, mut grouped) = {
+            let (dir, _path, db) = open_copy(base, "m31-grouped");
+            (dir, db)
+        };
+        crate::storage::reset_phases();
+        let started = std::time::Instant::now();
+        let bulk_count = change_count(&mut bulk, &sql);
+        let bulk_us = started.elapsed().as_micros();
+        let bulk_phases = crate::storage::take_phases();
+        crate::storage::reset_phases();
+        let started = std::time::Instant::now();
+        let grouped_count = {
+            let _guard = crate::storage::ForceGroupedDelete::new();
+            change_count(&mut grouped, &sql)
+        };
+        let grouped_us = started.elapsed().as_micros();
+        let grouped_phases = crate::storage::take_phases();
+        assert_eq!(bulk_count, grouped_count, "{workload} {rows}");
+        assert_eq!(
+            mutation_checksum(&mut bulk),
+            mutation_checksum(&mut grouped),
+            "{workload} {rows}"
+        );
+        assert_eq!(
+            bulk.table("users").unwrap().next_row_id(),
+            grouped.table("users").unwrap().next_row_id(),
+            "{workload} {rows}"
+        );
+        let (id_height, id_pages) = bulk.index_shape("idx_users_id").unwrap();
+        let (bucket_height, bucket_pages) = bulk.index_shape("idx_users_bucket").unwrap();
+        let (old_id_height, old_id_pages) = grouped.index_shape("idx_users_id").unwrap();
+        if workload == "one" {
+            assert_eq!(bulk_phases.bulk_spans, 0, "{rows}");
+            assert_eq!(bulk_phases.leaf_redistributions, 0, "{rows}");
+            assert_eq!(
+                bulk_phases.index_singles, grouped_phases.index_singles,
+                "{rows}"
+            );
+        }
+        if rows >= 1_000 && matches!(workload, "half" | "all" | "consecutive" | "alternating") {
+            assert!(
+                bulk_phases.bulk_spans > 0,
+                "{workload} {rows} spans {}",
+                bulk_phases.bulk_spans
+            );
+            assert!(
+                bulk_phases.index_singles < grouped_phases.index_singles,
+                "{workload} {rows} bulk singles {} grouped singles {}",
+                bulk_phases.index_singles,
+                grouped_phases.index_singles
+            );
+        }
+        let checksum = mutation_checksum(&mut bulk);
+        println!(
+            "milestone31 workload={workload} rows={rows} sample={sample} count={bulk_count} bulk_us={bulk_us} grouped_us={grouped_us} bulk_heap_us={} grouped_heap_us={} bulk_index_us={} grouped_index_us={} bulk_wal={} grouped_wal={} bulk_frames={} grouped_frames={} descents={} grouped_descents={} redistributions={} leaf_merges={} internal_merges={} contractions={} allocated={} freed={} scratch={} singles={} grouped_singles={} batches={} id_height={id_height} id_pages={id_pages} old_id_height={old_id_height} old_id_pages={old_id_pages} bucket_height={bucket_height} bucket_pages={bucket_pages} checksum={checksum}",
+            bulk_phases.heap_edit.as_micros(),
+            grouped_phases.heap_edit.as_micros(),
+            bulk_phases.index_edit.as_micros(),
+            grouped_phases.index_edit.as_micros(),
+            bulk_phases.wal_bytes,
+            grouped_phases.wal_bytes,
+            bulk_phases.frames,
+            grouped_phases.frames,
+            bulk_phases.descents,
+            grouped_phases.descents,
+            bulk_phases.leaf_redistributions,
+            bulk_phases.leaf_merges,
+            bulk_phases.internal_merges,
+            bulk_phases.root_contractions,
+            bulk_phases.pages_allocated,
+            bulk_phases.pages_freed,
+            bulk_phases.scratch_bytes,
+            bulk_phases.index_singles,
+            grouped_phases.index_singles,
+            bulk_phases.leaf_batches,
+        );
+        BulkSample {
+            bulk_us,
+            grouped_us,
+            bulk_index_us: bulk_phases.index_edit.as_micros(),
+            grouped_index_us: grouped_phases.index_edit.as_micros(),
+            bulk_wal: bulk_phases.wal_bytes,
+            grouped_wal: grouped_phases.wal_bytes,
+            spans: bulk_phases.bulk_spans,
+            merges: bulk_phases.leaf_merges,
+            internal_merges: bulk_phases.internal_merges,
+            contractions: bulk_phases.root_contractions,
+            allocated: bulk_phases.pages_allocated,
+            freed: bulk_phases.pages_freed,
+            scratch: bulk_phases.scratch_bytes,
+            singles: bulk_phases.index_singles,
+            grouped_singles: grouped_phases.index_singles,
+            descents: bulk_phases.descents,
+            id_height,
+            id_pages,
+            checksum,
         }
     }
 
@@ -22609,13 +23127,15 @@ mod tests {
         assert!(!batch_note.undo_snapshot, "{workload}");
         let checksum = mutation_checksum(&mut batch);
         assert_eq!(checksum, mutation_checksum(&mut per_row), "{workload}");
-        assert_eq!(batch_phases.wal_bytes, row_phases.wal_bytes, "{workload}");
         assert_eq!(batch_phases.heap_pages, row_phases.heap_pages, "{workload}");
-        assert_eq!(
-            batch_phases.index_pages, row_phases.index_pages,
-            "{workload}"
-        );
-        assert_eq!(batch_phases.frames, row_phases.frames, "{workload}");
+        if batch_phases.bulk_spans == 0 {
+            assert_eq!(batch_phases.wal_bytes, row_phases.wal_bytes, "{workload}");
+            assert_eq!(
+                batch_phases.index_pages, row_phases.index_pages,
+                "{workload}"
+            );
+            assert_eq!(batch_phases.frames, row_phases.frames, "{workload}");
+        }
         assert_eq!(
             batch_phases.row_compares, row_phases.row_compares,
             "{workload}"
@@ -22637,11 +23157,13 @@ mod tests {
         }
         if rows >= 1_000 && matches!(workload, "duplicates" | "half" | "all" | "ten") {
             assert!(
-                batch_phases.leaf_batches > 0,
-                "{workload} batches {}",
-                batch_phases.leaf_batches
+                batch_phases.leaf_batches > 0 || batch_phases.bulk_spans > 0,
+                "{workload} batches {} spans {}",
+                batch_phases.leaf_batches,
+                batch_phases.bulk_spans
             );
             assert_eq!(row_phases.leaf_batches, 0, "{workload}");
+            assert_eq!(row_phases.bulk_spans, 0, "{workload}");
         }
         let samples = if delete_is_repeatable(workload) {
             if rows >= 100_000 { 3 } else { 6 }
@@ -22657,10 +23179,12 @@ mod tests {
             .collect();
         let batch_time = time_unlink(&mut timed_batch, &statements, false);
         let row_time = time_unlink(&mut timed_row, &statements, true);
-        assert_eq!(batch_time.wal_bytes, row_time.wal_bytes, "{workload}");
         assert_eq!(batch_time.heap_pages, row_time.heap_pages, "{workload}");
-        assert_eq!(batch_time.index_pages, row_time.index_pages, "{workload}");
-        assert_eq!(batch_time.frames, row_time.frames, "{workload}");
+        if batch_time.bulk_spans == 0 {
+            assert_eq!(batch_time.wal_bytes, row_time.wal_bytes, "{workload}");
+            assert_eq!(batch_time.index_pages, row_time.index_pages, "{workload}");
+            assert_eq!(batch_time.frames, row_time.frames, "{workload}");
+        }
         let survivors = u64::try_from(rows).unwrap() - u64::try_from(batch_count).unwrap();
         let id_bytes = u64::try_from(batch_count).unwrap().saturating_mul(8);
         // One row does not clone the heap chains. The 32 bytes per deleted
@@ -22715,6 +23239,7 @@ mod tests {
         compares: u64,
         leaf_batches: u64,
         index_singles: u64,
+        bulk_spans: u64,
         wal_bytes: u64,
         heap_pages: u32,
         index_pages: u32,
@@ -22733,6 +23258,7 @@ mod tests {
         let mut compares = Vec::with_capacity(statements.len());
         let mut batches = Vec::with_capacity(statements.len());
         let mut singles = Vec::with_capacity(statements.len());
+        let mut spans = Vec::with_capacity(statements.len());
         let mut wal_bytes = Vec::with_capacity(statements.len());
         let mut heap_pages = Vec::with_capacity(statements.len());
         let mut index_pages = Vec::with_capacity(statements.len());
@@ -22765,6 +23291,7 @@ mod tests {
             compares.push(taken.row_compares);
             batches.push(taken.leaf_batches);
             singles.push(taken.index_singles);
+            spans.push(taken.bulk_spans);
             wal_bytes.push(taken.wal_bytes);
             heap_pages.push(taken.heap_pages);
             index_pages.push(taken.index_pages);
@@ -22797,6 +23324,7 @@ mod tests {
             compares: warm_u64(&compares),
             leaf_batches: batches[batches.len() - 1],
             index_singles: singles[singles.len() - 1],
+            bulk_spans: spans[spans.len() - 1],
             wal_bytes: warm_u64(&wal_bytes),
             heap_pages: heap_pages[heap_pages.len() - 1],
             index_pages: index_pages[index_pages.len() - 1],

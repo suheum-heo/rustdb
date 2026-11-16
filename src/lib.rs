@@ -41,8 +41,12 @@
 //! not clone the surviving values. One deleted row keeps the per-row unlink.
 //! Two or more repair heap links in one descending pass. Index postings that
 //! share a leaf are removed together when the leaf
-//! stays at its minimum; a borrow or merge still deletes one posting at a
-//! time, and the sealed pages match that loop. A delete that matches nothing still audits
+//! stays at its minimum. A run that would drop a leaf below its minimum is
+//! repacked across that leaf span, and the internal pages above the surviving
+//! leaves are rebuilt in the same commit. One posting, and any run that stays
+//! at the minimum, still uses the earlier delete. A test can force that
+//! grouped path. The rebuilt pages can differ from deleting one posting at a
+//! time. A delete that matches nothing still audits
 //! memory and decodes the stored rows, and it writes no log when they already
 //! match. `INSERT` still snapshots the table.
 //! `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,
