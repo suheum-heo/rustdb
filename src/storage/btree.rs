@@ -10,7 +10,7 @@ use super::page::{
 };
 use crate::error::DbError;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) type Entry = (i64, u64);
 
@@ -176,7 +176,11 @@ pub(crate) fn delete(
 /// The prefix stops at the first missing or repeated pair, and that error is
 /// the same as [`delete`]. A run that moves only forward or only backward in
 /// `(key, row id)` order is checked along the leaf chain after the first root
-/// descent. Any other order, a repeated pair, and a test that forces it still
+/// descent. A run that changes direction is checked against a presence map
+/// when one descent per remaining posting would read more pages than the
+/// largest tree of this height. The map is built from [`validate`] and the
+/// leaf chain, then dropped before any page is written. A map that cannot be
+/// built, a request that is too small, and a test that forces it still
 /// descend once per posting. A test can also force the grouped path for every
 /// run.
 pub(crate) fn delete_many(
@@ -359,6 +363,73 @@ fn descent_only() -> bool {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_CHAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_PRESENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Keep Milestone 32's leaf-chain check and skip the presence map.
+#[cfg(test)]
+pub(crate) struct ForceChainVerify;
+
+#[cfg(test)]
+impl ForceChainVerify {
+    pub(crate) fn new() -> Self {
+        FORCE_CHAIN.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceChainVerify {
+    fn drop(&mut self) {
+        FORCE_CHAIN.with(|flag| flag.set(false));
+    }
+}
+
+/// Build a presence map for a non-monotonic run even when the cost bound says
+/// the descents are cheaper.
+#[cfg(test)]
+pub(crate) struct ForcePresenceMap;
+
+#[cfg(test)]
+impl ForcePresenceMap {
+    pub(crate) fn new() -> Self {
+        FORCE_PRESENCE.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcePresenceMap {
+    fn drop(&mut self) {
+        FORCE_PRESENCE.with(|flag| flag.set(false));
+    }
+}
+
+fn chain_only() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_CHAIN.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn presence_forced() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_PRESENCE.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 struct Hit {
     entry: Entry,
     leaf: u32,
@@ -388,7 +459,7 @@ fn bulk_rebalance(
     path: &[(u32, usize)],
     limits: Limits,
 ) -> Result<(u32, usize), DbError> {
-    let hits = collect_hits(store, root, entries, seed_leaf, seed_count, path)?;
+    let hits = collect_hits(store, root, entries, seed_leaf, seed_count, path, limits)?;
     if hits.len() < 2 {
         return Ok((root, 0));
     }
@@ -564,6 +635,7 @@ fn collect_hits(
     seed_leaf: u32,
     seed_count: usize,
     path: &[(u32, usize)],
+    limits: Limits,
 ) -> Result<Vec<Hit>, DbError> {
     let mut hits = Vec::new();
     let mut claimed = HashSet::new();
@@ -600,6 +672,26 @@ fn collect_hits(
             hits.push(hit);
         }
         super::profile::note_ordered_verified(count_u64(hits.len()));
+        return Ok(hits);
+    }
+    // A direction change is not eligible for the leaf chain. The map is a
+    // local snapshot of this root. It is dropped before the rebuild writes,
+    // and a later batch starts from the root that rebuild produced.
+    let height = u32::try_from(path.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    if !descent_only()
+        && direction.is_none()
+        && let Some(extra) =
+            verify_presence_suffix(store, root, entries, seed_count, &claimed, height, limits)?
+    {
+        for hit in extra {
+            if !claim_posting(&mut claimed, hit.entry) {
+                break;
+            }
+            hits.push(hit);
+        }
+        super::profile::note_presence_verified(count_u64(hits.len()));
         return Ok(hits);
     }
     let mut index = hits.len();
@@ -695,6 +787,152 @@ impl Drop for PostedCompares {
     fn drop(&mut self) {
         super::profile::note_posting_compare_n(self.0);
     }
+}
+
+/// Largest page count a tree of `height` can hold.
+///
+/// Each internal page has at most [`INTERNAL_MAX`] separators, so it has at
+/// most that many children plus one. The sum is every level from the root
+/// down to the leaves. A request whose descents would read more pages than
+/// that maximum cannot be cheaper as a walk from the root.
+fn max_index_pages(height: u32) -> u64 {
+    let fanout = u64::try_from(INTERNAL_MAX)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut pages = 1_u64;
+    let mut level = 1_u64;
+    for _ in 1..height.max(1) {
+        level = level.saturating_mul(fanout);
+        pages = pages.saturating_add(level);
+    }
+    pages
+}
+
+/// `suffix` is the number of postings that would otherwise each descend from
+/// the root. The comparison uses page reads, not a measured latency.
+fn presence_reads_exceed_tree(suffix: usize, height: u32) -> bool {
+    let height = height.max(1);
+    let reads = u64::try_from(suffix)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::from(height));
+    reads > max_index_pages(height)
+}
+
+fn presence_map_eligible(suffix: usize, height: u32) -> bool {
+    if chain_only() {
+        return false;
+    }
+    if presence_forced() {
+        return suffix > 0;
+    }
+    presence_reads_exceed_tree(suffix, height)
+}
+
+/// `None` means the map is not a safe substitute. The caller repeats the
+/// check with one descent per posting, so a missing pair stays missing when
+/// that older check would not yet report a damaged page.
+///
+/// A `Some` prefix stops before the first missing or repeated pair. The map
+/// is discarded by the caller. It is not used again after a rebuild.
+fn verify_presence_suffix(
+    store: &mut dyn Nodes,
+    root: u32,
+    entries: &[Entry],
+    seed_count: usize,
+    claimed: &HashSet<Entry>,
+    height: u32,
+    limits: Limits,
+) -> Result<Option<Vec<Hit>>, DbError> {
+    let suffix = entries.len().saturating_sub(seed_count);
+    if !presence_map_eligible(suffix, height) {
+        return Ok(None);
+    }
+    let built = super::profile::start();
+    // The same validator the rebuild runs before it writes. A failure here
+    // is not returned: the descent path decides whether the first request
+    // fails as missing or the later rebuild reports the damaged page.
+    let flat = match validate(store, root, limits) {
+        Ok(flat) => flat,
+        Err(_) => {
+            super::profile::add_presence_build(built);
+            return Ok(None);
+        }
+    };
+    let chain = match leaf_chain(store, root) {
+        Ok(chain) => chain,
+        Err(_) => {
+            super::profile::add_presence_build(built);
+            return Ok(None);
+        }
+    };
+    let mut count = 0_usize;
+    for leaf in &chain {
+        count = match count.checked_add(leaf.entries.len()) {
+            Some(count) => count,
+            None => {
+                super::profile::add_presence_build(built);
+                return Ok(None);
+            }
+        };
+    }
+    if count != flat.len() {
+        super::profile::add_presence_build(built);
+        return Ok(None);
+    }
+    let mut map = HashMap::new();
+    if map.try_reserve(count).is_err() {
+        super::profile::add_presence_build(built);
+        return Ok(None);
+    }
+    let mut cursor = 0_usize;
+    for (index, leaf) in chain.iter().enumerate() {
+        if index > 0 {
+            super::profile::note_sibling_step();
+        }
+        for entry in &leaf.entries {
+            if flat.get(cursor) != Some(entry) || map.insert(*entry, leaf.id).is_some() {
+                super::profile::add_presence_build(built);
+                return Ok(None);
+            }
+            cursor += 1;
+        }
+    }
+    if cursor != flat.len() {
+        super::profile::add_presence_build(built);
+        return Ok(None);
+    }
+    let payload = count_u64(count).saturating_mul(
+        u64::try_from(std::mem::size_of::<Entry>() + std::mem::size_of::<u32>())
+            .unwrap_or(u64::MAX),
+    );
+    super::profile::note_map_bytes(payload);
+    super::profile::note_presence_build_count();
+    super::profile::add_presence_build(built);
+    let member = super::profile::start();
+    let mut extra = Vec::new();
+    let mut seen = HashSet::new();
+    if seen.try_reserve(suffix).is_err() {
+        super::profile::add_presence_member(member);
+        return Ok(None);
+    }
+    for entry in entries.iter().copied().skip(seed_count) {
+        super::profile::note_duplicate_check_n(1);
+        if claimed.contains(&entry) || !seen.insert(entry) {
+            break;
+        }
+        match map.get(&entry) {
+            Some(leaf) => {
+                super::profile::note_map_hit(1);
+                extra.push(Hit { entry, leaf: *leaf });
+            }
+            None => {
+                super::profile::note_map_miss();
+                break;
+            }
+        }
+    }
+    super::profile::add_presence_member(member);
+    Ok(Some(extra))
 }
 
 /// `None` means the chain walk is not a safe substitute, and the caller must
@@ -4664,5 +4902,1131 @@ mod tests {
         }
 
         agree_verifiers(production(), &sequential(800), &sequential(400));
+    }
+
+    #[test]
+    fn presence_map_bound_uses_the_page_fanout() {
+        assert_eq!(max_index_pages(1), 1);
+        assert_eq!(max_index_pages(2), 205);
+        assert_eq!(max_index_pages(3), 41_821);
+        assert!(!presence_reads_exceed_tree(0, 3));
+        assert!(!presence_reads_exceed_tree(102, 2));
+        assert!(presence_reads_exceed_tree(103, 2));
+        assert!(!presence_reads_exceed_tree(13_940, 3));
+        assert!(presence_reads_exceed_tree(13_941, 3));
+        assert!(presence_reads_exceed_tree(2, 1));
+        assert_eq!(max_index_pages(4), 8_531_485);
+        assert!(max_index_pages(9) > max_index_pages(4));
+        assert!(max_index_pages(9) < u64::MAX);
+        assert_eq!(max_index_pages(10), u64::MAX);
+        assert_eq!(max_index_pages(64), u64::MAX);
+        assert_eq!(max_index_pages(0), 1);
+        assert!(!presence_reads_exceed_tree(usize::MAX, 64));
+        assert!(presence_reads_exceed_tree(usize::MAX, 3));
+    }
+
+    fn interleaved(entries: &[Entry]) -> Vec<Entry> {
+        let mut out = Vec::with_capacity(entries.len());
+        let mut low = 0;
+        let mut high = entries.len();
+        while low < high {
+            high -= 1;
+            out.push(entries[high]);
+            if low < high {
+                out.push(entries[low]);
+                low += 1;
+            }
+        }
+        out
+    }
+
+    fn agree_membership(limits: Limits, entries: &[Entry], remove: &[Entry]) {
+        let (mut presence_store, presence_root) = fill(limits, entries);
+        let (mut chain_store, chain_root) = fill(limits, entries);
+        let (mut descent_store, descent_root) = fill(limits, entries);
+        let presence = {
+            let _guard = ForcePresenceMap::new();
+            delete_many(&mut presence_store, presence_root, remove, limits)
+        };
+        let chain = {
+            let _guard = ForceChainVerify::new();
+            delete_many(&mut chain_store, chain_root, remove, limits)
+        };
+        let descent = {
+            let _guard = ForceDescentVerify::new();
+            delete_many(&mut descent_store, descent_root, remove, limits)
+        };
+        match (presence, chain, descent) {
+            (Ok(left), Ok(middle), Ok(right)) => {
+                let left_entries = validate(&mut presence_store, left, limits).unwrap();
+                let middle_entries = validate(&mut chain_store, middle, limits).unwrap();
+                let right_entries = validate(&mut descent_store, right, limits).unwrap();
+                assert_eq!(left_entries, right_entries, "{remove:?}");
+                assert_eq!(middle_entries, right_entries, "{remove:?}");
+                assert_eq!(page_image(&presence_store), page_image(&descent_store));
+                assert_eq!(page_image(&chain_store), page_image(&descent_store));
+                assert_eq!(presence_store.free, descent_store.free);
+                assert_eq!(chain_store.free, descent_store.free);
+                assert_pages(&mut presence_store, left);
+            }
+            (Err(left), Err(middle), Err(right)) => {
+                assert_eq!(left.to_string(), right.to_string(), "{remove:?}");
+                assert_eq!(middle.to_string(), right.to_string(), "{remove:?}");
+                assert_eq!(page_image(&presence_store), page_image(&descent_store));
+                assert_eq!(page_image(&chain_store), page_image(&descent_store));
+            }
+            (left, middle, right) => {
+                panic!("membership split presence={left:?} chain={middle:?} descent={right:?}")
+            }
+        }
+    }
+
+    fn agree_damaged(
+        limits: Limits,
+        entries: &[Entry],
+        remove: &[Entry],
+        damage: &mut dyn FnMut(&mut Mem, u32),
+    ) {
+        let (mut presence, presence_root) = fill(limits, entries);
+        let (mut chain, chain_root) = fill(limits, entries);
+        let (mut descent, descent_root) = fill(limits, entries);
+        damage(&mut presence, presence_root);
+        damage(&mut chain, chain_root);
+        damage(&mut descent, descent_root);
+        let presence_result = {
+            let _guard = ForcePresenceMap::new();
+            delete_many(&mut presence, presence_root, remove, limits)
+        };
+        let chain_result = {
+            let _guard = ForceChainVerify::new();
+            delete_many(&mut chain, chain_root, remove, limits)
+        };
+        let descent_result = {
+            let _guard = ForceDescentVerify::new();
+            delete_many(&mut descent, descent_root, remove, limits)
+        };
+        match (presence_result, chain_result, descent_result) {
+            (Ok(left), Ok(middle), Ok(right)) => {
+                assert_eq!(
+                    validate(&mut presence, left, limits).unwrap(),
+                    validate(&mut descent, right, limits).unwrap()
+                );
+                assert_eq!(
+                    validate(&mut chain, middle, limits).unwrap(),
+                    validate(&mut descent, right, limits).unwrap()
+                );
+                assert_eq!(page_image(&presence), page_image(&descent));
+                assert_eq!(page_image(&chain), page_image(&descent));
+            }
+            (Err(left), Err(middle), Err(right)) => {
+                assert_eq!(left.to_string(), right.to_string());
+                assert_eq!(middle.to_string(), right.to_string());
+                assert_eq!(page_image(&presence), page_image(&descent));
+                assert_eq!(page_image(&chain), page_image(&descent));
+            }
+            (left, middle, right) => {
+                panic!("damaged split presence={left:?} chain={middle:?} descent={right:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn presence_map_matches_chain_and_descent_verification() {
+        let limits = small();
+        let entries = sequential(48);
+        let mixed = interleaved(&entries);
+        assert!(monotonic_direction(&mixed).is_none());
+        agree_membership(limits, &entries, &[]);
+        agree_membership(limits, &entries, &entries[..1]);
+        agree_membership(limits, &entries, &[(99, 99), entries[0]]);
+        agree_membership(limits, &entries, &[entries[0], (99, 99), entries[2]]);
+        let mut missing_last = mixed.clone();
+        missing_last.push((99, 99));
+        agree_membership(limits, &entries, &missing_last);
+        agree_membership(limits, &entries, &[entries[0], entries[0], entries[1]]);
+        agree_membership(limits, &entries, &[entries[4], entries[1], entries[4]]);
+        agree_membership(limits, &entries, &[(4, 4), (4, 40), (5, 5)]);
+        agree_membership(limits, &entries, &mixed);
+        agree_membership(limits, &entries, &mixed[..mixed.len() / 2]);
+        let mut back = vec![entries[30], entries[2], entries[31], entries[1]];
+        back.push(entries[30]);
+        agree_membership(limits, &entries, &back);
+        let duplicates: Vec<Entry> = (1..=30).map(|row| (7, row)).collect();
+        let mixed_duplicates = interleaved(&duplicates);
+        agree_membership(limits, &duplicates, &mixed_duplicates);
+        let extremes = vec![
+            (i64::MIN, 1),
+            (i64::MIN, u64::MAX),
+            (-4, 2),
+            (0, 3),
+            (1, 4),
+            (i64::MAX, 8),
+            (i64::MAX, 9),
+        ];
+        agree_membership(limits, &extremes, &interleaved(&extremes));
+
+        let (mut probe, root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut probe, root);
+        for id in [
+            runs[0].id,
+            runs[runs.len() / 2].id,
+            runs[runs.len() - 1].id,
+            root,
+        ] {
+            let (mut left, left_root) = fill(limits, &entries);
+            let (mut right, right_root) = fill(limits, &entries);
+            for store in [&mut left, &mut right] {
+                let mut page = store.read_node(id).unwrap();
+                page.as_mut_slice()[0] = 0;
+                store.write_node(id, page).unwrap();
+            }
+            let presence = {
+                let _guard = ForcePresenceMap::new();
+                delete_many(&mut left, left_root, &mixed, limits)
+            };
+            let descent = {
+                let _guard = ForceDescentVerify::new();
+                delete_many(&mut right, right_root, &mixed, limits)
+            };
+            match (presence, descent) {
+                (Err(left_error), Err(right_error)) => {
+                    assert_eq!(left_error.to_string(), right_error.to_string(), "page {id}");
+                }
+                (left_result, right_result) => {
+                    panic!("corrupt page {id} split {left_result:?} {right_result:?}")
+                }
+            }
+            assert_eq!(page_image(&left), page_image(&right), "page {id}");
+        }
+
+        let mut damage = |store: &mut Mem, root_id: u32| {
+            let mut node = decode_internal(&store.read_node(root_id).unwrap()).unwrap();
+            node.keys[0] = (i64::MIN, 0);
+            store
+                .write_node(root_id, encode_internal(root_id, &node).unwrap())
+                .unwrap();
+        };
+        agree_damaged(limits, &entries, &mixed, &mut damage);
+
+        let mut damage = |store: &mut Mem, root_id: u32| {
+            let mut node = decode_internal(&store.read_node(root_id).unwrap()).unwrap();
+            node.children[0] = 0;
+            store
+                .write_node(root_id, encode_internal(root_id, &node).unwrap())
+                .unwrap();
+        };
+        agree_damaged(limits, &entries, &mixed, &mut damage);
+
+        let mut damage = |store: &mut Mem, root_id: u32| {
+            let runs = leaf_runs(store, root_id);
+            let mut page = store.read_node(runs[1].id).unwrap();
+            crate::storage::page::set_next_page(&mut page, runs[1].id);
+            store.write_node(runs[1].id, page).unwrap();
+        };
+        agree_damaged(limits, &entries, &mixed, &mut damage);
+
+        let mut damage = |store: &mut Mem, root_id: u32| {
+            let live = leaf_runs(store, root_id)[0].id;
+            store.free.push(live);
+        };
+        agree_damaged(limits, &entries, &mixed, &mut damage);
+
+        let mut damage = |store: &mut Mem, _root_id: u32| {
+            store.free.push(90_000);
+            store.free.push(90_000);
+        };
+        agree_damaged(limits, &entries, &mixed, &mut damage);
+
+        let _profile = crate::storage::profile::enable();
+        let (mut store, root) = fill(limits, &entries);
+        {
+            let _guard = ForcePresenceMap::new();
+            delete_many(&mut store, root, &mixed, limits).unwrap();
+        }
+        let presence_profile = crate::storage::profile::take();
+        crate::storage::profile::reset();
+        let (mut store, root) = fill(limits, &entries);
+        {
+            let _guard = ForceChainVerify::new();
+            delete_many(&mut store, root, &mixed, limits).unwrap();
+        }
+        let chain_profile = crate::storage::profile::take();
+        assert!(
+            presence_profile.presence_verified > 0,
+            "{presence_profile:?}"
+        );
+        assert!(
+            presence_profile.presence_builds >= 1,
+            "{presence_profile:?}"
+        );
+        assert_eq!(presence_profile.ordered_verified, 0);
+        assert!(
+            presence_profile.descents < chain_profile.descents,
+            "presence {} chain {}",
+            presence_profile.descents,
+            chain_profile.descents
+        );
+        assert!(chain_profile.fallback_verified > 0, "{chain_profile:?}");
+        assert_eq!(chain_profile.presence_builds, 0);
+
+        crate::storage::profile::reset();
+        let reversed = {
+            let mut copy = entries.clone();
+            copy.reverse();
+            copy
+        };
+        let (mut store, root) = fill(limits, &entries);
+        {
+            let _guard = ForcePresenceMap::new();
+            delete_many(&mut store, root, &reversed, limits).unwrap();
+        }
+        let reversed_profile = crate::storage::profile::take();
+        assert_eq!(reversed_profile.presence_builds, 0, "{reversed_profile:?}");
+        assert!(
+            reversed_profile.ordered_verified > 0,
+            "{reversed_profile:?}"
+        );
+
+        crate::storage::profile::reset();
+        let (mut store, root) = fill(production(), &sequential(800));
+        let wide = interleaved(&sequential(800));
+        let short = wide[..3].to_vec();
+        delete_many(&mut store, root, &short, production()).unwrap();
+        let short_profile = crate::storage::profile::take();
+        assert_eq!(short_profile.presence_builds, 0, "{short_profile:?}");
+
+        crate::storage::profile::reset();
+        let (mut store, root) = fill(production(), &sequential(800));
+        let long = wide[..200].to_vec();
+        let tree_height = height(&mut store, root).unwrap();
+        delete_many(&mut store, root, &long, production()).unwrap();
+        let long_profile = crate::storage::profile::take();
+        if presence_reads_exceed_tree(long.len().saturating_sub(1), tree_height) {
+            assert!(
+                long_profile.presence_builds >= 1,
+                "{long_profile:?} height {tree_height}"
+            );
+            assert!(long_profile.presence_verified > 0, "{long_profile:?}");
+        }
+    }
+
+    fn live_root(store: &Mem) -> u32 {
+        if store.pages.is_empty() {
+            return 0;
+        }
+        let mut children = HashSet::new();
+        for (id, page) in &store.pages {
+            if page_type(page).unwrap() != TYPE_INDEX_INTERNAL {
+                continue;
+            }
+            let node = decode_internal(page).unwrap();
+            for child in node.children {
+                assert!(children.insert(child), "page {id} repeats child {child}");
+            }
+        }
+        let roots: Vec<_> = store
+            .pages
+            .keys()
+            .copied()
+            .filter(|id| !children.contains(id))
+            .collect();
+        assert_eq!(roots.len(), 1, "roots {roots:?}");
+        roots[0]
+    }
+
+    fn accepted_prefix(entries: &[Entry], remove: &[Entry]) -> Vec<Entry> {
+        let mut live: HashSet<Entry> = entries.iter().copied().collect();
+        let mut prefix = Vec::new();
+        for entry in remove {
+            if !live.remove(entry) {
+                break;
+            }
+            prefix.push(*entry);
+        }
+        prefix
+    }
+
+    /// Three verifiers must remove the same request prefix the sorted reference
+    /// accepts, and must leave every later request in the tree.
+    fn delete_verified(label: &str, limits: Limits, entries: &[Entry], remove: &[Entry]) {
+        let prefix = accepted_prefix(entries, remove);
+        let expect = reference_delete(entries, &prefix).unwrap();
+        let mut seen_image = None;
+        let mut seen_free = None;
+        let mut seen_error = None;
+        for mode in ["presence", "chain", "descent"] {
+            let (mut store, root) = fill(limits, entries);
+            let result = match mode {
+                "presence" => {
+                    let _guard = ForcePresenceMap::new();
+                    delete_many(&mut store, root, remove, limits)
+                }
+                "chain" => {
+                    let _guard = ForceChainVerify::new();
+                    delete_many(&mut store, root, remove, limits)
+                }
+                "descent" => {
+                    let _guard = ForceDescentVerify::new();
+                    delete_many(&mut store, root, remove, limits)
+                }
+                _ => unreachable!(),
+            };
+            let live = match result {
+                Ok(root) => {
+                    assert_eq!(prefix.len(), remove.len(), "{label} {mode}");
+                    assert_eq!(live_root(&store), root, "{label} {mode}");
+                    root
+                }
+                Err(error) => {
+                    assert_ne!(prefix.len(), remove.len(), "{label} {mode}: {error}");
+                    let text = error.to_string();
+                    assert!(
+                        text.contains("index entry is missing"),
+                        "{label} {mode}: {text}"
+                    );
+                    if let Some(previous) = &seen_error {
+                        assert_eq!(previous, &text, "{label} {mode}");
+                    } else {
+                        seen_error = Some(text);
+                    }
+                    live_root(&store)
+                }
+            };
+            let got = validate(&mut store, live, limits).unwrap();
+            assert_eq!(got, expect, "{label} {mode}");
+            assert_built(&mut store, live, limits, &expect);
+            let image = page_image(&store);
+            let free = store.free.clone();
+            if let Some(previous) = &seen_image {
+                assert_eq!(previous, &image, "{label} {mode}");
+                assert_eq!(seen_free.as_ref().unwrap(), &free, "{label} {mode}");
+            } else {
+                seen_image = Some(image);
+                seen_free = Some(free);
+            }
+        }
+        if prefix.len() != remove.len() {
+            assert!(seen_error.is_some(), "{label}");
+            for later in remove.iter().skip(prefix.len() + 1) {
+                if entries.contains(later) && !prefix.contains(later) {
+                    assert!(
+                        expect.contains(later),
+                        "{label} removed a posting after the first error: {later:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    struct Trio {
+        presence: Mem,
+        chain: Mem,
+        descent: Mem,
+        presence_root: u32,
+        chain_root: u32,
+        descent_root: u32,
+        model: Vec<Entry>,
+    }
+
+    impl Trio {
+        fn open(limits: Limits, entries: &[Entry]) -> Self {
+            let (presence, presence_root) = fill(limits, entries);
+            let (chain, chain_root) = fill(limits, entries);
+            let (descent, descent_root) = fill(limits, entries);
+            Self {
+                presence,
+                chain,
+                descent,
+                presence_root,
+                chain_root,
+                descent_root,
+                model: reference_delete(entries, &[]).unwrap(),
+            }
+        }
+
+        fn delete(&mut self, limits: Limits, remove: &[Entry]) {
+            self.presence_root = {
+                let _guard = ForcePresenceMap::new();
+                delete_many(&mut self.presence, self.presence_root, remove, limits).unwrap()
+            };
+            self.chain_root = {
+                let _guard = ForceChainVerify::new();
+                delete_many(&mut self.chain, self.chain_root, remove, limits).unwrap()
+            };
+            self.descent_root = {
+                let _guard = ForceDescentVerify::new();
+                delete_many(&mut self.descent, self.descent_root, remove, limits).unwrap()
+            };
+            assert_eq!(page_image(&self.presence), page_image(&self.chain));
+            assert_eq!(page_image(&self.presence), page_image(&self.descent));
+            assert_eq!(self.presence.free, self.chain.free);
+            assert_eq!(self.presence.free, self.descent.free);
+            assert_eq!(live_root(&self.presence), self.presence_root);
+            self.model = reference_delete(&self.model, remove).unwrap();
+            assert_built(&mut self.presence, self.presence_root, limits, &self.model);
+            assert_eq!(
+                validate(&mut self.chain, self.chain_root, limits).unwrap(),
+                self.model
+            );
+            assert_eq!(
+                validate(&mut self.descent, self.descent_root, limits).unwrap(),
+                self.model
+            );
+        }
+
+        fn add(&mut self, limits: Limits, entry: Entry) {
+            self.presence_root = insert(
+                &mut self.presence,
+                self.presence_root,
+                entry.0,
+                entry.1,
+                limits,
+            )
+            .unwrap();
+            self.chain_root =
+                insert(&mut self.chain, self.chain_root, entry.0, entry.1, limits).unwrap();
+            self.descent_root = insert(
+                &mut self.descent,
+                self.descent_root,
+                entry.0,
+                entry.1,
+                limits,
+            )
+            .unwrap();
+            assert_eq!(page_image(&self.presence), page_image(&self.chain));
+            assert_eq!(page_image(&self.presence), page_image(&self.descent));
+            self.model.push(entry);
+            self.model = reference_delete(&self.model, &[]).unwrap();
+            assert_built(&mut self.presence, self.presence_root, limits, &self.model);
+        }
+    }
+
+    #[test]
+    fn presence_map_batches_follow_the_rebuilt_root() {
+        let _profile = crate::storage::profile::enable();
+        let limits = small();
+        let entries = sequential(48);
+        let (mut probe, probe_root) = fill(limits, &entries);
+        let before_height = height(&mut probe, probe_root).unwrap();
+        assert!(before_height >= 3, "{before_height}");
+        let runs = leaf_runs(&mut probe, probe_root);
+        let fat = runs
+            .iter()
+            .find(|run| run.id != probe_root && run.entries.len() >= limits.leaf_min + 2)
+            .expect("fat leaf");
+        let thin = runs
+            .iter()
+            .find(|run| {
+                run.id != probe_root && run.id != fat.id && run.entries.len() == limits.leaf_min
+            })
+            .expect("thin leaf");
+        let fat_keys = [fat.entries[0], fat.entries[2]];
+        let thin_key = thin.entries[0];
+        assert!(!fat.entries.contains(&thin_key));
+
+        let mut grouped_then_map = vec![fat_keys[0], fat_keys[1], thin_key];
+        grouped_then_map.extend(interleaved(&without(
+            &entries,
+            &[fat_keys[0], fat_keys[1], thin_key],
+        )));
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(limits, &entries);
+            let _guard = ForcePresenceMap::new();
+            delete_many(&mut store, root, &grouped_then_map, limits).unwrap();
+        }
+        let grouped_profile = crate::storage::profile::take();
+        assert!(grouped_profile.leaf_batches >= 1, "{grouped_profile:?}");
+        assert_eq!(grouped_profile.presence_builds, 1, "{grouped_profile:?}");
+        assert_eq!(grouped_profile.bulk_spans, 1, "{grouped_profile:?}");
+        assert_eq!(grouped_profile.ordered_verified, 0, "{grouped_profile:?}");
+        let mut trio = Trio::open(limits, &entries);
+        trio.delete(limits, &grouped_then_map);
+        assert!(trio.model.is_empty());
+
+        let mut single_then_map = vec![fat_keys[0], thin_key];
+        single_then_map.extend(interleaved(&without(&entries, &[fat_keys[0], thin_key])));
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(limits, &entries);
+            let _guard = ForcePresenceMap::new();
+            delete_many(&mut store, root, &single_then_map, limits).unwrap();
+        }
+        let single_profile = crate::storage::profile::take();
+        assert!(single_profile.index_singles >= 1, "{single_profile:?}");
+        assert_eq!(single_profile.presence_builds, 1, "{single_profile:?}");
+        assert_eq!(single_profile.bulk_spans, 1, "{single_profile:?}");
+        Trio::open(limits, &entries).delete(limits, &single_then_map);
+
+        let mut first_rest = without(&entries, &[thin_key]);
+        let second_keys = first_rest.split_off(first_rest.len() / 2);
+        let mut first = vec![thin_key];
+        first.extend(interleaved(&first_rest));
+        let second = interleaved(&second_keys);
+        crate::storage::profile::reset();
+        let (mut store, mut root) = fill(limits, &entries);
+        {
+            let _guard = ForcePresenceMap::new();
+            root = delete_many(&mut store, root, &first, limits).unwrap();
+        }
+        let first_profile = crate::storage::profile::take();
+        assert_eq!(first_profile.presence_builds, 1, "{first_profile:?}");
+        assert_eq!(first_profile.bulk_spans, 1, "{first_profile:?}");
+        assert_eq!(first_profile.leaf_batches, 0, "{first_profile:?}");
+        let returned = root;
+        crate::storage::profile::reset();
+        {
+            let _guard = ForcePresenceMap::new();
+            root = delete_many(&mut store, returned, &second, limits).unwrap();
+        }
+        let second_profile = crate::storage::profile::take();
+        assert_eq!(second_profile.presence_builds, 1, "{second_profile:?}");
+        assert!(second_profile.bulk_spans >= 1, "{second_profile:?}");
+        assert_built(&mut store, root, limits, &[]);
+
+        let mut trio = Trio::open(limits, &entries);
+        let height_before = height(&mut trio.presence, trio.presence_root).unwrap();
+        trio.delete(limits, &first);
+        let freed = trio.presence.free.clone();
+        assert!(!freed.is_empty(), "first rebuild freed no page");
+        let height_mid = height(&mut trio.presence, trio.presence_root).unwrap();
+        assert!(
+            height_mid <= height_before,
+            "{height_before} -> {height_mid}"
+        );
+        let runs = leaf_runs(&mut trio.presence, trio.presence_root);
+        let packed = runs
+            .iter()
+            .find(|run| run.id != trio.presence_root && run.entries.len() == limits.leaf_max)
+            .expect("packed leaf");
+        let packed_keys = packed.entries.clone();
+        let extras: Vec<Entry> = trio
+            .model
+            .iter()
+            .copied()
+            .filter(|entry| !packed_keys.contains(entry))
+            .take(5)
+            .collect();
+        let mut reuse_request = vec![packed_keys[0], packed_keys[1], packed_keys[2]];
+        reuse_request.extend(extras);
+        trio.delete(limits, &reuse_request);
+        assert!(
+            freed.iter().any(|id| trio.presence.pages.contains_key(id)),
+            "second rebuild did not reuse a freed page"
+        );
+        let runs = leaf_runs(&mut trio.presence, trio.presence_root);
+        let grouped = runs
+            .iter()
+            .find(|run| run.id != trio.presence_root && run.entries.len() >= limits.leaf_min + 2)
+            .expect("later fat leaf");
+        let grouped_request = vec![grouped.entries[0], grouped.entries[2]];
+        crate::storage::profile::reset();
+        {
+            let mut store = trio.presence.clone();
+            let _guard = ForcePresenceMap::new();
+            delete_many(&mut store, trio.presence_root, &grouped_request, limits).unwrap();
+        }
+        let grouped_later = crate::storage::profile::take();
+        assert!(grouped_later.leaf_batches >= 1, "{grouped_later:?}");
+        assert_eq!(grouped_later.presence_builds, 0, "{grouped_later:?}");
+        trio.delete(limits, &grouped_request);
+        let one = trio.model[0];
+        crate::storage::profile::reset();
+        {
+            let mut store = trio.presence.clone();
+            let _guard = ForcePresenceMap::new();
+            delete_many(&mut store, trio.presence_root, &[one], limits).unwrap();
+        }
+        let single_later = crate::storage::profile::take();
+        assert!(single_later.index_singles >= 1, "{single_later:?}");
+        assert_eq!(single_later.presence_builds, 0, "{single_later:?}");
+        trio.delete(limits, &[one]);
+
+        let mut contraction = Trio::open(limits, &entries);
+        let tall = height(&mut contraction.presence, contraction.presence_root).unwrap();
+        let keep = entries[0];
+        let almost = if thin_key == keep {
+            interleaved(&without(&entries, &[keep]))
+        } else {
+            let mut request = vec![thin_key];
+            request.extend(interleaved(&without(&entries, &[thin_key, keep])));
+            request
+        };
+        contraction.delete(limits, &almost);
+        let short = height(&mut contraction.presence, contraction.presence_root).unwrap();
+        assert!(short < tall, "{tall} -> {short}");
+        assert_eq!(contraction.model, vec![keep]);
+        contraction.delete(limits, &[keep]);
+        assert_eq!(contraction.presence_root, 0);
+        let freed = contraction.presence.free.clone();
+        assert!(!freed.is_empty());
+        for row in 1..=24 {
+            contraction.add(limits, (20_000 + row, row as u64));
+        }
+        assert!(
+            freed
+                .iter()
+                .any(|id| contraction.presence.pages.contains_key(id)),
+            "insert did not reuse a freed page"
+        );
+        let reused = interleaved(&contraction.model);
+        contraction.delete(limits, &reused);
+        assert!(contraction.model.is_empty());
+    }
+
+    #[test]
+    fn presence_map_first_error_matches_the_sorted_reference() {
+        let _profile = crate::storage::profile::enable();
+        let limits = small();
+        let entries = sequential(48);
+        let (mut probe, probe_root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut probe, probe_root);
+        let fat = runs
+            .iter()
+            .find(|run| run.id != probe_root && run.entries.len() >= limits.leaf_min + 2)
+            .expect("fat leaf");
+        let thin = runs
+            .iter()
+            .find(|run| {
+                run.id != probe_root && run.id != fat.id && run.entries.len() == limits.leaf_min
+            })
+            .expect("thin leaf");
+        let fat_keys = [fat.entries[0], fat.entries[2]];
+        let thin_key = thin.entries[0];
+        let left = &runs[runs.len() / 2 - 1];
+        let right = &runs[runs.len() / 2];
+        let boundary = *left.entries.last().unwrap();
+        let between = (boundary.0, boundary.1 + 1);
+        assert!(!entries.contains(&between));
+        assert_eq!(
+            cmp_entry(between, right.entries[0]),
+            std::cmp::Ordering::Less
+        );
+
+        delete_verified("missing-first", limits, &entries, &[(99, 99), entries[0]]);
+        let mut after_prefix = vec![thin_key];
+        after_prefix.extend(
+            entries
+                .iter()
+                .copied()
+                .filter(|entry| *entry != thin_key)
+                .take(6),
+        );
+        let survivor = entries
+            .iter()
+            .copied()
+            .rev()
+            .find(|entry| !after_prefix.contains(entry));
+        let survivor = survivor.expect("survivor");
+        after_prefix.push((99, 99));
+        after_prefix.push(survivor);
+        delete_verified("missing-after-prefix", limits, &entries, &after_prefix);
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(limits, &entries);
+            let _guard = ForcePresenceMap::new();
+            let error = delete_many(&mut store, root, &after_prefix, limits).unwrap_err();
+            assert!(
+                error.to_string().contains("index entry is missing"),
+                "{error}"
+            );
+        }
+        let rebuilt = crate::storage::profile::take();
+        assert!(rebuilt.presence_builds >= 1, "{rebuilt:?}");
+        assert!(rebuilt.bulk_spans >= 1, "{rebuilt:?}");
+        assert!(rebuilt.map_misses >= 1, "{rebuilt:?}");
+
+        delete_verified(
+            "duplicate-in-batch",
+            limits,
+            &entries,
+            &[thin_key, entries[10], thin_key, entries[20]],
+        );
+        let later = entries
+            .iter()
+            .copied()
+            .find(|entry| *entry != fat_keys[0] && *entry != fat_keys[1])
+            .unwrap();
+        delete_verified(
+            "duplicate-later-batch",
+            limits,
+            &entries,
+            &[fat_keys[0], fat_keys[1], fat_keys[0], later],
+        );
+        let mut same_key = sequential(20);
+        same_key.push((4, 40));
+        same_key.push((4, 41));
+        delete_verified(
+            "two-row-ids",
+            limits,
+            &same_key,
+            &[(4, 41), (4, 40), (5, 5)],
+        );
+        delete_verified(
+            "two-row-ids-repeat",
+            limits,
+            &same_key,
+            &[(4, 41), (4, 40), (4, 41), (6, 6)],
+        );
+        delete_verified(
+            "direction-change",
+            limits,
+            &entries,
+            &[(1, 1), (30, 30), (10, 10), (99, 99), (11, 11)],
+        );
+        delete_verified(
+            "leaf-boundary",
+            limits,
+            &entries,
+            &[boundary, between, right.entries[0]],
+        );
+    }
+
+    #[test]
+    fn presence_map_eligibility_follows_the_fanout_bound() {
+        let _profile = crate::storage::profile::enable();
+        let mut empty = Mem::new();
+        let error = delete_many(&mut empty, 0, &[(1, 1)], small()).unwrap_err();
+        assert!(
+            error.to_string().contains("index entry is missing"),
+            "{error}"
+        );
+        assert!(empty.pages.is_empty());
+        let (mut store, root) = fill(small(), &sequential(4));
+        assert_eq!(delete_many(&mut store, root, &[], small()).unwrap(), root);
+
+        crate::storage::profile::reset();
+        let (mut store, root) = fill(small(), &sequential(4));
+        delete_many(&mut store, root, &[(1, 1)], small()).unwrap();
+        let one = crate::storage::profile::take();
+        assert_eq!(one.presence_builds, 0, "{one:?}");
+        assert!(one.index_singles >= 1, "{one:?}");
+
+        let ten = sequential(10);
+        let (mut store, root) = fill(production(), &ten);
+        assert_eq!(height(&mut store, root).unwrap(), 1);
+        crate::storage::profile::reset();
+        delete_many(&mut store, root, &interleaved(&ten), production()).unwrap();
+        let single_leaf = crate::storage::profile::take();
+        assert_eq!(single_leaf.presence_builds, 0, "{single_leaf:?}");
+
+        let mut one_missing = interleaved(&ten);
+        one_missing.push((99, 99));
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(production(), &ten);
+            let error = delete_many(&mut store, root, &one_missing, production()).unwrap_err();
+            assert!(
+                error.to_string().contains("index entry is missing"),
+                "{error}"
+            );
+        }
+        let suffix_one = crate::storage::profile::take();
+        assert_eq!(suffix_one.presence_builds, 0, "{suffix_one:?}");
+        let mut two_missing = interleaved(&ten);
+        two_missing.push((99, 99));
+        two_missing.push((98, 98));
+        delete_verified("height1-two-missing", production(), &ten, &two_missing);
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(production(), &ten);
+            let _ = delete_many(&mut store, root, &two_missing, production());
+        }
+        let suffix_two = crate::storage::profile::take();
+        assert!(suffix_two.presence_builds >= 1, "{suffix_two:?}");
+        assert!(suffix_two.map_misses >= 1, "{suffix_two:?}");
+
+        let entries = sequential(8);
+        let (mut store, root) = fill(small(), &entries);
+        assert_eq!(height(&mut store, root).unwrap(), 2);
+        let mixed = interleaved(&entries);
+        crate::storage::profile::reset();
+        delete_many(&mut store, root, &mixed, small()).unwrap();
+        let height_two = crate::storage::profile::take();
+        assert_eq!(height_two.presence_builds, 0, "{height_two:?}");
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(small(), &entries);
+            let _guard = ForcePresenceMap::new();
+            delete_many(&mut store, root, &mixed, small()).unwrap();
+        }
+        let forced_two = crate::storage::profile::take();
+        assert!(forced_two.presence_builds >= 1, "{forced_two:?}");
+        delete_verified("height2-forced", small(), &entries, &mixed);
+
+        let tall = sequential(48);
+        let (mut store, root) = fill(small(), &tall);
+        let tall_height = height(&mut store, root).unwrap();
+        assert!(tall_height >= 3, "{tall_height}");
+        let mixed = interleaved(&tall);
+        crate::storage::profile::reset();
+        delete_many(&mut store, root, &mixed, small()).unwrap();
+        let automatic = crate::storage::profile::take();
+        assert_eq!(automatic.presence_builds, 0, "{automatic:?}");
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(small(), &tall);
+            let _guard = ForcePresenceMap::new();
+            delete_many(&mut store, root, &mixed, small()).unwrap();
+        }
+        let forced_tall = crate::storage::profile::take();
+        assert!(forced_tall.presence_builds >= 1, "{forced_tall:?}");
+
+        let ascending = sequential(48);
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(small(), &ascending);
+            let _guard = ForcePresenceMap::new();
+            delete_many(&mut store, root, &ascending, small()).unwrap();
+        }
+        let forward = crate::storage::profile::take();
+        assert_eq!(forward.presence_builds, 0, "{forward:?}");
+        assert!(forward.ordered_verified > 0, "{forward:?}");
+        let mut descending = ascending.clone();
+        descending.reverse();
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(small(), &ascending);
+            let _guard = ForcePresenceMap::new();
+            delete_many(&mut store, root, &descending, small()).unwrap();
+        }
+        let backward = crate::storage::profile::take();
+        assert_eq!(backward.presence_builds, 0, "{backward:?}");
+        assert!(backward.ordered_verified > 0, "{backward:?}");
+
+        let wide = sequential(800);
+        let (mut probe, root) = fill(production(), &wide);
+        assert_eq!(height(&mut probe, root).unwrap(), 2);
+        let runs = leaf_runs(&mut probe, root);
+        let thin = runs
+            .iter()
+            .find(|run| run.entries.len() == production().leaf_min)
+            .expect("minimum leaf");
+        let thin_key = thin.entries[0];
+        let foreign = interleaved(
+            &wide
+                .iter()
+                .copied()
+                .filter(|entry| !thin.entries.contains(entry))
+                .collect::<Vec<_>>(),
+        );
+        let mut below = vec![thin_key];
+        below.extend(foreign.iter().copied().take(102));
+        let mut above = vec![thin_key];
+        above.extend(foreign.iter().copied().take(103));
+        let mut short = vec![thin_key];
+        short.extend(foreign.iter().copied().take(9));
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(production(), &wide);
+            delete_many(&mut store, root, &below, production()).unwrap();
+        }
+        let below_profile = crate::storage::profile::take();
+        assert_eq!(below_profile.presence_builds, 0, "{below_profile:?}");
+        assert!(below_profile.fallback_verified > 0, "{below_profile:?}");
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(production(), &wide);
+            delete_many(&mut store, root, &above, production()).unwrap();
+        }
+        let above_profile = crate::storage::profile::take();
+        assert!(above_profile.presence_builds >= 1, "{above_profile:?}");
+        assert!(above_profile.presence_verified > 0, "{above_profile:?}");
+        assert_eq!(above_profile.fallback_verified, 0, "{above_profile:?}");
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(production(), &wide);
+            delete_many(&mut store, root, &short, production()).unwrap();
+        }
+        let ten_profile = crate::storage::profile::take();
+        assert_eq!(ten_profile.presence_builds, 0, "{ten_profile:?}");
+        delete_verified("below-bound", production(), &wide, &below);
+        delete_verified("above-bound", production(), &wide, &above);
+        delete_verified("ten-postings", production(), &wide, &short);
+        let mut repeated = above.clone();
+        repeated.insert(3, repeated[1]);
+        delete_verified("repeated-pair", production(), &wide, &repeated);
+    }
+
+    fn corruption_is_not_written(
+        label: &str,
+        limits: Limits,
+        root: u32,
+        damaged: &Mem,
+        remove: &[Entry],
+    ) {
+        let image = page_image(damaged);
+        let mut seen_error = None;
+        for mode in ["presence", "chain", "descent"] {
+            let mut store = damaged.clone();
+            let result = match mode {
+                "presence" => {
+                    let _guard = ForcePresenceMap::new();
+                    delete_many(&mut store, root, remove, limits)
+                }
+                "chain" => {
+                    let _guard = ForceChainVerify::new();
+                    delete_many(&mut store, root, remove, limits)
+                }
+                "descent" => {
+                    let _guard = ForceDescentVerify::new();
+                    delete_many(&mut store, root, remove, limits)
+                }
+                _ => unreachable!(),
+            };
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("corrupt"), "{label} {mode}: {error}");
+            assert!(
+                !error.contains("index entry is missing"),
+                "{label} {mode}: {error}"
+            );
+            if let Some(previous) = &seen_error {
+                assert_eq!(previous, &error, "{label} {mode}");
+            } else {
+                seen_error = Some(error);
+            }
+            assert_eq!(page_image(&store), image, "{label} {mode}");
+        }
+    }
+
+    #[test]
+    fn presence_map_does_not_repair_a_damaged_tree() {
+        let limits = small();
+        let entries = sequential(48);
+        let (probe, root) = fill(limits, &entries);
+        let runs = leaf_runs(&mut probe.clone(), root);
+        let thin = runs
+            .iter()
+            .find(|run| run.id != root && run.entries.len() == limits.leaf_min)
+            .expect("thin leaf");
+        let thin_key = thin.entries[0];
+        let victim = runs
+            .iter()
+            .find(|run| run.id != thin.id && run.entries.len() >= 2)
+            .expect("victim");
+        let victim_id = victim.id;
+        let mut remove = vec![thin_key];
+        remove.extend(interleaved(&without(&entries, &[thin_key])));
+
+        let mut typed = probe.clone();
+        let mut page = typed.read_node(victim_id).unwrap();
+        page.as_mut_slice()[0] = 0;
+        typed.write_node(victim_id, page).unwrap();
+        corruption_is_not_written("type", limits, root, &typed, &remove);
+
+        let mut back = probe.clone();
+        let mut leaf = decode_leaf(&back.read_node(victim_id).unwrap()).unwrap();
+        leaf.left = victim_id;
+        back.write_node(victim_id, encode_leaf(victim_id, &leaf).unwrap())
+            .unwrap();
+        corruption_is_not_written("back-pointer", limits, root, &back, &remove);
+
+        let mut order = probe.clone();
+        let mut leaf = decode_leaf(&order.read_node(victim_id).unwrap()).unwrap();
+        leaf.entries.swap(0, 1);
+        order
+            .write_node(victim_id, encode_leaf(victim_id, &leaf).unwrap())
+            .unwrap();
+        corruption_is_not_written("order", limits, root, &order, &remove);
+
+        let mut cycle = probe.clone();
+        let mut page = cycle.read_node(victim_id).unwrap();
+        crate::storage::page::set_next_page(&mut page, victim_id);
+        cycle.write_node(victim_id, page).unwrap();
+        corruption_is_not_written("cycle", limits, root, &cycle, &remove);
+
+        agree_damaged(limits, &entries, &remove, &mut |store, root_id| {
+            let mut node = decode_internal(&store.read_node(root_id).unwrap()).unwrap();
+            node.keys[0] = (i64::MIN, 0);
+            store
+                .write_node(root_id, encode_internal(root_id, &node).unwrap())
+                .unwrap();
+        });
+
+        agree_damaged(limits, &entries, &remove, &mut |store, root_id| {
+            let mut node = decode_internal(&store.read_node(root_id).unwrap()).unwrap();
+            node.children[0] = 0;
+            store
+                .write_node(root_id, encode_internal(root_id, &node).unwrap())
+                .unwrap();
+        });
+
+        let live = victim_id;
+        let mut presence = probe.clone();
+        let mut chain = probe.clone();
+        let mut descent = probe.clone();
+        presence.free.push(live);
+        chain.free.push(live);
+        descent.free.push(live);
+        let presence_result = {
+            let _guard = ForcePresenceMap::new();
+            delete_many(&mut presence, root, &remove, limits)
+        };
+        let chain_result = {
+            let _guard = ForceChainVerify::new();
+            delete_many(&mut chain, root, &remove, limits)
+        };
+        let descent_result = {
+            let _guard = ForceDescentVerify::new();
+            delete_many(&mut descent, root, &remove, limits)
+        };
+        match (presence_result, chain_result, descent_result) {
+            (Ok(left), Ok(middle), Ok(right)) => {
+                assert!(presence.free.contains(&live) && presence.pages.contains_key(&live));
+                assert_eq!(page_image(&presence), page_image(&descent));
+                assert_eq!(page_image(&chain), page_image(&descent));
+                assert_eq!(
+                    validate(&mut presence, left, limits).unwrap(),
+                    validate(&mut descent, right, limits).unwrap()
+                );
+                assert_eq!(
+                    validate(&mut chain, middle, limits).unwrap(),
+                    validate(&mut descent, right, limits).unwrap()
+                );
+            }
+            (Err(left), Err(middle), Err(right)) => {
+                assert_eq!(left.to_string(), right.to_string());
+                assert_eq!(middle.to_string(), right.to_string());
+                assert_eq!(page_image(&presence), page_image(&descent));
+                assert_eq!(page_image(&chain), page_image(&descent));
+            }
+            (left_result, middle, right_result) => {
+                panic!("free-list split {left_result:?} {middle:?} {right_result:?}")
+            }
+        }
+
+        let mut seen = None;
+        for mode in ["presence", "chain", "descent"] {
+            let mut store = probe.clone();
+            store.free.push(90_000);
+            store.free.push(90_000);
+            let result = match mode {
+                "presence" => {
+                    let _guard = ForcePresenceMap::new();
+                    delete_many(&mut store, root, &remove, limits)
+                }
+                "chain" => {
+                    let _guard = ForceChainVerify::new();
+                    delete_many(&mut store, root, &remove, limits)
+                }
+                "descent" => {
+                    let _guard = ForceDescentVerify::new();
+                    delete_many(&mut store, root, &remove, limits)
+                }
+                _ => unreachable!(),
+            };
+            let image = page_image(&store);
+            let copies = store.free.iter().filter(|id| **id == 90_000).count();
+            if result.is_ok() {
+                assert!(copies >= 2, "{mode} repaired a duplicated free-list id");
+            }
+            if let Some((previous_image, previous_copies, previous_ok)) = &seen {
+                assert_eq!(previous_image, &image, "{mode}");
+                assert_eq!(*previous_copies, copies, "{mode}");
+                assert_eq!(*previous_ok, result.is_ok(), "{mode}");
+            } else {
+                seen = Some((image, copies, result.is_ok()));
+            }
+        }
     }
 }

@@ -21750,6 +21750,16 @@ mod tests {
         let mut again = Database::open(&path).unwrap();
         assert_eq!(table_rows(&mut again), expected_rows, "{label}");
         assert_eq!(db_file(&path), expected_bytes, "{label}");
+        assert_eq!(
+            index_postings(&mut again, "idx_users_id"),
+            reference_postings(&expected_rows, &expected_ids, 0),
+            "{label}"
+        );
+        assert_eq!(
+            index_postings(&mut again, "idx_users_bucket"),
+            reference_postings(&expected_rows, &expected_ids, 3),
+            "{label} bucket"
+        );
         assert_checksums(&path);
     }
 
@@ -22862,7 +22872,13 @@ mod tests {
             ] {
                 let mut taken = Vec::with_capacity(samples);
                 for sample in 0..samples {
-                    taken.push(profile_bulk_delete(&base, rows, workload, sample, true));
+                    taken.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Descent,
+                    ));
                 }
                 if samples > 1 {
                     for sample in &taken[1..] {
@@ -22942,9 +22958,23 @@ mod tests {
         duplicate_checks: u64,
         ordered_verified: u64,
         fallback_verified: u64,
+        presence_verified: u64,
+        presence_builds: u64,
+        map_bytes: u64,
+        map_hits: u64,
+        map_misses: u64,
+        presence_build_us: u128,
+        presence_member_us: u128,
         id_height: u32,
         id_pages: usize,
         checksum: i64,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum VerifyMode {
+        Presence,
+        Chain,
+        Descent,
     }
 
     fn profile_bulk_delete(
@@ -22952,10 +22982,12 @@ mod tests {
         rows: i64,
         workload: &str,
         sample: usize,
-        descent_verify: bool,
+        mode: VerifyMode,
     ) -> BulkSample {
         let sql = match workload {
             "one" => "DELETE FROM users WHERE id = 1;".to_string(),
+            "ten" => "DELETE FROM users WHERE id >= 1 AND id <= 10;".to_string(),
+            "buckets" => "DELETE FROM users WHERE bucket = 0 OR bucket = 1;".to_string(),
             "sparse" => "DELETE FROM users WHERE bucket IS NULL;".to_string(),
             "duplicates" => "DELETE FROM users WHERE bucket = 1;".to_string(),
             "half" => format!("DELETE FROM users WHERE id < {};", rows / 2),
@@ -22978,11 +23010,16 @@ mod tests {
         };
         crate::storage::reset_phases();
         let started = std::time::Instant::now();
-        let bulk_count = if descent_verify {
-            let _guard = crate::storage::ForceDescentVerify::new();
-            change_count(&mut bulk, &sql)
-        } else {
-            change_count(&mut bulk, &sql)
+        let bulk_count = match mode {
+            VerifyMode::Descent => {
+                let _guard = crate::storage::ForceDescentVerify::new();
+                change_count(&mut bulk, &sql)
+            }
+            VerifyMode::Chain => {
+                let _guard = crate::storage::ForceChainVerify::new();
+                change_count(&mut bulk, &sql)
+            }
+            VerifyMode::Presence => change_count(&mut bulk, &sql),
         };
         let bulk_us = started.elapsed().as_micros();
         let bulk_phases = crate::storage::take_phases();
@@ -23076,6 +23113,13 @@ mod tests {
             duplicate_checks: bulk_phases.duplicate_checks,
             ordered_verified: bulk_phases.ordered_verified,
             fallback_verified: bulk_phases.fallback_verified,
+            presence_verified: bulk_phases.presence_verified,
+            presence_builds: bulk_phases.presence_builds,
+            map_bytes: bulk_phases.map_bytes,
+            map_hits: bulk_phases.map_hits,
+            map_misses: bulk_phases.map_misses,
+            presence_build_us: bulk_phases.presence_build.as_micros(),
+            presence_member_us: bulk_phases.presence_member.as_micros(),
             id_height,
             id_pages,
             checksum,
@@ -23223,6 +23267,349 @@ mod tests {
     }
 
     #[test]
+    fn presence_map_matches_chain_and_descent_deletion() {
+        let _phases = crate::storage::enable_phases();
+        let (_dir, base) = seed_delete_db("m33-agree", 2_000, 0x3300);
+        let statements = [
+            ("none", "DELETE FROM users WHERE id = -1;"),
+            ("one", "DELETE FROM users WHERE id = 1;"),
+            ("ten", "DELETE FROM users WHERE id >= 1 AND id <= 10;"),
+            ("half", "DELETE FROM users WHERE id < 1000;"),
+            (
+                "buckets",
+                "DELETE FROM users WHERE bucket = 0 OR bucket = 1;",
+            ),
+            ("alternating", "DELETE FROM users WHERE active = TRUE;"),
+            ("all", "DELETE FROM users WHERE TRUE OR id = 0;"),
+        ];
+        for (label, sql) in statements {
+            let (_presence_dir, presence_path, mut presence) =
+                open_copy(&base, &format!("m33-{label}-p"));
+            let (_chain_dir, chain_path, mut chain) = open_copy(&base, &format!("m33-{label}-c"));
+            let (_descent_dir, _descent_path, mut descent) =
+                open_copy(&base, &format!("m33-{label}-d"));
+            let origin_next = presence.table("users").unwrap().next_row_id();
+            crate::storage::reset_phases();
+            let presence_count = change_count(&mut presence, sql);
+            let presence_phases = crate::storage::take_phases();
+            crate::storage::reset_phases();
+            let chain_count = {
+                let _guard = crate::storage::ForceChainVerify::new();
+                change_count(&mut chain, sql)
+            };
+            let chain_phases = crate::storage::take_phases();
+            crate::storage::reset_phases();
+            let descent_count = {
+                let _guard = crate::storage::ForceDescentVerify::new();
+                change_count(&mut descent, sql)
+            };
+            assert_eq!(presence_count, chain_count, "{label}");
+            assert_eq!(presence_count, descent_count, "{label}");
+            assert_eq!(
+                mutation_checksum(&mut presence),
+                mutation_checksum(&mut chain),
+                "{label}"
+            );
+            assert_eq!(
+                mutation_checksum(&mut presence),
+                mutation_checksum(&mut descent),
+                "{label}"
+            );
+            assert_eq!(table_rows(&mut presence), table_rows(&mut chain), "{label}");
+            assert_eq!(
+                presence.table("users").unwrap().row_ids(),
+                chain.table("users").unwrap().row_ids(),
+                "{label}"
+            );
+            assert_eq!(
+                presence.table("users").unwrap().next_row_id(),
+                origin_next,
+                "{label}"
+            );
+            for index in ["idx_users_id", "idx_users_bucket"] {
+                assert_eq!(
+                    index_postings(&mut presence, index),
+                    index_postings(&mut chain, index),
+                    "{label} {index}"
+                );
+                assert_eq!(
+                    index_postings(&mut presence, index),
+                    index_postings(&mut descent, index),
+                    "{label} {index}"
+                );
+            }
+            assert_eq!(
+                presence.index_shape("idx_users_id").unwrap(),
+                chain.index_shape("idx_users_id").unwrap(),
+                "{label}"
+            );
+            assert_eq!(db_file(&presence_path), db_file(&chain_path), "{label}");
+            assert_eq!(presence_phases.wal_bytes, chain_phases.wal_bytes, "{label}");
+            assert_eq!(
+                presence_phases.bulk_spans, chain_phases.bulk_spans,
+                "{label}"
+            );
+            if matches!(label, "none" | "one" | "ten") {
+                assert_eq!(
+                    presence_phases.presence_builds, 0,
+                    "{label} {presence_phases:?}"
+                );
+            }
+            if matches!(label, "half" | "buckets" | "alternating" | "all") {
+                assert!(
+                    presence_phases.presence_verified > 0,
+                    "{label} {presence_phases:?}"
+                );
+                assert!(
+                    presence_phases.descents < chain_phases.descents,
+                    "{label} presence {} chain {}",
+                    presence_phases.descents,
+                    chain_phases.descents
+                );
+            }
+            let checksum = mutation_checksum(&mut presence);
+            drop(presence);
+            let mut reopened = Database::open(&presence_path).unwrap();
+            assert_eq!(mutation_checksum(&mut reopened), checksum, "{label}");
+            assert_eq!(
+                query(&mut reopened, "SELECT id FROM users WHERE id = 1;")
+                    .rows
+                    .len(),
+                query(&mut chain, "SELECT id FROM users WHERE id = 1;")
+                    .rows
+                    .len(),
+                "{label}"
+            );
+            let bucket = index_postings(&mut reopened, "idx_users_bucket");
+            drop(reopened);
+            let mut again = Database::open(&presence_path).unwrap();
+            assert_eq!(mutation_checksum(&mut again), checksum, "{label}");
+            assert_eq!(
+                index_postings(&mut again, "idx_users_bucket"),
+                bucket,
+                "{label}"
+            );
+            if label == "half" {
+                assert!(
+                    presence_phases.bulk_spans >= 2,
+                    "{label} spans {}",
+                    presence_phases.bulk_spans
+                );
+                assert!(
+                    presence_phases.presence_builds >= 1,
+                    "{label} {presence_phases:?}"
+                );
+            }
+        }
+
+        let (_dir, path, mut db) = open_copy(&base, "m33-update");
+        db.execute("UPDATE users SET bucket = 3 WHERE id = 40;")
+            .unwrap();
+        db.execute("UPDATE users SET name = 'relocated-name-with-extra-bytes' WHERE id = 41;")
+            .unwrap();
+        let updated = change_count(&mut db, "DELETE FROM users WHERE id < 1000;");
+        assert!(updated >= 999);
+        db.execute("INSERT INTO users VALUES (9000, 'again', TRUE, 1);")
+            .unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT id FROM users WHERE id = 9000;")
+                .rows
+                .len(),
+            1
+        );
+        let second = change_count(&mut db, "DELETE FROM users WHERE id = 1;");
+        assert_eq!(second, 0);
+        let checksum = mutation_checksum(&mut db);
+        drop(db);
+        let mut reopened = Database::open(&path).unwrap();
+        assert_eq!(mutation_checksum(&mut reopened), checksum);
+
+        assert_precommit(
+            &base,
+            "m33-pre-half",
+            "DELETE FROM users WHERE id < 1000;",
+            crate::storage::Inject::BeforeLogSync,
+        );
+        {
+            let _guard = crate::storage::ForceChainVerify::new();
+            assert_precommit(
+                &base,
+                "m33-pre-half-chain",
+                "DELETE FROM users WHERE id < 1000;",
+                crate::storage::Inject::BeforeLogSync,
+            );
+        }
+        for inject in [
+            crate::storage::Inject::AfterLogSync,
+            crate::storage::Inject::CommitSyncFailed,
+            crate::storage::Inject::DuringCheckpoint(1),
+        ] {
+            assert_postcommit(
+                &base,
+                &format!("m33-post-half-{inject:?}"),
+                "DELETE FROM users WHERE id < 1000;",
+                inject,
+            );
+            assert_postcommit(
+                &base,
+                &format!("m33-post-buckets-{inject:?}"),
+                "DELETE FROM users WHERE bucket = 0 OR bucket = 1;",
+                inject,
+            );
+        }
+
+        let batches = [
+            "DELETE FROM users WHERE id < 800;",
+            "DELETE FROM users WHERE id >= 1400;",
+        ];
+        let (_batch_dir, batch_path, mut presence) = open_copy(&base, "m33-batches-p");
+        let (_chain_dir, _, mut chain) = open_copy(&base, "m33-batches-c");
+        let (_descent_dir, _, mut descent) = open_copy(&base, "m33-batches-d");
+        for sql in batches {
+            let presence_count = change_count(&mut presence, sql);
+            let chain_count = {
+                let _guard = crate::storage::ForceChainVerify::new();
+                change_count(&mut chain, sql)
+            };
+            let descent_count = {
+                let _guard = crate::storage::ForceDescentVerify::new();
+                change_count(&mut descent, sql)
+            };
+            assert_eq!(presence_count, chain_count, "{sql}");
+            assert_eq!(presence_count, descent_count, "{sql}");
+            assert_eq!(table_rows(&mut presence), table_rows(&mut chain), "{sql}");
+            assert_eq!(table_rows(&mut presence), table_rows(&mut descent), "{sql}");
+            let ids = presence.table("users").unwrap().row_ids().to_vec();
+            let rows = table_rows(&mut presence);
+            assert_eq!(
+                index_postings(&mut presence, "idx_users_id"),
+                reference_postings(&rows, &ids, 0),
+                "{sql}"
+            );
+            assert_eq!(
+                index_postings(&mut presence, "idx_users_bucket"),
+                reference_postings(&rows, &ids, 3),
+                "{sql}"
+            );
+            assert_eq!(
+                index_postings(&mut presence, "idx_users_id"),
+                index_postings(&mut chain, "idx_users_id"),
+                "{sql}"
+            );
+            assert_eq!(
+                index_postings(&mut presence, "idx_users_bucket"),
+                index_postings(&mut descent, "idx_users_bucket"),
+                "{sql}"
+            );
+        }
+        let batch_checksum = mutation_checksum(&mut presence);
+        drop(presence);
+        let mut once = Database::open(&batch_path).unwrap();
+        assert_eq!(mutation_checksum(&mut once), batch_checksum);
+        drop(once);
+        let mut twice = Database::open(&batch_path).unwrap();
+        assert_eq!(mutation_checksum(&mut twice), batch_checksum);
+        let ids = twice.table("users").unwrap().row_ids().to_vec();
+        let rows = table_rows(&mut twice);
+        assert_eq!(
+            index_postings(&mut twice, "idx_users_id"),
+            reference_postings(&rows, &ids, 0)
+        );
+        assert_eq!(
+            index_postings(&mut twice, "idx_users_bucket"),
+            reference_postings(&rows, &ids, 3)
+        );
+
+        let (_mixed_dir, mixed_path, mut mixed) = open_copy(&base, "m33-mixed");
+        let (_mixed_chain_dir, _, mut mixed_chain) = open_copy(&base, "m33-mixed-c");
+        for sql in [
+            "DELETE FROM users WHERE id = 1;",
+            "DELETE FROM users WHERE bucket = 0 OR bucket = 1;",
+        ] {
+            let left = change_count(&mut mixed, sql);
+            let right = {
+                let _guard = crate::storage::ForceChainVerify::new();
+                change_count(&mut mixed_chain, sql)
+            };
+            assert_eq!(left, right, "{sql}");
+            assert_eq!(
+                table_rows(&mut mixed),
+                table_rows(&mut mixed_chain),
+                "{sql}"
+            );
+            assert_eq!(
+                index_postings(&mut mixed, "idx_users_bucket"),
+                index_postings(&mut mixed_chain, "idx_users_bucket"),
+                "{sql}"
+            );
+        }
+        let mixed_checksum = mutation_checksum(&mut mixed);
+        drop(mixed);
+        let mut mixed_again = Database::open(&mixed_path).unwrap();
+        assert_eq!(mutation_checksum(&mut mixed_again), mixed_checksum);
+        drop(mixed_again);
+        let mut mixed_twice = Database::open(&mixed_path).unwrap();
+        assert_eq!(mutation_checksum(&mut mixed_twice), mixed_checksum);
+
+        let (contract_dir, contracted, mut contracted_db) = open_copy(&base, "m33-contract-src");
+        let before_height = contracted_db.index_shape("idx_users_id").unwrap().0;
+        change_count(&mut contracted_db, "DELETE FROM users WHERE id < 1900;");
+        let after_height = contracted_db.index_shape("idx_users_id").unwrap().0;
+        assert!(
+            after_height < before_height,
+            "id height {before_height} -> {after_height}"
+        );
+        drop(contracted_db);
+        assert_precommit(
+            &contracted,
+            "m33-pre-second",
+            "DELETE FROM users WHERE id >= 1900;",
+            crate::storage::Inject::BeforeLogSync,
+        );
+        for inject in [
+            crate::storage::Inject::AfterLogSync,
+            crate::storage::Inject::CommitSyncFailed,
+            crate::storage::Inject::DuringCheckpoint(1),
+        ] {
+            assert_postcommit(
+                &contracted,
+                &format!("m33-post-second-{inject:?}"),
+                "DELETE FROM users WHERE id >= 1900;",
+                inject,
+            );
+        }
+        drop(contract_dir);
+
+        assert_precommit(
+            &base,
+            "m33-pre-all",
+            "DELETE FROM users WHERE TRUE OR id = 0;",
+            crate::storage::Inject::BeforeLogSync,
+        );
+        {
+            let _guard = crate::storage::ForceDescentVerify::new();
+            assert_precommit(
+                &base,
+                "m33-pre-all-descent",
+                "DELETE FROM users WHERE TRUE OR id = 0;",
+                crate::storage::Inject::BeforeLogSync,
+            );
+        }
+        for inject in [
+            crate::storage::Inject::AfterLogSync,
+            crate::storage::Inject::CommitSyncFailed,
+            crate::storage::Inject::DuringCheckpoint(1),
+        ] {
+            assert_postcommit(
+                &base,
+                &format!("m33-post-all-{inject:?}"),
+                "DELETE FROM users WHERE TRUE OR id = 0;",
+                inject,
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "release profile of ordered posting-run verification"]
     fn profile_milestone32() {
         let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
@@ -23246,8 +23633,20 @@ mod tests {
                 let mut ordered = Vec::with_capacity(samples);
                 let mut descent = Vec::with_capacity(samples);
                 for sample in 0..samples {
-                    ordered.push(profile_bulk_delete(&base, rows, workload, sample, false));
-                    descent.push(profile_bulk_delete(&base, rows, workload, sample, true));
+                    ordered.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Chain,
+                    ));
+                    descent.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Descent,
+                    ));
                 }
                 for (index, sample) in ordered.iter().enumerate() {
                     let previous = &descent[index];
@@ -23319,6 +23718,130 @@ mod tests {
                     sample.ordered_verified,
                     sample.fallback_verified,
                     previous.fallback_verified,
+                    sample.id_height,
+                    sample.id_pages,
+                    sample.checksum
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release profile of posting presence-map verification"]
+    fn profile_milestone33() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!("milestone33 cpu={cpu} mem_bytes={mem} rustc={rustc}");
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            let (_base_dir, base) = seed_delete_db("m33-base", rows, 0x3100);
+            let samples = if rows == 100_000 { 3 } else { 1 };
+            for workload in [
+                "one",
+                "ten",
+                "buckets",
+                "half",
+                "sparse",
+                "alternating",
+                "consecutive",
+                "all",
+                "wide",
+            ] {
+                let mut presence = Vec::with_capacity(samples);
+                let mut chain = Vec::with_capacity(samples);
+                for sample in 0..samples {
+                    presence.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Presence,
+                    ));
+                    chain.push(profile_bulk_delete(
+                        &base,
+                        rows,
+                        workload,
+                        sample,
+                        VerifyMode::Chain,
+                    ));
+                }
+                for (index, sample) in presence.iter().enumerate() {
+                    let previous = &chain[index];
+                    assert_eq!(sample.checksum, previous.checksum, "{workload} {rows}");
+                    assert_eq!(sample.bulk_wal, previous.bulk_wal, "{workload} {rows}");
+                    assert_eq!(sample.spans, previous.spans, "{workload} {rows}");
+                    assert_eq!(sample.id_height, previous.id_height, "{workload} {rows}");
+                    assert_eq!(sample.id_pages, previous.id_pages, "{workload} {rows}");
+                    assert_eq!(sample.singles, previous.singles, "{workload} {rows}");
+                    if sample.presence_builds > 0 {
+                        assert!(
+                            sample.descents < previous.descents,
+                            "{workload} {rows} presence {} chain {}",
+                            sample.descents,
+                            previous.descents
+                        );
+                        assert!(sample.map_bytes > 0, "{workload} {rows}");
+                    } else {
+                        assert_eq!(sample.descents, previous.descents, "{workload} {rows}");
+                    }
+                }
+                let presence_us = median(
+                    &presence
+                        .iter()
+                        .map(|sample| sample.bulk_us)
+                        .collect::<Vec<_>>(),
+                );
+                let chain_us = median(
+                    &chain
+                        .iter()
+                        .map(|sample| sample.bulk_us)
+                        .collect::<Vec<_>>(),
+                );
+                let presence_index = median(
+                    &presence
+                        .iter()
+                        .map(|sample| sample.bulk_index_us)
+                        .collect::<Vec<_>>(),
+                );
+                let chain_index = median(
+                    &chain
+                        .iter()
+                        .map(|sample| sample.bulk_index_us)
+                        .collect::<Vec<_>>(),
+                );
+                let build_us = median(
+                    &presence
+                        .iter()
+                        .map(|sample| sample.presence_build_us)
+                        .collect::<Vec<_>>(),
+                );
+                let member_us = median(
+                    &presence
+                        .iter()
+                        .map(|sample| sample.presence_member_us)
+                        .collect::<Vec<_>>(),
+                );
+                let sample = &presence[0];
+                let previous = &chain[0];
+                println!(
+                    "milestone33 median workload={workload} rows={rows} samples={samples} presence_us={presence_us} chain_us={chain_us} presence_index_us={presence_index} chain_index_us={chain_index} build_us={build_us} member_us={member_us} wal={} spans={} scratch={} map_bytes={} builds={} hits={} misses={} presence_descents={} chain_descents={} presence_verified={} ordered_verified={} fallback_verified={} chain_fallback={} leaf_decodes={} chain_leaf_decodes={} sibling_steps={} id_height={} id_pages={} checksum={}",
+                    sample.bulk_wal,
+                    sample.spans,
+                    sample.scratch,
+                    sample.map_bytes,
+                    sample.presence_builds,
+                    sample.map_hits,
+                    sample.map_misses,
+                    sample.descents,
+                    previous.descents,
+                    sample.presence_verified,
+                    sample.ordered_verified,
+                    sample.fallback_verified,
+                    previous.fallback_verified,
+                    sample.leaf_decodes,
+                    previous.leaf_decodes,
+                    sample.sibling_steps,
                     sample.id_height,
                     sample.id_pages,
                     sample.checksum

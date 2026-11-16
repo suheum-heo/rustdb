@@ -87,6 +87,28 @@ pub(crate) struct Profile {
     /// Postings accepted by a root descent per posting.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fallback_verified: u64,
+    /// Validating the tree and building the posting presence map.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub presence_build: Duration,
+    /// Looking up requested postings in a presence map.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub presence_member: Duration,
+    /// Payload bytes of `(key, row id, leaf)` pairs stored in the map.
+    /// This is not peak resident memory.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub map_bytes: u64,
+    /// Requested pairs found in the map.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub map_hits: u64,
+    /// Requested pairs absent from the map.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub map_misses: u64,
+    /// Postings accepted after a presence-map check, including the seed leaf.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub presence_verified: u64,
+    /// Successful presence maps built during deletion.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub presence_builds: u64,
 }
 
 #[cfg(test)]
@@ -128,6 +150,13 @@ thread_local! {
         duplicate_checks: 0,
         ordered_verified: 0,
         fallback_verified: 0,
+        presence_build: Duration::ZERO,
+        presence_member: Duration::ZERO,
+        map_bytes: 0,
+        map_hits: 0,
+        map_misses: 0,
+        presence_verified: 0,
+        presence_builds: 0,
     }) };
 }
 
@@ -254,6 +283,34 @@ pub(crate) fn note_ordered_verified(count: u64) {
 
 pub(crate) fn note_fallback_verified(count: u64) {
     note_u64(|profile| &mut profile.fallback_verified, count);
+}
+
+pub(crate) fn add_presence_build(mark: Option<Instant>) {
+    add(|profile| &mut profile.presence_build, mark);
+}
+
+pub(crate) fn add_presence_member(mark: Option<Instant>) {
+    add(|profile| &mut profile.presence_member, mark);
+}
+
+pub(crate) fn note_map_bytes(bytes: u64) {
+    note_u64(|profile| &mut profile.map_bytes, bytes);
+}
+
+pub(crate) fn note_map_hit(count: u64) {
+    note_u64(|profile| &mut profile.map_hits, count);
+}
+
+pub(crate) fn note_map_miss() {
+    note_u64(|profile| &mut profile.map_misses, 1);
+}
+
+pub(crate) fn note_presence_verified(count: u64) {
+    note_u64(|profile| &mut profile.presence_verified, count);
+}
+
+pub(crate) fn note_presence_build_count() {
+    note_u64(|profile| &mut profile.presence_builds, 1);
 }
 
 fn note_u64(slot: fn(&mut Profile) -> &mut u64, amount: u64) {

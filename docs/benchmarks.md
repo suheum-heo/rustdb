@@ -1458,3 +1458,31 @@ Consecutive keys cut index time from 40,398 µs to 23,965 µs and the statement 
 At 100 rows the tree is one leaf. The chain walk does not run, the two verifiers seal the same log, and the statement is the log sync, about 11–13 ms. At 1,000 rows the half index is 463 µs against 706 µs, and the statement is 15,010 µs against 13,609 µs, so the statement does not get faster at that size. At 10,000 rows the half index is 3,130 µs against 5,387 µs, and the statement is 30,068 µs against 31,719 µs.
 
 The chain walk is not a cost heuristic. It does not choose between the span rebuild and the grouped path. Peak RSS was not measured. A request that is not monotonic still pays one descent per posting, and that is the remaining index cost on a half delete.
+
+## Milestone 33 posting presence map
+
+16 Nov 2026, Apple M5, 17179869184 bytes of memory, rustc 1.100.0. The ignored test is `profile_milestone33`. It uses seed `0x3100`. `presence` is the default verifier. `chain` forces the Milestone 32 leaf-chain check and one descent per posting when the request changes direction. At 100,000 rows each workload is the median of three fresh copies. Smaller sizes are one sample. This is not a power-loss test.
+
+The map is a hash table of every live `(key, row id)` pair and the leaf that holds it. It is built only when the request is not one monotonic run and the postings that would each descend would read more pages than the largest tree of this height. An internal page has at most 204 children, so a height-3 tree is bounded at 41,821 pages. A monotonic run still uses the Milestone 32 walk. One posting, ten postings, and the wide-name delete at height 3 stay on that walk. The map is dropped before the rebuild writes, and the rebuild validates the tree again. `map_bytes` is the payload of those pairs, `size_of<(i64, u64)>() + size_of<u32>()` times the posting count. It is not peak resident memory. Times are microseconds.
+
+| rows | workload | presence | chain | presence index | chain index | descents | chain descents | map bytes | WAL | checksum |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 100,000 | one | 20,509 | 19,368 | 16 | 15 | 1 | 1 | 0 | 36,996 | 5001482560 |
+| 100,000 | ten | 59,567 | 59,104 | 3,675 | 3,670 | 9 | 9 | 0 | 2,045,996 | 5001482470 |
+| 100,000 | buckets | 236,435 | 260,198 | 16,145 | 39,951 | 155 | 40,032 | 1,597,580 | 10,906,096 | 3000897535 |
+| 100,000 | half | 182,812 | 206,933 | 17,502 | 42,195 | 2 | 40,000 | 1,600,000 | 7,101,296 | 3750796338 |
+| 100,000 | sparse | 193,519 | 194,329 | 5,640 | 5,719 | 2 | 2 | 0 | 9,581,796 | 4001250051 |
+| 100,000 | alternating | 250,558 | 272,233 | 16,588 | 40,051 | 156 | 40,032 | 1,597,540 | 11,537,496 | 2500711280 |
+| 100,000 | consecutive | 123,084 | 133,875 | 11,194 | 21,934 | 2 | 20,000 | 1,600,000 | 4,555,196 | 4688644540 |
+| 100,000 | all | 287,960 | 338,207 | 29,585 | 79,774 | 495 | 80,248 | 1,595,080 | 12,168,896 | 0 |
+| 100,000 | wide | 244,867 | 243,935 | 13,469 | 13,762 | 7,343 | 7,343 | 0 | 12,181,196 | 4546235365 |
+
+The half delete is the case Milestone 32 left at 40,000 descents. The `id` index is one decreasing run. The `bucket` index is not. One map of the 80,000 live bucket postings accepts the 39,999 requested pairs after the initial descent. Descents fall from 40,000 to 2. Index time falls from 42,195 µs to 17,502 µs, of which 2,037 µs builds the map and 1,303 µs looks the requests up. The statement falls from 206,933 µs to 182,812 µs. The log stays 7,101,296 bytes, the checksum stays 3750796338, and the span rebuild is unchanged. Leaf decodes fall from 46,761 to 8,644 even though the rebuild validates the tree a second time.
+
+`bucket = 0 OR bucket = 1` and the alternating delete also build one map. Their descents fall from about 40,000 to 155 and 156. The statements fall by about 24 ms and 22 ms. The remaining descents are same-leaf groups that finish before the request underflows a leaf and reaches the map. Delete-all falls from 80,248 descents to 495, and index time from 79,774 µs to 29,585 µs. The statement falls from 338,207 µs to 287,960 µs. The log stays 12,168,896 bytes. Consecutive keys fall from 20,000 descents to 2, and the statement from 133,875 µs to 123,084 µs.
+
+Sparse NULL-bucket rows stay on the monotonic walk. Descents stay at 2, and the statement is 193,519 µs against 194,329 µs. A one-row delete does not build a map. At 100,000 rows it is 20,509 µs against 19,368 µs, with the same 36,996-byte log. Ten keys stay at 9 descents on both paths. The wide-name delete at height 3 is below the fanout bound, so it does not build a map. Its statement is 244,867 µs against 243,935 µs. At 10,000 rows that same delete is height 2, the map runs, and the statement is 32,226 µs against 34,224 µs.
+
+At 100 rows the tree is one leaf. The map does not run, and the statement is the log sync, about 10–14 ms. At 1,000 rows the half index is 241 µs against 470 µs, and the statement is 15,313 µs against 13,741 µs, so the statement does not get faster at that size. The 1,000-row `bucket = 0 OR bucket = 1` index is 698 µs against 681 µs. The map's build cost is visible there, and the statement is not faster.
+
+The map does not change the log or the scratch vector of the span rebuild. Peak RSS was not measured. A request below the fanout bound still descends once per posting.
