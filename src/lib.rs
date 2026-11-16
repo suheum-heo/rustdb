@@ -43,7 +43,11 @@
 //! share a leaf are removed together when the leaf
 //! stays at its minimum. A run that would drop a leaf below its minimum is
 //! repacked across that leaf span, and the internal pages above the surviving
-//! leaves are rebuilt in the same commit. One posting, and any run that stays
+//! leaves are rebuilt in the same commit. A run that is strictly increasing or
+//! strictly decreasing is checked along the leaf chain after one root descent.
+//! Publish hands postings over in descending stored order, which is decreasing
+//! for an indexed `id`. A run that changes direction, a repeated posting, and
+//! a test that forces the older check still descend once per posting. One posting, and any run that stays
 //! at the minimum, still uses the earlier delete. A test can force that
 //! grouped path. The rebuilt pages can differ from deleting one posting at a
 //! time. A delete that matches nothing still audits

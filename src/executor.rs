@@ -22862,7 +22862,7 @@ mod tests {
             ] {
                 let mut taken = Vec::with_capacity(samples);
                 for sample in 0..samples {
-                    taken.push(profile_bulk_delete(&base, rows, workload, sample));
+                    taken.push(profile_bulk_delete(&base, rows, workload, sample, true));
                 }
                 if samples > 1 {
                     for sample in &taken[1..] {
@@ -22936,6 +22936,12 @@ mod tests {
         singles: u64,
         grouped_singles: u64,
         descents: u64,
+        leaf_decodes: u64,
+        sibling_steps: u64,
+        posting_compares: u64,
+        duplicate_checks: u64,
+        ordered_verified: u64,
+        fallback_verified: u64,
         id_height: u32,
         id_pages: usize,
         checksum: i64,
@@ -22946,6 +22952,7 @@ mod tests {
         rows: i64,
         workload: &str,
         sample: usize,
+        descent_verify: bool,
     ) -> BulkSample {
         let sql = match workload {
             "one" => "DELETE FROM users WHERE id = 1;".to_string(),
@@ -22971,7 +22978,12 @@ mod tests {
         };
         crate::storage::reset_phases();
         let started = std::time::Instant::now();
-        let bulk_count = change_count(&mut bulk, &sql);
+        let bulk_count = if descent_verify {
+            let _guard = crate::storage::ForceDescentVerify::new();
+            change_count(&mut bulk, &sql)
+        } else {
+            change_count(&mut bulk, &sql)
+        };
         let bulk_us = started.elapsed().as_micros();
         let bulk_phases = crate::storage::take_phases();
         crate::storage::reset_phases();
@@ -23058,9 +23070,260 @@ mod tests {
             singles: bulk_phases.index_singles,
             grouped_singles: grouped_phases.index_singles,
             descents: bulk_phases.descents,
+            leaf_decodes: bulk_phases.leaf_decodes,
+            sibling_steps: bulk_phases.sibling_steps,
+            posting_compares: bulk_phases.posting_compares,
+            duplicate_checks: bulk_phases.duplicate_checks,
+            ordered_verified: bulk_phases.ordered_verified,
+            fallback_verified: bulk_phases.fallback_verified,
             id_height,
             id_pages,
             checksum,
+        }
+    }
+
+    #[test]
+    fn ordered_posting_run_matches_descent_verification() {
+        let _phases = crate::storage::enable_phases();
+        let (_dir, base) = seed_delete_db("m32-agree", 2_000, 0x3200);
+        let statements = [
+            ("one", "DELETE FROM users WHERE id = 1;"),
+            ("half", "DELETE FROM users WHERE id < 1000;"),
+            ("duplicates", "DELETE FROM users WHERE bucket = 1;"),
+            ("alternating", "DELETE FROM users WHERE active = TRUE;"),
+            ("bucket", "DELETE FROM users WHERE bucket = 0;"),
+            ("all", "DELETE FROM users WHERE TRUE OR id = 0;"),
+        ];
+        for (label, sql) in statements {
+            let (_ordered_dir, ordered_path, mut ordered) =
+                open_copy(&base, &format!("m32-{label}-o"));
+            let (_descent_dir, descent_path, mut descent) =
+                open_copy(&base, &format!("m32-{label}-d"));
+            let origin_next = ordered.table("users").unwrap().next_row_id();
+            crate::storage::reset_phases();
+            let ordered_count = change_count(&mut ordered, sql);
+            let ordered_phases = crate::storage::take_phases();
+            crate::storage::reset_phases();
+            let descent_count = {
+                let _guard = crate::storage::ForceDescentVerify::new();
+                change_count(&mut descent, sql)
+            };
+            let descent_phases = crate::storage::take_phases();
+            assert_eq!(ordered_count, descent_count, "{label}");
+            assert_eq!(
+                mutation_checksum(&mut ordered),
+                mutation_checksum(&mut descent),
+                "{label}"
+            );
+            assert_eq!(
+                table_rows(&mut ordered),
+                table_rows(&mut descent),
+                "{label}"
+            );
+            assert_eq!(
+                ordered.table("users").unwrap().row_ids(),
+                descent.table("users").unwrap().row_ids(),
+                "{label}"
+            );
+            assert_eq!(
+                ordered.table("users").unwrap().next_row_id(),
+                origin_next,
+                "{label}"
+            );
+            assert_eq!(
+                index_postings(&mut ordered, "idx_users_id"),
+                index_postings(&mut descent, "idx_users_id"),
+                "{label}"
+            );
+            assert_eq!(
+                index_postings(&mut ordered, "idx_users_bucket"),
+                index_postings(&mut descent, "idx_users_bucket"),
+                "{label}"
+            );
+            assert_eq!(
+                ordered.index_shape("idx_users_id").unwrap(),
+                descent.index_shape("idx_users_id").unwrap(),
+                "{label}"
+            );
+            assert_eq!(db_file(&ordered_path), db_file(&descent_path), "{label}");
+            assert_eq!(wal_len(&ordered_path), wal_len(&descent_path), "{label}");
+            assert_eq!(
+                ordered_phases.bulk_spans, descent_phases.bulk_spans,
+                "{label}"
+            );
+            assert_eq!(
+                ordered_phases.wal_bytes, descent_phases.wal_bytes,
+                "{label}"
+            );
+            if label == "one" {
+                assert_eq!(ordered_phases.bulk_spans, 0, "{label}");
+                assert!(
+                    ordered_phases.index_singles >= 1,
+                    "{label} {ordered_phases:?}"
+                );
+                assert_eq!(ordered_phases.descents, descent_phases.descents, "{label}");
+            }
+            if matches!(label, "half" | "all" | "alternating") {
+                assert!(
+                    ordered_phases.descents < descent_phases.descents,
+                    "{label} ordered {} descent {} verified {} fallback {}",
+                    ordered_phases.descents,
+                    descent_phases.descents,
+                    ordered_phases.ordered_verified,
+                    ordered_phases.fallback_verified
+                );
+                assert!(
+                    ordered_phases.ordered_verified > 0,
+                    "{label} {ordered_phases:?}"
+                );
+            }
+            let checksum = mutation_checksum(&mut ordered);
+            let ordered_lookup = query(&mut ordered, "SELECT id FROM users WHERE id = 1;")
+                .rows
+                .len();
+            let descent_lookup = query(&mut descent, "SELECT id FROM users WHERE id = 1;")
+                .rows
+                .len();
+            assert_eq!(ordered_lookup, descent_lookup, "{label}");
+            drop(ordered);
+            let mut reopened = Database::open(&ordered_path).unwrap();
+            assert_eq!(mutation_checksum(&mut reopened), checksum, "{label}");
+            assert_eq!(
+                query(&mut reopened, "SELECT id FROM users WHERE id = 1;")
+                    .rows
+                    .len(),
+                ordered_lookup,
+                "{label}"
+            );
+        }
+        assert_precommit(
+            &base,
+            "m32-pre-half",
+            "DELETE FROM users WHERE id < 1000;",
+            crate::storage::Inject::BeforeLogSync,
+        );
+        for inject in [
+            crate::storage::Inject::AfterLogSync,
+            crate::storage::Inject::CommitSyncFailed,
+            crate::storage::Inject::DuringCheckpoint(1),
+        ] {
+            assert_postcommit(
+                &base,
+                &format!("m32-post-half-{inject:?}"),
+                "DELETE FROM users WHERE id < 1000;",
+                inject,
+            );
+        }
+        assert_precommit(
+            &base,
+            "m32-pre-active",
+            "DELETE FROM users WHERE active = TRUE;",
+            crate::storage::Inject::BeforeLogSync,
+        );
+    }
+
+    #[test]
+    #[ignore = "release profile of ordered posting-run verification"]
+    fn profile_milestone32() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!("milestone32 cpu={cpu} mem_bytes={mem} rustc={rustc}");
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            let (_base_dir, base) = seed_delete_db("m32-base", rows, 0x3100);
+            let samples = if rows == 100_000 { 3 } else { 1 };
+            for workload in [
+                "one",
+                "sparse",
+                "duplicates",
+                "half",
+                "all",
+                "alternating",
+                "consecutive",
+                "wide",
+            ] {
+                let mut ordered = Vec::with_capacity(samples);
+                let mut descent = Vec::with_capacity(samples);
+                for sample in 0..samples {
+                    ordered.push(profile_bulk_delete(&base, rows, workload, sample, false));
+                    descent.push(profile_bulk_delete(&base, rows, workload, sample, true));
+                }
+                for (index, sample) in ordered.iter().enumerate() {
+                    let previous = &descent[index];
+                    assert_eq!(sample.checksum, previous.checksum, "{workload} {rows}");
+                    assert_eq!(sample.bulk_wal, previous.bulk_wal, "{workload} {rows}");
+                    assert_eq!(sample.spans, previous.spans, "{workload} {rows}");
+                    assert_eq!(sample.id_height, previous.id_height, "{workload} {rows}");
+                    assert_eq!(sample.id_pages, previous.id_pages, "{workload} {rows}");
+                    assert_eq!(sample.singles, previous.singles, "{workload} {rows}");
+                    if rows >= 1_000 && workload != "one" {
+                        assert!(
+                            sample.descents < previous.descents,
+                            "{workload} {rows} ordered {} descent {}",
+                            sample.descents,
+                            previous.descents
+                        );
+                    }
+                }
+                let ordered_us = median(
+                    &ordered
+                        .iter()
+                        .map(|sample| sample.bulk_us)
+                        .collect::<Vec<_>>(),
+                );
+                let descent_us = median(
+                    &descent
+                        .iter()
+                        .map(|sample| sample.bulk_us)
+                        .collect::<Vec<_>>(),
+                );
+                let ordered_index = median(
+                    &ordered
+                        .iter()
+                        .map(|sample| sample.bulk_index_us)
+                        .collect::<Vec<_>>(),
+                );
+                let descent_index = median(
+                    &descent
+                        .iter()
+                        .map(|sample| sample.bulk_index_us)
+                        .collect::<Vec<_>>(),
+                );
+                let grouped_us = median(
+                    &ordered
+                        .iter()
+                        .map(|sample| sample.grouped_us)
+                        .collect::<Vec<_>>(),
+                );
+                let sample = &ordered[0];
+                let previous = &descent[0];
+                println!(
+                    "milestone32 median workload={workload} rows={rows} samples={samples} ordered_us={ordered_us} descent_us={descent_us} ordered_index_us={ordered_index} descent_index_us={descent_index} grouped_us={grouped_us} wal={} spans={} merges={} internal_merges={} contractions={} allocated={} freed={} scratch={} singles={} ordered_descents={} descent_descents={} leaf_decodes={} descent_leaf_decodes={} sibling_steps={} compares={} duplicate_checks={} ordered_verified={} fallback_verified={} descent_fallback={} id_height={} id_pages={} checksum={}",
+                    sample.bulk_wal,
+                    sample.spans,
+                    sample.merges,
+                    sample.internal_merges,
+                    sample.contractions,
+                    sample.allocated,
+                    sample.freed,
+                    sample.scratch,
+                    sample.singles,
+                    sample.descents,
+                    previous.descents,
+                    sample.leaf_decodes,
+                    previous.leaf_decodes,
+                    sample.sibling_steps,
+                    sample.posting_compares,
+                    sample.duplicate_checks,
+                    sample.ordered_verified,
+                    sample.fallback_verified,
+                    previous.fallback_verified,
+                    sample.id_height,
+                    sample.id_pages,
+                    sample.checksum
+                );
+            }
         }
     }
 

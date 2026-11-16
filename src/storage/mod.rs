@@ -17,6 +17,8 @@ mod store;
 mod wal;
 
 #[cfg(test)]
+pub(crate) use btree::ForceDescentVerify;
+#[cfg(test)]
 pub(crate) use btree::ForceGroupedDelete;
 #[cfg(test)]
 pub(crate) use edit::ForcePerRowUnlink;
