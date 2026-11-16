@@ -964,3 +964,36 @@ Release profile `profile_milestone22`, 15 Nov 2026. Apple M5, 17179869184 bytes 
 At 10,000 by 10,000 matched rows, the ordinary hash warm time is 1,499 µs and the nested warm time is 659,336 µs, 439.9×. The distinct hash warm time is 1,770 µs and the nested warm time is 669,491 µs, 378.2×. The nested loop still examines 100,000,000 pairs. Square matched ordinary checksums are 8,802; 59,132; 196,205; and 499,599. Square matched distinct checksums are 8,698; 4,802; 4,802; and 4,802. The distinct checksum stops changing once every `id % 97` residue has been seen.
 
 The distinct query is not uniformly slower than the ordinary query. At 10,000 duplicates the distinct hash warm time is 1,200 µs and the ordinary hash warm time is 1,257 µs. At 10,000 unmatched rows (`none`) those times are 643 µs and 762 µs. Three distinct amounts and 97 distinct amounts do not separate the 10,000 hash times by more than a few hundred microseconds, while the distinct-set estimate grows from 576 bytes to 9,600 bytes. NULL amounts (`nulls`) still match every left row, so that hash run stays near the matched run. These samples do not support a claim that distinct admission dominates the join.
+
+## Milestone 23 SELECT DISTINCT over LEFT JOIN
+
+Release profile `profile_milestone23`, 15 Nov 2026. Apple M5, 17179869184 bytes of memory, `rustc 1.100.0 (0ef1bc386 2026-11-09)`. `Value` is 32 bytes. The three queries share each inserted table. `plain` is `SELECT u.name, o.amount`. `distinct` is `SELECT DISTINCT u.name, o.amount`. `limit` is that distinct query with `ORDER BY u.name ASC, o.amount ASC LIMIT 10`. User ids are `0..users`. An order follows the Milestone 22 shapes, with `user_id = id % users` for `matched` and `few`. `hits` counts ON-true orders. `null-extended` counts left rows with no such order. `inputs` is the logical row count. `nested candidates` is `users × orders`, the comparisons the nested loop performs. The hash path builds the right table and does not publish a probe counter. Nested times are omitted where the run was not performed. `distinct bytes` estimates one stored tuple per unique projection, its hash entry, and one text byte per name. `join bytes` is 0: the distinct path does not buffer pairs. Neither figure is process RSS. A `HashMap` that cannot grow aborts the process. Checksums are independent sums of the projected cells. They matched the hash path and, where it ran, the nested path.
+
+| Shape | Users | Orders | Hits | Null-extended | Inputs | Uniques | Distinct bytes | Plain hash warm | Distinct hash warm | Limit hash warm | Plain nested warm | Distinct nested warm | Limit nested warm | Plain checksum | Distinct checksum | Limit checksum |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| matched | 100 | 100 | 100 | 0 | 100 | 98 | 12,642 | 32 µs | 35 µs | 42 µs | 105 µs | 95 µs | 100 µs | 4,361 | 4,359 | 450 |
+| few | 100 | 100 | 100 | 0 | 100 | 24 | 3,096 | 21 µs | 27 µs | 31 µs | 95 µs | 91 µs | 90 µs | 199 | 48 | 19 |
+| duplicates | 100 | 100 | 100 | 90 | 190 | 18 | 2,322 | 21 µs | 29 µs | 32 µs | 83 µs | 91 µs | 94 µs | 340 | 38 | 23 |
+| none | 100 | 100 | 0 | 100 | 100 | 8 | 1,032 | 16 µs | 22 µs | 24 µs | 80 µs | 85 µs | 87 µs | 100 | 8 | 8 |
+| nulls | 100 | 100 | 100 | 0 | 100 | 8 | 1,032 | 21 µs | 25 µs | 27 µs | 83 µs | 85 µs | 132 µs | 100 | 8 | 8 |
+| matched | 1,000 | 1,000 | 1,000 | 0 | 1,000 | 734 | 94,686 | 141 µs | 244 µs | 305 µs | 7,181 µs | 7,521 µs | 7,345 µs | 43,690 | 35,461 | 55 |
+| few | 1,000 | 1,000 | 1,000 | 0 | 1,000 | 24 | 3,096 | 137 µs | 167 µs | 179 µs | 7,192 µs | 7,225 µs | 7,207 µs | 1,999 | 48 | 19 |
+| duplicates | 1,000 | 1,000 | 1,000 | 990 | 1,990 | 18 | 2,322 | 146 µs | 189 µs | 190 µs | 6,936 µs | 7,197 µs | 7,175 µs | 3,490 | 38 | 23 |
+| none | 1,000 | 1,000 | 0 | 1,000 | 1,000 | 8 | 1,032 | 85 µs | 116 µs | 119 µs | 6,927 µs | 7,058 µs | 7,309 µs | 1,000 | 8 | 8 |
+| nulls | 1,000 | 1,000 | 1,000 | 0 | 1,000 | 8 | 1,032 | 158 µs | 178 µs | 163 µs | 7,155 µs | 7,266 µs | 7,318 µs | 1,000 | 8 | 8 |
+| matched | 4,000 | 4,000 | 4,000 | 0 | 4,000 | 784 | 101,136 | 588 µs | 740 µs | 875 µs | 114,306 µs | 115,135 µs | 124,793 µs | 177,784 | 38,032 | 55 |
+| few | 4,000 | 4,000 | 4,000 | 0 | 4,000 | 24 | 3,096 | 590 µs | 724 µs | 775 µs | 114,713 µs | 114,591 µs | 114,234 µs | 7,999 | 48 | 19 |
+| duplicates | 4,000 | 4,000 | 4,000 | 3,990 | 7,990 | 18 | 2,322 | 515 µs | 696 µs | 798 µs | 116,857 µs | 113,329 µs | 114,072 µs | 13,990 | 38 | 23 |
+| none | 4,000 | 4,000 | 0 | 4,000 | 4,000 | 8 | 1,032 | 305 µs | 423 µs | 441 µs | 114,712 µs | 114,846 µs | 116,407 µs | 4,000 | 8 | 8 |
+| nulls | 4,000 | 4,000 | 4,000 | 0 | 4,000 | 8 | 1,032 | 532 µs | 736 µs | 652 µs | 114,905 µs | 116,133 µs | 115,238 µs | 4,000 | 8 | 8 |
+| matched | 10,000 | 10,000 | 10,000 | 0 | 10,000 | 784 | 101,136 | 1,400 µs | 1,810 µs | 1,845 µs | 715,496 µs | 731,256 µs | 738,961 µs | 446,000 | 38,032 | 55 |
+| few | 10,000 | 10,000 | 10,000 | 0 | 10,000 | 24 | 3,096 | 1,344 µs | 1,608 µs | 1,632 µs | — | — | — | 19,999 | 48 | 19 |
+| duplicates | 10,000 | 10,000 | 10,000 | 9,990 | 19,990 | 18 | 2,322 | 1,236 µs | 1,713 µs | 1,748 µs | — | — | — | 34,990 | 38 | 23 |
+| none | 10,000 | 10,000 | 0 | 10,000 | 10,000 | 8 | 1,032 | 739 µs | 1,025 µs | 1,031 µs | — | — | — | 10,000 | 8 | 8 |
+| nulls | 10,000 | 10,000 | 10,000 | 0 | 10,000 | 8 | 1,032 | 1,259 µs | 1,711 µs | 1,605 µs | — | — | — | 10,000 | 8 | 8 |
+| matched | 100 | 4,000 | 4,000 | 0 | 4,000 | 784 | 101,136 | 251 µs | 542 µs | 574 µs | 3,123 µs | 3,413 µs | 3,615 µs | 177,784 | 38,032 | 55 |
+| matched | 4,000 | 100 | 100 | 3,900 | 4,000 | 98 | 12,642 | 211 µs | 340 µs | 385 µs | 3,121 µs | 3,020 µs | 3,091 µs | 8,261 | 4,359 | 450 |
+
+At 10,000 by 10,000 matched rows, plain hash warm is 1,400 µs and nested warm is 715,496 µs, 511.1×. Distinct hash warm is 1,810 µs and nested warm is 731,256 µs, 404.0×. The plain hash cold time is 2,275 µs and the distinct hash cold time is 2,195 µs. The nested loop examines 100,000,000 pairs. Square matched plain checksums are 4,361; 43,690; 177,784; and 446,000. Square matched distinct checksums are 4,359; 35,461; 38,032; and 38,032. The distinct checksum stops changing once all eight names and the `id % 97` residues, including NULL, have been seen: 784 tuples.
+
+Distinct admission is visible and small next to the join. At 10,000 matched rows the distinct hash warm time is 410 µs above the plain query. Twenty-four unique tuples and 784 unique tuples differ by 202 µs at that size, while the estimate grows from 3,096 bytes to 101,136 bytes. The unmatched `none` hash run is the cheapest distinct sample at 10,000, 1,025 µs. `ORDER BY` plus `LIMIT 10` stays near the full distinct time because the scan still admits every tuple before the sort. These samples do not support a claim that the distinct set dominates a hash left join.

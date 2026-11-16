@@ -461,9 +461,9 @@ fn text_boolean_residual_and_aliases_follow_the_walker() {
     assert_eq!(
         failure(
             &mut database,
-            "SELECT DISTINCT f.name FROM flags f LEFT JOIN checks c ON f.id = c.ok;",
+            "SELECT DISTINCT f.name FROM flags f LEFT JOIN checks c ON f.id = c.ok GROUP BY f.name;",
         ),
-        "LEFT JOIN is not supported with DISTINCT"
+        "DISTINCT is not supported with GROUP BY"
     );
     let explained = query(
         &mut database,

@@ -504,8 +504,8 @@ fn unsupported_outer_forms_stay_rejected() {
             "multiple JOINs are not supported",
         ),
         (
-            "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id;",
-            "LEFT JOIN is not supported with DISTINCT",
+            "SELECT DISTINCT u.name FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.name;",
+            "DISTINCT is not supported with GROUP BY",
         ),
     ];
     for (sql, message) in cases {

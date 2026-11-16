@@ -677,8 +677,8 @@ fn unsupported_joins_are_rejected() {
     seed(&mut database);
     let cases = [
         (
-            "SELECT DISTINCT name FROM users LEFT JOIN orders ON users.id = orders.user_id;",
-            "LEFT JOIN is not supported with DISTINCT",
+            "SELECT DISTINCT name FROM users LEFT JOIN orders ON users.id = orders.user_id GROUP BY name;",
+            "DISTINCT is not supported with GROUP BY",
         ),
         (
             "SELECT * FROM users RIGHT JOIN orders ON users.id = orders.user_id;",
