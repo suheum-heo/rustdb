@@ -176,28 +176,53 @@ pub(crate) fn delete(
 /// The prefix stops at the first missing or repeated pair, and that error is
 /// the same as [`delete`]. A run that moves only forward or only backward in
 /// `(key, row id)` order is checked along the leaf chain after the first root
-/// descent. A run that changes direction is checked against a presence map
-/// when one descent per remaining posting would read more pages than the
-/// largest tree of this height. The map is built from [`validate`] and the
-/// leaf chain, then dropped before any page is written. A map that cannot be
-/// built, a request that is too small, and a test that forces it still
-/// descend once per posting. A test can also force the grouped path for every
-/// run.
+/// descent. A run that changes direction may be checked against a presence
+/// map before this loop. The map is a snapshot of the current root. It is
+/// dropped when a rebuild frees pages. A map that cannot be built, a monotonic
+/// run, a request whose descents would read fewer pages than the estimate, and
+/// a test that forces the older check still descend once per posting. A test
+/// can also force the grouped path for every run.
 pub(crate) fn delete_many(
     store: &mut dyn Nodes,
-    mut root: u32,
+    root: u32,
     entries: &[Entry],
     limits: Limits,
 ) -> Result<u32, DbError> {
     if grouped_only() {
         return delete_grouped(store, root, entries, limits);
     }
+    let plan = try_early_presence(store, root, entries, limits)?;
+    delete_with_plan(store, root, entries, limits, plan)
+}
+
+fn delete_with_plan(
+    store: &mut dyn Nodes,
+    mut root: u32,
+    entries: &[Entry],
+    limits: Limits,
+    mut plan: Option<PresencePlan>,
+) -> Result<u32, DbError> {
     let mut cursor = 0;
+    // Grouped rewrites and single deletes that stay above the minimum do not
+    // free a leaf or change another leaf's child index. A span rebuild does.
+    let mut rebuilt = false;
+    let mut mutated = false;
     while cursor < entries.len() {
         if root == 0 {
             return Err(missing());
         }
-        let (path, leaf_id) = path_to_leaf(store, root, entries[cursor])?;
+        let cached = if rebuilt {
+            None
+        } else {
+            plan.as_ref()
+                .filter(|plan| plan.live)
+                .and_then(|plan| plan.place(entries[cursor]))
+        };
+        let (path, leaf_id) = if let Some(place) = cached {
+            (place.path, place.leaf)
+        } else {
+            path_to_leaf(store, root, entries[cursor])?
+        };
         let leaf = decode_leaf(&store.read_node(leaf_id)?)?;
         // Count a slot once. A second copy of the same pair ends the run, so
         // the next pass reports it missing after the first copy is removed.
@@ -226,10 +251,34 @@ pub(crate) fn delete_many(
             let minimum_changed = removed.entries[0] != old_first;
             super::profile::note_leaf_batch(u64::try_from(take).unwrap_or(u64::MAX));
             rewrite_leaf_path(store, &path, leaf_id, &removed, minimum_changed)?;
+            mutated = true;
             cursor += take;
         } else if run > room {
-            let (new_root, taken) =
-                bulk_rebalance(store, root, &entries[cursor..], leaf_id, run, &path, limits)?;
+            let prepared = if rebuilt {
+                None
+            } else {
+                plan.as_ref()
+                    .and_then(|plan| plan.hits(&entries[cursor..], leaf_id, run))
+            };
+            let skip_validate = prepared.is_some() && !mutated;
+            let (new_root, taken) = bulk_rebalance(
+                store,
+                root,
+                BulkRequest {
+                    entries: &entries[cursor..],
+                    seed_leaf: leaf_id,
+                    seed_count: run,
+                    path: &path,
+                    prepared,
+                    skip_validate,
+                },
+                limits,
+            )?;
+            rebuilt = true;
+            mutated = true;
+            if let Some(plan) = plan.as_mut() {
+                plan.live = false;
+            }
             if taken == 0 {
                 root = delete(store, root, entries[cursor].0, entries[cursor].1, limits)?;
                 cursor += 1;
@@ -238,7 +287,18 @@ pub(crate) fn delete_many(
                 cursor += taken;
             }
         } else {
-            root = delete(store, root, entries[cursor].0, entries[cursor].1, limits)?;
+            let next = delete(store, root, entries[cursor].0, entries[cursor].1, limits)?;
+            // A leaf that stays at its minimum is not merged, so the other
+            // leaves keep their page ids. A root change means this snapshot
+            // no longer describes the tree.
+            if next != root {
+                rebuilt = true;
+                if let Some(plan) = plan.as_mut() {
+                    plan.live = false;
+                }
+            }
+            root = next;
+            mutated = true;
             cursor += 1;
         }
     }
@@ -367,6 +427,7 @@ fn descent_only() -> bool {
 thread_local! {
     static FORCE_CHAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FORCE_PRESENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FORCE_LATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Keep Milestone 32's leaf-chain check and skip the presence map.
@@ -385,6 +446,25 @@ impl ForceChainVerify {
 impl Drop for ForceChainVerify {
     fn drop(&mut self) {
         FORCE_CHAIN.with(|flag| flag.set(false));
+    }
+}
+
+/// Keep Milestone 33's late map and skip the early plan.
+#[cfg(test)]
+pub(crate) struct ForceLatePresence;
+
+#[cfg(test)]
+impl ForceLatePresence {
+    pub(crate) fn new() -> Self {
+        FORCE_LATE.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceLatePresence {
+    fn drop(&mut self) {
+        FORCE_LATE.with(|flag| flag.set(false));
     }
 }
 
@@ -430,6 +510,17 @@ fn presence_forced() -> bool {
     }
 }
 
+fn late_only() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_LATE.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 struct Hit {
     entry: Entry,
     leaf: u32,
@@ -450,16 +541,34 @@ struct Loaded {
 /// before any page is written. A corrupt page, including one outside the
 /// deleted key range, returns the corrupt error and leaves the store as it
 /// was. The rebuilt tree uses the same leaf and internal page encodings.
+struct BulkRequest<'a> {
+    entries: &'a [Entry],
+    seed_leaf: u32,
+    seed_count: usize,
+    path: &'a [(u32, usize)],
+    prepared: Option<Vec<Hit>>,
+    skip_validate: bool,
+}
+
 fn bulk_rebalance(
     store: &mut dyn Nodes,
     root: u32,
-    entries: &[Entry],
-    seed_leaf: u32,
-    seed_count: usize,
-    path: &[(u32, usize)],
+    request: BulkRequest<'_>,
     limits: Limits,
 ) -> Result<(u32, usize), DbError> {
-    let hits = collect_hits(store, root, entries, seed_leaf, seed_count, path, limits)?;
+    let BulkRequest {
+        entries,
+        seed_leaf,
+        seed_count,
+        path,
+        prepared,
+        skip_validate,
+    } = request;
+    let hits = if let Some(hits) = prepared {
+        hits
+    } else {
+        collect_hits(store, root, entries, seed_leaf, seed_count, path, limits)?
+    };
     if hits.len() < 2 {
         return Ok((root, 0));
     }
@@ -489,7 +598,13 @@ fn bulk_rebalance(
     // Reject a tree that is already corrupt before this rebuild writes a
     // page. The walk visits every leaf and internal page, so a damaged page
     // outside the deleted keys fails here. A one-posting delete does not.
-    validate(store, root, limits)?;
+    // An early plan that validated this same root, and has not written since,
+    // already established those invariants.
+    if skip_validate {
+        super::profile::note_validation_skipped();
+    } else {
+        validate(store, root, limits)?;
+    }
     let old_height = height(store, root)?;
     let old_internals = internal_ids(store, root)?;
     let old_chain = leaf_chain(store, root)?;
@@ -826,6 +941,338 @@ fn presence_map_eligible(suffix: usize, height: u32) -> bool {
         return suffix > 0;
     }
     presence_reads_exceed_tree(suffix, height)
+}
+
+/// Pages a descent-cost estimate attributes to the current tree.
+///
+/// `exact` is the page count read from the root and, at height 3, from each
+/// of the root's children. Taller trees use that root shape as a ceiling and
+/// fill every unseen level to this tree's own internal fanout. The probe does
+/// not read leaves.
+#[derive(Clone, Copy, Debug)]
+struct ScanEstimate {
+    height: u32,
+    pages: u64,
+    exact: bool,
+}
+
+struct LeafPlace {
+    leaf: u32,
+    path: Vec<(u32, usize)>,
+}
+
+/// Statement-local snapshot of one index. `live` is false after a rebuild
+/// frees or reallocates pages. Leaf ids in `leaves` are then unusable.
+struct PresencePlan {
+    leaves: HashMap<Entry, u32>,
+    paths: HashMap<u32, Vec<(u32, usize)>>,
+    live: bool,
+}
+
+impl PresencePlan {
+    fn place(&self, entry: Entry) -> Option<LeafPlace> {
+        if !self.live {
+            return None;
+        }
+        let leaf = *self.leaves.get(&entry)?;
+        let path = self.paths.get(&leaf)?.clone();
+        Some(LeafPlace { leaf, path })
+    }
+
+    /// Hits for a bulk suffix, or `None` when this snapshot does not name the
+    /// seed leaf. The caller then uses the older per-posting check.
+    fn hits(&self, entries: &[Entry], seed_leaf: u32, seed_count: usize) -> Option<Vec<Hit>> {
+        if !self.live || seed_count > entries.len() {
+            return None;
+        }
+        let mut hits = Vec::new();
+        let mut claimed = HashSet::new();
+        for entry in entries.iter().copied().take(seed_count) {
+            if self.leaves.get(&entry).copied() != Some(seed_leaf) {
+                return None;
+            }
+            if !claimed.insert(entry) {
+                return Some(hits);
+            }
+            hits.push(Hit {
+                entry,
+                leaf: seed_leaf,
+            });
+        }
+        for entry in entries.iter().copied().skip(seed_count) {
+            if !claimed.insert(entry) {
+                break;
+            }
+            match self.leaves.get(&entry).copied() {
+                Some(leaf) => hits.push(Hit { entry, leaf }),
+                None => break,
+            }
+        }
+        if hits.len() < 2 { None } else { Some(hits) }
+    }
+}
+
+fn direction_of(entries: &[Entry]) -> Option<Direction> {
+    let mut direction = None;
+    for pair in entries.windows(2) {
+        let step = match cmp_entry(pair[0], pair[1]) {
+            Ordering::Less => Direction::Forward,
+            Ordering::Greater => Direction::Backward,
+            Ordering::Equal => return None,
+        };
+        match direction {
+            None => direction = Some(step),
+            Some(current) if current != step => return None,
+            Some(_) => {}
+        }
+    }
+    Some(direction.unwrap_or(Direction::Forward))
+}
+
+/// `None` keeps the Milestone 33 decision inside the first underflow.
+///
+/// A monotonic run stays on the leaf-chain check. A height-1 tree is one
+/// leaf, so the grouping loop already sees every posting after one descent.
+/// The map is also skipped when the request has no more postings than the
+/// estimate has pages: hashing every live posting would dominate that delete.
+fn try_early_presence(
+    store: &mut dyn Nodes,
+    root: u32,
+    entries: &[Entry],
+    limits: Limits,
+) -> Result<Option<PresencePlan>, DbError> {
+    if late_only() || descent_only() || chain_only() || root == 0 || entries.is_empty() {
+        return Ok(None);
+    }
+    if direction_of(entries).is_some() {
+        return Ok(None);
+    }
+    let estimate = match estimate_scan(store, root, limits) {
+        Ok(estimate) => estimate,
+        Err(_) => return Ok(None),
+    };
+    super::profile::note_estimated_pages(estimate.pages);
+    if !early_map_eligible(entries.len(), &estimate) {
+        return Ok(None);
+    }
+    let built = super::profile::start();
+    let mut hints = Vec::new();
+    let (flat, scanned) = match validate_tree(store, root, limits, Some(&mut hints)) {
+        Ok(tree) => tree,
+        Err(_) => {
+            super::profile::add_presence_build(built);
+            return Ok(None);
+        }
+    };
+    let Some(plan) = assemble_presence(&flat, hints) else {
+        super::profile::add_presence_build(built);
+        return Ok(None);
+    };
+    super::profile::note_scanned_pages(scanned);
+    super::profile::add_presence_build(built);
+    let payload = count_u64(plan.leaves.len()).saturating_mul(
+        u64::try_from(std::mem::size_of::<Entry>() + std::mem::size_of::<u32>())
+            .unwrap_or(u64::MAX),
+    );
+    let leaves = plan.leaves;
+    let paths = plan.paths;
+    let member = super::profile::start();
+    let mut seen = HashSet::new();
+    if seen.try_reserve(entries.len()).is_err() {
+        super::profile::add_presence_member(member);
+        return Ok(None);
+    }
+    let mut verified = 0_usize;
+    for entry in entries.iter().copied() {
+        super::profile::note_duplicate_check_n(1);
+        if !seen.insert(entry) {
+            break;
+        }
+        if leaves.contains_key(&entry) {
+            super::profile::note_map_hit(1);
+            verified += 1;
+        } else {
+            super::profile::note_map_miss();
+            break;
+        }
+    }
+    super::profile::add_presence_member(member);
+    super::profile::note_presence_verified(count_u64(verified));
+    super::profile::note_map_bytes(payload);
+    super::profile::note_presence_build_count();
+    super::profile::note_early_plan();
+    Ok(Some(PresencePlan {
+        leaves,
+        paths,
+        live: true,
+    }))
+}
+
+/// Fill the map from the entries [`validate_tree`] already accepted.
+///
+/// `try_reserve` failure drops the hints and leaves the request unconsumed.
+/// A duplicate pair or a count that does not match the validated entries
+/// means the hints are not a snapshot of that walk.
+fn assemble_presence(flat: &[Entry], hints: Vec<LeafHint>) -> Option<PresencePlan> {
+    let recorded = super::profile::start();
+    let mut leaves = HashMap::new();
+    let mut paths = HashMap::new();
+    if leaves.try_reserve(flat.len()).is_err() || paths.try_reserve(hints.len()).is_err() {
+        super::profile::add_path_record(recorded);
+        return None;
+    }
+    let mut cursor = 0_usize;
+    for hint in hints {
+        let Some(end) = cursor.checked_add(hint.count) else {
+            super::profile::add_path_record(recorded);
+            return None;
+        };
+        if end > flat.len() || paths.insert(hint.id, hint.path).is_some() {
+            super::profile::add_path_record(recorded);
+            return None;
+        }
+        for entry in &flat[cursor..end] {
+            if leaves.insert(*entry, hint.id).is_some() {
+                super::profile::add_path_record(recorded);
+                return None;
+            }
+        }
+        cursor = end;
+    }
+    super::profile::add_path_record(recorded);
+    if cursor != flat.len() || leaves.len() != flat.len() {
+        return None;
+    }
+    Some(PresencePlan {
+        leaves,
+        paths,
+        live: true,
+    })
+}
+
+fn early_map_eligible(suffix: usize, estimate: &ScanEstimate) -> bool {
+    if chain_only() || descent_only() || suffix == 0 || estimate.height <= 1 {
+        return false;
+    }
+    if presence_forced() {
+        return true;
+    }
+    let pages = estimate.pages.max(1);
+    let reads = u64::try_from(suffix)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::from(estimate.height));
+    if reads <= pages {
+        return false;
+    }
+    // An exact page count is also the tree's size. A shorter request stays on
+    // the descent path so the delete does not hash every live posting. An
+    // inexact count is already a ceiling, so the read comparison is enough.
+    !estimate.exact || count_u64(suffix) > pages
+}
+
+fn estimate_scan(
+    store: &mut dyn Nodes,
+    root: u32,
+    limits: Limits,
+) -> Result<ScanEstimate, DbError> {
+    if root == 0 {
+        return Ok(ScanEstimate {
+            height: 0,
+            pages: 0,
+            exact: true,
+        });
+    }
+    let page = store.read_node(root)?;
+    let kind = page_type(&page)?;
+    if kind == TYPE_INDEX_LEAF {
+        return Ok(ScanEstimate {
+            height: 1,
+            pages: 1,
+            exact: true,
+        });
+    }
+    if kind != TYPE_INDEX_INTERNAL {
+        return Err(corrupt(root));
+    }
+    let root_node = decode_internal(&page)?;
+    let children = root_node.children.len();
+    let child_count = u64::try_from(children).unwrap_or(u64::MAX);
+    let Some(first) = root_node.children.first().copied() else {
+        return Err(corrupt(root));
+    };
+    let first_page = store.read_node(first)?;
+    let first_kind = page_type(&first_page)?;
+    if first_kind == TYPE_INDEX_LEAF {
+        return Ok(ScanEstimate {
+            height: 2,
+            pages: child_count.saturating_add(1),
+            exact: true,
+        });
+    }
+    if first_kind != TYPE_INDEX_INTERNAL {
+        return Err(corrupt(first));
+    }
+    let height = height(store, root)?;
+    let fanout = u64::try_from(limits.internal_max)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let ceiling = |height| fanout_pages(fanout, height);
+    if height == 3 {
+        let mut leaves = 0_u64;
+        for child in root_node.children {
+            let Some(node) = read_internal(store, child) else {
+                return Ok(ScanEstimate {
+                    height,
+                    pages: ceiling(height),
+                    exact: false,
+                });
+            };
+            leaves = leaves.saturating_add(u64::try_from(node.children.len()).unwrap_or(u64::MAX));
+        }
+        return Ok(ScanEstimate {
+            height,
+            pages: child_count.saturating_add(1).saturating_add(leaves),
+            exact: true,
+        });
+    }
+    // Read the root's children and stop. Each of those nodes roots a subtree
+    // whose remaining levels are filled to this tree's own fanout. Counting
+    // every lower internal page would be the scan the estimate is avoiding.
+    let mut level_two = 0_u64;
+    for child in root_node.children {
+        let Some(node) = read_internal(store, child) else {
+            return Ok(ScanEstimate {
+                height,
+                pages: ceiling(height),
+                exact: false,
+            });
+        };
+        level_two =
+            level_two.saturating_add(u64::try_from(node.children.len()).unwrap_or(u64::MAX));
+    }
+    let below = fanout_pages(fanout, height.saturating_sub(2));
+    Ok(ScanEstimate {
+        height,
+        pages: child_count
+            .saturating_add(1)
+            .saturating_add(level_two.saturating_mul(below)),
+        exact: false,
+    })
+}
+
+fn fanout_pages(fanout: u64, height: u32) -> u64 {
+    let mut pages = 1_u64;
+    let mut level = 1_u64;
+    for _ in 1..height.max(1) {
+        level = level.saturating_mul(fanout);
+        pages = pages.saturating_add(level);
+    }
+    pages
+}
+
+fn read_internal(store: &mut dyn Nodes, id: u32) -> Option<Internal> {
+    let page = store.read_node(id).ok()?;
+    decode_internal(&page).ok()
 }
 
 /// `None` means the map is not a safe substitute. The caller repeats the
@@ -1908,12 +2355,34 @@ pub(crate) fn validate(
     root: u32,
     limits: Limits,
 ) -> Result<Vec<Entry>, DbError> {
+    validate_tree(store, root, limits, None).map(|(flat, _)| flat)
+}
+
+/// One structural walk. `hints` records each leaf's parent path and entry
+/// count for the caller that is about to build a presence map. The checks are
+/// the same whether or not that record is requested.
+fn validate_tree(
+    store: &mut dyn Nodes,
+    root: u32,
+    limits: Limits,
+    hints: Option<&mut Vec<LeafHint>>,
+) -> Result<(Vec<Entry>, u64), DbError> {
+    super::profile::note_tree_validation();
     if root == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let mut seen = Vec::new();
     let mut leaves = Vec::new();
-    let _ = check_node(store, root, true, limits, &mut seen, &mut leaves, 0)?;
+    {
+        let mut walk = Walk {
+            seen: &mut seen,
+            leaves: &mut leaves,
+            hints,
+            path: Vec::new(),
+        };
+        let _ = check_node(store, root, true, limits, &mut walk, 0)?;
+    }
+    let scanned = count_u64(seen.len());
     let mut previous = 0;
     let mut flat = Vec::new();
     for (index, id) in leaves.iter().copied().enumerate() {
@@ -1939,7 +2408,21 @@ pub(crate) fn validate(
             return Err(corrupt(root));
         }
     }
-    Ok(flat)
+    Ok((flat, scanned))
+}
+
+/// Parent path and entry count of one leaf, captured during [`validate_tree`].
+struct LeafHint {
+    id: u32,
+    path: Vec<(u32, usize)>,
+    count: usize,
+}
+
+struct Walk<'a> {
+    seen: &'a mut Vec<u32>,
+    leaves: &'a mut Vec<u32>,
+    hints: Option<&'a mut Vec<LeafHint>>,
+    path: Vec<(u32, usize)>,
 }
 
 /// Every page the tree owns, including the root.
@@ -1977,14 +2460,13 @@ fn check_node(
     id: u32,
     is_root: bool,
     limits: Limits,
-    seen: &mut Vec<u32>,
-    leaves: &mut Vec<u32>,
+    walk: &mut Walk<'_>,
     depth: u32,
 ) -> Result<Entry, DbError> {
-    if depth >= MAX_DEPTH || !seen.iter().all(|page| *page != id) {
+    if depth >= MAX_DEPTH || !walk.seen.iter().all(|page| *page != id) {
         return Err(corrupt(id));
     }
-    seen.push(id);
+    walk.seen.push(id);
     let page = store.read_node(id)?;
     match page_type(&page)? {
         TYPE_INDEX_LEAF => {
@@ -2000,7 +2482,14 @@ fn check_node(
                     return Err(corrupt(id));
                 }
             }
-            leaves.push(id);
+            if let Some(hints) = walk.hints.as_mut() {
+                hints.push(LeafHint {
+                    id,
+                    path: walk.path.clone(),
+                    count: leaf.entries.len(),
+                });
+            }
+            walk.leaves.push(id);
             Ok(leaf.entries[0])
         }
         TYPE_INDEX_INTERNAL => {
@@ -2021,7 +2510,9 @@ fn check_node(
             }
             let mut child_min = None;
             for (index, child) in node.children.iter().copied().enumerate() {
-                let minimum = check_node(store, child, false, limits, seen, leaves, depth + 1)?;
+                walk.path.push((id, index));
+                let minimum = check_node(store, child, false, limits, walk, depth + 1)?;
+                walk.path.pop();
                 if index == 0 {
                     child_min = Some(minimum);
                 } else if node.keys[index - 1] != minimum {
@@ -5739,38 +6230,73 @@ mod tests {
         let entries = sequential(8);
         let (mut store, root) = fill(small(), &entries);
         assert_eq!(height(&mut store, root).unwrap(), 2);
+        let estimate = estimate_scan(&mut store, root, small()).unwrap();
+        assert!(estimate.exact, "{estimate:?}");
+        assert_eq!(estimate.height, 2);
+        assert!(estimate.pages > 1, "{}", estimate.pages);
         let mixed = interleaved(&entries);
         crate::storage::profile::reset();
         delete_many(&mut store, root, &mixed, small()).unwrap();
         let height_two = crate::storage::profile::take();
-        assert_eq!(height_two.presence_builds, 0, "{height_two:?}");
+        assert!(
+            count_u64(mixed.len()) > estimate.pages,
+            "mixed {} pages {}",
+            mixed.len(),
+            estimate.pages
+        );
+        assert!(height_two.early_plans >= 1, "{height_two:?}");
+        assert!(height_two.presence_builds >= 1, "{height_two:?}");
         crate::storage::profile::reset();
         {
-            let (mut store, root) = fill(small(), &entries);
-            let _guard = ForcePresenceMap::new();
-            delete_many(&mut store, root, &mixed, small()).unwrap();
+            let (mut late_store, late_root) = fill(small(), &entries);
+            let _guard = ForceLatePresence::new();
+            delete_many(&mut late_store, late_root, &mixed, small()).unwrap();
         }
-        let forced_two = crate::storage::profile::take();
-        assert!(forced_two.presence_builds >= 1, "{forced_two:?}");
-        delete_verified("height2-forced", small(), &entries, &mixed);
+        let late_two = crate::storage::profile::take();
+        assert_eq!(late_two.early_plans, 0, "{late_two:?}");
+        assert_eq!(late_two.presence_builds, 0, "{late_two:?}");
+        assert!(
+            height_two.descents < late_two.descents,
+            "early {} late {}",
+            height_two.descents,
+            late_two.descents
+        );
+        delete_verified("height2-early", small(), &entries, &mixed);
 
         let tall = sequential(48);
         let (mut store, root) = fill(small(), &tall);
         let tall_height = height(&mut store, root).unwrap();
         assert!(tall_height >= 3, "{tall_height}");
+        let tall_estimate = estimate_scan(&mut store, root, small()).unwrap();
+        if tall_height == 3 {
+            assert!(tall_estimate.exact, "{tall_estimate:?}");
+            assert!(
+                tall_estimate.pages < max_index_pages(3),
+                "estimate {} ceiling {}",
+                tall_estimate.pages,
+                max_index_pages(3)
+            );
+        }
         let mixed = interleaved(&tall);
         crate::storage::profile::reset();
         delete_many(&mut store, root, &mixed, small()).unwrap();
         let automatic = crate::storage::profile::take();
-        assert_eq!(automatic.presence_builds, 0, "{automatic:?}");
+        assert!(automatic.early_plans >= 1, "{automatic:?}");
+        assert!(automatic.presence_builds >= 1, "{automatic:?}");
         crate::storage::profile::reset();
         {
-            let (mut store, root) = fill(small(), &tall);
-            let _guard = ForcePresenceMap::new();
-            delete_many(&mut store, root, &mixed, small()).unwrap();
+            let (mut late_store, late_root) = fill(small(), &tall);
+            let _guard = ForceLatePresence::new();
+            delete_many(&mut late_store, late_root, &mixed, small()).unwrap();
         }
-        let forced_tall = crate::storage::profile::take();
-        assert!(forced_tall.presence_builds >= 1, "{forced_tall:?}");
+        let late_tall = crate::storage::profile::take();
+        assert_eq!(late_tall.presence_builds, 0, "{late_tall:?}");
+        assert!(
+            automatic.descents < late_tall.descents,
+            "early {} late {}",
+            automatic.descents,
+            late_tall.descents
+        );
 
         let ascending = sequential(48);
         crate::storage::profile::reset();
@@ -5797,6 +6323,14 @@ mod tests {
         let wide = sequential(800);
         let (mut probe, root) = fill(production(), &wide);
         assert_eq!(height(&mut probe, root).unwrap(), 2);
+        let wide_estimate = estimate_scan(&mut probe, root, production()).unwrap();
+        assert!(wide_estimate.exact, "{wide_estimate:?}");
+        assert_eq!(wide_estimate.height, 2);
+        assert!(
+            wide_estimate.pages < max_index_pages(2),
+            "{}",
+            wide_estimate.pages
+        );
         let runs = leaf_runs(&mut probe, root);
         let thin = runs
             .iter()
@@ -5815,24 +6349,44 @@ mod tests {
         let mut above = vec![thin_key];
         above.extend(foreign.iter().copied().take(103));
         let mut short = vec![thin_key];
-        short.extend(foreign.iter().copied().take(9));
+        let short_extra = usize::try_from(wide_estimate.pages).unwrap_or(usize::MAX);
+        short.extend(foreign.iter().copied().take(short_extra.saturating_sub(2)));
+        assert!(count_u64(short.len()) <= wide_estimate.pages);
         crate::storage::profile::reset();
         {
             let (mut store, root) = fill(production(), &wide);
+            let _guard = ForceLatePresence::new();
             delete_many(&mut store, root, &below, production()).unwrap();
         }
         let below_profile = crate::storage::profile::take();
+        assert_eq!(below_profile.early_plans, 0, "{below_profile:?}");
         assert_eq!(below_profile.presence_builds, 0, "{below_profile:?}");
         assert!(below_profile.fallback_verified > 0, "{below_profile:?}");
         crate::storage::profile::reset();
         {
             let (mut store, root) = fill(production(), &wide);
+            let _guard = ForceLatePresence::new();
             delete_many(&mut store, root, &above, production()).unwrap();
         }
-        let above_profile = crate::storage::profile::take();
-        assert!(above_profile.presence_builds >= 1, "{above_profile:?}");
-        assert!(above_profile.presence_verified > 0, "{above_profile:?}");
-        assert_eq!(above_profile.fallback_verified, 0, "{above_profile:?}");
+        let above_late = crate::storage::profile::take();
+        assert!(above_late.presence_builds >= 1, "{above_late:?}");
+        assert_eq!(above_late.early_plans, 0, "{above_late:?}");
+        crate::storage::profile::reset();
+        {
+            let (mut store, root) = fill(production(), &wide);
+            delete_many(&mut store, root, &below, production()).unwrap();
+        }
+        let below_early = crate::storage::profile::take();
+        assert!(below_early.early_plans >= 1, "{below_early:?}");
+        assert!(below_early.presence_builds >= 1, "{below_early:?}");
+        assert!(below_early.presence_verified > 0, "{below_early:?}");
+        assert_eq!(below_early.fallback_verified, 0, "{below_early:?}");
+        assert!(
+            below_early.descents < below_profile.descents,
+            "early {} late {}",
+            below_early.descents,
+            below_profile.descents
+        );
         crate::storage::profile::reset();
         {
             let (mut store, root) = fill(production(), &wide);
@@ -5840,6 +6394,7 @@ mod tests {
         }
         let ten_profile = crate::storage::profile::take();
         assert_eq!(ten_profile.presence_builds, 0, "{ten_profile:?}");
+        assert_eq!(ten_profile.early_plans, 0, "{ten_profile:?}");
         delete_verified("below-bound", production(), &wide, &below);
         delete_verified("above-bound", production(), &wide, &above);
         delete_verified("ten-postings", production(), &wide, &short);

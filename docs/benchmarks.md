@@ -1486,3 +1486,37 @@ Sparse NULL-bucket rows stay on the monotonic walk. Descents stay at 2, and the 
 At 100 rows the tree is one leaf. The map does not run, and the statement is the log sync, about 10–14 ms. At 1,000 rows the half index is 241 µs against 470 µs, and the statement is 15,313 µs against 13,741 µs, so the statement does not get faster at that size. The 1,000-row `bucket = 0 OR bucket = 1` index is 698 µs against 681 µs. The map's build cost is visible there, and the statement is not faster.
 
 The map does not change the log or the scratch vector of the span rebuild. Peak RSS was not measured. A request below the fanout bound still descends once per posting.
+
+## Milestone 34 early presence-map planning
+
+16 Nov 2026, Apple M5, 17179869184 bytes of memory, rustc 1.100.0. The ignored test is `profile_milestone34`. It uses seed `0x3100`, the same rows as Milestone 33. `early` is the default planner. `late` keeps Milestone 33's map, which starts only after the first underflow and still uses the full-fanout ceiling. `chain` forces the Milestone 32 leaf-chain check. At 100,000 rows each workload is the median of three fresh copies. Smaller sizes are one sample. Page counters below are from the first copy. Statement time includes the log sync. This is not a power-loss test.
+
+The planner runs before the per-leaf loop. It reads the root. A height-2 tree costs one plus the root's child count. A height-3 tree reads each of those children and adds their child counts. Both counts are exact, and neither reads a leaf to make the decision. On every 100,000-row plan the estimate was 634 pages and the later walk read 634 pages. A height of four or more fills the unseen levels to this tree's fanout; that ceiling was not the production shape in this profile. A height-1 tree is one page and stays on the grouping loop. A monotonic run stays on the Milestone 32 walk. An exact estimate also requires the request to be longer than the page count, so ten keys against 634 pages estimate the tree and then decline.
+
+`build_us` is one structural walk plus filling the map. The walk records each leaf's parent path and entry count. `path_us` is the in-memory reserve and insert after that walk, and it is included in `build_us`. `member_us` is the request lookup. `validations` counts calls to the structural walk, including the check of the rebuilt tree. `map_bytes` is `size_of<(i64, u64)>() + size_of<u32>()` times the live posting count of the planned index. It is not peak resident memory. Peak RSS was not measured.
+
+| workload | early | late | chain | early index | late index | descents | late descents | build | validations | late validations | map bytes | WAL | checksum |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| one | 20,082 | 21,469 | 21,140 | 18 | 16 | 1 | 1 | 0 | 0 | 0 | 0 | 36,996 | 5001482560 |
+| ten | 62,409 | 62,786 | 61,832 | 3,998 | 4,009 | 9 | 9 | 0 | 4 | 4 | 0 | 2,045,996 | 5001482470 |
+| buckets | 244,513 | 247,121 | 269,690 | 16,264 | 16,702 | 63 | 155 | 1,645 | 5 | 5 | 1,600,000 | 10,906,096 | 3000897535 |
+| half | 191,538 | 191,849 | 218,727 | 17,835 | 18,239 | 1 | 2 | 2,109 | 4 | 5 | 1,600,000 | 7,101,296 | 3750796338 |
+| sparse | 206,033 | 203,781 | 204,019 | 6,056 | 5,884 | 2 | 2 | 0 | 2 | 2 | 0 | 9,581,796 | 4001250051 |
+| alternating | 261,541 | 261,253 | 286,092 | 17,274 | 17,446 | 63 | 156 | 2,007 | 5 | 5 | 1,600,000 | 11,537,496 | 2500711280 |
+| consecutive | 128,108 | 127,675 | 139,302 | 10,928 | 11,395 | 1 | 2 | 1,878 | 4 | 5 | 1,600,000 | 4,555,196 | 4688644540 |
+| all | 305,296 | 306,560 | 350,484 | 32,399 | 31,247 | 248 | 495 | 2,151 | 5 | 5 | 1,600,000 | 12,168,896 | 0 |
+| wide | 252,550 | 256,334 | 252,718 | 10,874 | 13,995 | 71 | 7,343 | 2,120 | 5 | 4 | 1,600,000 | 12,181,196 | 4546235365 |
+
+Times are microseconds. Chain descents at 100,000 rows stay 1, 9, 40,032, 40,000, 2, 40,032, 20,000, 80,248, and 7,343.
+
+The wide-name delete is the case the old ceiling missed. The bucket index is height 3 and holds 634 pages, under the 41,821-page fanout bound, so the late path builds no map and descends 7,343 times. The early plan accepts 7,272 pairs from the one structural walk. Descents fall to 71. Sixty-nine of those are single-entry deletes, and `delete` still walks from the root for each one. Index time falls from 13,995 µs to 10,874 µs. The build is 2,120 µs, of which 1,542 µs inserts the pairs, and the lookups are 160 µs. The statement is 252,550 µs against 256,334 µs. The log stays 12,181,196 bytes and the checksum stays 4546235365. The map payload is 1,600,000 bytes. The rebuild allocates 6 pages, frees 783, and uses 2,876,048 scratch bytes. Early validation count is 5 against the late path's 4, because the plan adds one walk and the late path never built a map.
+
+Buckets, half, alternating, and consecutive already had a late map. With one walk, their index time is now level with that path or a few hundred microseconds under it: buckets 16,264 µs against 16,702 µs, half 17,835 µs against 18,239 µs, alternating 17,274 µs against 17,446 µs, consecutive 10,928 µs against 11,395 µs. Descents still fall: buckets 155 to 63, half 2 to 1, alternating 156 to 63, consecutive 2 to 1. Half and consecutive skip the pre-write validation (`validations` 4 against 5). The rebuilt tree is still validated after the write. Half still allocates 4 pages, frees 840, and uses 1,924,176 scratch bytes. Logs and checksums match the late path and the chain path.
+
+Delete-all is the remaining index regression against the late map: 32,399 µs against 31,247 µs. Both paths validate 5 times, because 246 single-entry deletes write pages before the rebuild, so the pre-write check still runs. The early build is 2,151 µs against 1,761 µs, and 1,386 µs of that is inserting the full posting set and the parent paths. The statement is 305,296 µs against 306,560 µs. The chain index is 79,947 µs. The log stays 12,168,896 bytes.
+
+Ten keys at 100,000 rows estimate 634 pages and decline. Descents stay at 9. Index time is 3,998 µs against 4,009 µs late and 3,904 µs on the chain path. One row never estimates. Sparse NULL-bucket rows stay on the monotonic walk: 2 descents, no map, log 9,581,796 bytes, checksum 4001250051. Its index time is 6,056 µs against 5,858 µs on the chain path.
+
+At 100 rows the tree is one leaf and no plan runs. At 1,000 rows ten keys see 6 pages and do plan. Index time is 135 µs against 85 µs late and 92 µs on the chain path, on a statement of about 14 ms. That is a map the fanout ceiling would have refused, and it does not pay for itself at that size. The 1,000-row bucket index is 421 µs against 409 µs late. At 10,000 rows ten keys estimate 62 pages and decline. The wide delete plans, and its index time is 1,021 µs against 1,062 µs late.
+
+A monotonic run, one posting, a request that is not longer than an exact page count, a one-leaf tree, and a validation or reservation failure stay on the older check. The late map remains available as a test force. The early plan is the default because the extra internal-page walk is gone, and the wide delete is faster for it.
