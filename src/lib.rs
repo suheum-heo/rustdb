@@ -25,7 +25,13 @@
 //! column equality hashes the right table. Any other `ON` uses a nested loop.
 //! A left row with no TRUE `ON` match is
 //! returned once, with NULL for each right column. `WHERE` runs after that
-//! extension. `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,
+//! extension. `UPDATE` and `DELETE` use one integer equality index to list
+//! candidate row ids when `WHERE` has that equality. The heap must contain
+//! exactly those equality matches before any row changes. A missing or extra
+//! posting fails the statement. The original predicate then runs on that
+//! complete set. A range, `OR`, `IS NULL`, and a non-integer equality still
+//! scan the heap. The index and the WAL change only inside the existing
+//! publish of that statement. `COUNT(*)` counts a null-extended row. `COUNT(DISTINCT ...)`,
 //! `SUM(DISTINCT ...)`, and `AVG(DISTINCT ...)` use the same per-group sets
 //! as a single table and ignore NULL, including a null-extended right column.
 //! `SELECT DISTINCT` keeps the first copy of each projected logical row,

@@ -314,6 +314,14 @@ impl Database {
     }
 
     #[cfg(test)]
+    pub(crate) fn drop_root_leaf_entry(&mut self, name: &str, slot: usize) -> Result<(), DbError> {
+        self.store
+            .as_mut()
+            .ok_or_else(|| DbError::Internal("index scan requires a database file".to_string()))?
+            .drop_root_leaf_entry(name, slot)
+    }
+
+    #[cfg(test)]
     pub(crate) fn corrupt_index_root_type(&mut self, name: &str) -> Result<(), DbError> {
         self.store
             .as_mut()
@@ -327,6 +335,14 @@ impl Database {
             .as_mut()
             .ok_or_else(|| DbError::Internal("index scan requires a database file".to_string()))?
             .zero_leftmost_leaf_right(name)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_inject(&mut self, inject: crate::storage::Inject) {
+        self.store
+            .as_mut()
+            .expect("disk database")
+            .set_inject(inject);
     }
 
     #[cfg(test)]

@@ -1,9 +1,10 @@
 //! Execute parsed statements against the catalog.
 //!
 //! Filters are bound and type-checked before any row is read. `UPDATE` and
-//! `DELETE` build the replacement rows and install them only after every row
-//! has been planned, so a failure leaves the table unchanged. A durable
-//! database publishes that result only after the statement succeeds.
+//! `DELETE` choose an index lookup or the heap scan, list the matched row ids,
+//! and install the replacement only after every intended change has been
+//! checked, so a failure leaves the table unchanged. A durable database
+//! publishes that result only after the statement succeeds.
 //!
 //! A plain `SELECT` applies `WHERE`, then `ORDER BY`, then `LIMIT`, then
 //! projection. Its sort keys may name columns that are not in the select list.
@@ -24,7 +25,12 @@
 //! candidates. Equal keys keep the order produced above because the sort is
 //! stable. NULL is greater than every non-NULL value unless the query
 //! overrides that with `NULLS FIRST` or `NULLS LAST`.
-//! `UPDATE` and `DELETE` still read every row of one table.
+//! `UPDATE` and `DELETE` look up one integer equality in an index on that
+//! table when `WHERE` has one. They then require the heap to contain exactly
+//! those equality matches, evaluate the original predicate, and list the
+//! matched row ids before any row or index changes. A missing posting fails
+//! the statement. A range, `OR`, `IS NULL`, a non-indexed column, and a
+//! non-integer equality still read the heap from front to back.
 //!
 //! A `SELECT` may group rows from one table, one `INNER JOIN`, or one
 //! `LEFT JOIN`. `WHERE`
@@ -2220,25 +2226,13 @@ impl Database {
         assignments: &[Assignment],
         selection: Option<&Expr>,
     ) -> Result<StatementResult, DbError> {
-        let (new_rows, count) = {
-            let table = self.table(table_name)?;
-            let scope = Scope::from_table(table, table.name());
-            let filter = bind_optional_where(selection, &scope)?;
-            let assignments = bind_assignments(&scope, table_name, assignments)?;
-            let mut new_rows = Vec::with_capacity(table.rows().len());
-            let mut count = 0usize;
-            for row in table.rows() {
-                if !expr::row_matches(filter.as_ref(), row)? {
-                    new_rows.push(row.clone());
-                    continue;
-                }
-                new_rows.push(assign_row(row, &assignments)?);
-                count += 1;
-            }
-            (new_rows, count)
-        };
-        self.table_mut(table_name)?.rewrite_all(new_rows)?;
-        Ok(StatementResult::Update { count })
+        let (filter, assignments) = self.bind_update(table_name, assignments, selection)?;
+        let planned = self.plan_mutation(table_name, selection)?;
+        if self.index_mutation_eligible(&planned) {
+            self.update_indexed(table_name, &planned, filter.as_ref(), &assignments)
+        } else {
+            self.update_scanned(table_name, &planned, filter.as_ref(), &assignments)
+        }
     }
 
     fn delete(
@@ -2246,24 +2240,607 @@ impl Database {
         table_name: &str,
         selection: Option<&Expr>,
     ) -> Result<StatementResult, DbError> {
-        let (kept_indexes, deleted) = {
+        let filter = self.bind_delete(table_name, selection)?;
+        let planned = self.plan_mutation(table_name, selection)?;
+        if self.index_mutation_eligible(&planned) {
+            self.delete_indexed(table_name, &planned, filter.as_ref())
+        } else {
+            self.delete_scanned(table_name, &planned, filter.as_ref())
+        }
+    }
+
+    fn bind_update(
+        &self,
+        table_name: &str,
+        assignments: &[Assignment],
+        selection: Option<&Expr>,
+    ) -> Result<(Option<BoundExpr>, Vec<BoundAssignment>), DbError> {
+        let table = self.table(table_name)?;
+        let scope = Scope::from_table(table, table.name());
+        let filter = bind_optional_where(selection, &scope)?;
+        let assignments = bind_assignments(&scope, table_name, assignments)?;
+        Ok((filter, assignments))
+    }
+
+    fn bind_delete(
+        &self,
+        table_name: &str,
+        selection: Option<&Expr>,
+    ) -> Result<Option<BoundExpr>, DbError> {
+        let table = self.table(table_name)?;
+        let scope = Scope::from_table(table, table.name());
+        bind_optional_where(selection, &scope)
+    }
+
+    fn plan_mutation(
+        &self,
+        table_name: &str,
+        selection: Option<&Expr>,
+    ) -> Result<plan::MutationAccess, DbError> {
+        let table = self.table(table_name)?;
+        let choices = index_choices(table, self.index_images())?;
+        Ok(plan::choose_mutation(table.name(), selection, &choices))
+    }
+
+    /// An index lookup is eligible only from the shape of `WHERE`.
+    ///
+    /// A test can force the heap scan after that choice. A malformed `WHERE`
+    /// cell is not decided here: the index path checks it before the probe and
+    /// uses the heap scan for that execution.
+    fn index_mutation_eligible(&self, planned: &plan::MutationAccess) -> bool {
+        #[cfg(test)]
+        if force_heap_mutation() {
+            return false;
+        }
+        matches!(planned, plan::MutationAccess::IndexLookup { .. })
+    }
+
+    /// Probe, filter, then rewrite. The probe finishes before any assignment.
+    ///
+    /// A non-NULL `WHERE` cell of the wrong type uses the heap scan, so the
+    /// comparison error matches a scan and a non-candidate is not skipped.
+    /// A corrupt page, a broken leaf, a missing row id, a repeated row id, or
+    /// a key that disagrees with the heap fails this statement. The probe's
+    /// row ids are then compared with every heap row that stores the same
+    /// integer. A missing or extra posting fails before `WHERE` and before
+    /// any assignment. Open still compares the whole tree, so a file that is
+    /// already missing a posting fails to open. This check is one pass over
+    /// the heap for the chosen key. It does not audit other keys.
+    fn update_indexed(
+        &mut self,
+        table_name: &str,
+        planned: &plan::MutationAccess,
+        filter: Option<&BoundExpr>,
+        assignments: &[BoundAssignment],
+    ) -> Result<StatementResult, DbError> {
+        let Some(filter) = filter else {
+            return self.update_scanned(table_name, planned, None, assignments);
+        };
+        if !self.where_cells_allow_index(table_name, filter)? {
+            return self.update_scanned(table_name, planned, Some(filter), assignments);
+        }
+        let plan::MutationAccess::IndexLookup {
+            name, ordinal, key, ..
+        } = planned
+        else {
+            return Err(DbError::Internal(
+                "heap scan has no mutation index".to_string(),
+            ));
+        };
+        let (positions, probe_us, validate_us) =
+            self.checked_equality_positions(table_name, name, *ordinal, *key)?;
+        let filter_started = std::time::Instant::now();
+        let matched = self.matched_ids(table_name, name, &positions, Some(filter))?;
+        let filter_us = filter_started.elapsed().as_micros();
+        let stage_started = std::time::Instant::now();
+        let (new_rows, count, width) = self.assigned_rows(table_name, &matched, assignments)?;
+        let stage_us = stage_started.elapsed().as_micros();
+        let heap_rows = new_rows.len();
+        let apply_started = std::time::Instant::now();
+        self.table_mut(table_name)?.rewrite_all(new_rows)?;
+        let apply_us = apply_started.elapsed().as_micros();
+        note_mutation(MutationNote::index(
+            planned,
+            MutationCounts {
+                candidates: positions.len(),
+                examined: positions.len(),
+                heap_rows,
+                staged_rows: heap_rows,
+                modified: count,
+                width,
+            },
+            MutationTiming {
+                probe_us,
+                validate_us,
+                filter_us,
+                stage_us,
+                apply_us,
+            },
+        ));
+        Ok(StatementResult::Update { count })
+    }
+
+    fn update_scanned(
+        &mut self,
+        table_name: &str,
+        planned: &plan::MutationAccess,
+        filter: Option<&BoundExpr>,
+        assignments: &[BoundAssignment],
+    ) -> Result<StatementResult, DbError> {
+        let discover_started = std::time::Instant::now();
+        let (new_rows, count) = {
             let table = self.table(table_name)?;
-            let scope = Scope::from_table(table, table.name());
-            let filter = bind_optional_where(selection, &scope)?;
+            let mut new_rows = Vec::with_capacity(table.rows().len());
+            let mut count = 0usize;
+            for row in table.rows() {
+                if !expr::row_matches(filter, row)? {
+                    new_rows.push(row.clone());
+                    continue;
+                }
+                new_rows.push(assign_row(row, assignments)?);
+                count += 1;
+            }
+            (new_rows, count)
+        };
+        let discover_us = discover_started.elapsed().as_micros();
+        let apply_started = std::time::Instant::now();
+        let heap_rows = new_rows.len();
+        let width = new_rows.first().map(Vec::len).unwrap_or(0);
+        self.table_mut(table_name)?.rewrite_all(new_rows)?;
+        let apply_us = apply_started.elapsed().as_micros();
+        note_mutation(MutationNote::scan(
+            planned,
+            count,
+            heap_rows,
+            heap_rows,
+            width,
+            MutationTiming {
+                probe_us: 0,
+                validate_us: 0,
+                filter_us: discover_us,
+                stage_us: 0,
+                apply_us,
+            },
+        ));
+        Ok(StatementResult::Update { count })
+    }
+
+    fn delete_indexed(
+        &mut self,
+        table_name: &str,
+        planned: &plan::MutationAccess,
+        filter: Option<&BoundExpr>,
+    ) -> Result<StatementResult, DbError> {
+        let Some(filter) = filter else {
+            return self.delete_scanned(table_name, planned, None);
+        };
+        if !self.where_cells_allow_index(table_name, filter)? {
+            return self.delete_scanned(table_name, planned, Some(filter));
+        }
+        let plan::MutationAccess::IndexLookup {
+            name, ordinal, key, ..
+        } = planned
+        else {
+            return Err(DbError::Internal(
+                "heap scan has no mutation index".to_string(),
+            ));
+        };
+        let (positions, probe_us, validate_us) =
+            self.checked_equality_positions(table_name, name, *ordinal, *key)?;
+        let filter_started = std::time::Instant::now();
+        let matched = self.matched_ids(table_name, name, &positions, Some(filter))?;
+        let filter_us = filter_started.elapsed().as_micros();
+        let stage_started = std::time::Instant::now();
+        let (kept_indexes, deleted, heap_rows, width) =
+            self.retained_indexes(table_name, &matched)?;
+        let stage_us = stage_started.elapsed().as_micros();
+        let kept_rows = kept_indexes.len();
+        let apply_started = std::time::Instant::now();
+        self.table_mut(table_name)?.retain_indexes(&kept_indexes)?;
+        let apply_us = apply_started.elapsed().as_micros();
+        note_mutation(MutationNote::index(
+            planned,
+            MutationCounts {
+                candidates: positions.len(),
+                examined: positions.len(),
+                heap_rows,
+                staged_rows: kept_rows,
+                modified: deleted,
+                width,
+            },
+            MutationTiming {
+                probe_us,
+                validate_us,
+                filter_us,
+                stage_us,
+                apply_us,
+            },
+        ));
+        Ok(StatementResult::Delete { count: deleted })
+    }
+
+    fn delete_scanned(
+        &mut self,
+        table_name: &str,
+        planned: &plan::MutationAccess,
+        filter: Option<&BoundExpr>,
+    ) -> Result<StatementResult, DbError> {
+        let discover_started = std::time::Instant::now();
+        let (kept_indexes, deleted, width) = {
+            let table = self.table(table_name)?;
+            let width = table.schema().len();
             let mut kept_indexes = Vec::new();
             let mut deleted = 0usize;
             for (index, row) in table.rows().iter().enumerate() {
-                if expr::row_matches(filter.as_ref(), row)? {
+                if expr::row_matches(filter, row)? {
                     deleted += 1;
                 } else {
                     kept_indexes.push(index);
                 }
             }
-            (kept_indexes, deleted)
+            (kept_indexes, deleted, width)
         };
+        let discover_us = discover_started.elapsed().as_micros();
+        let apply_started = std::time::Instant::now();
+        let heap_rows = kept_indexes.len() + deleted;
+        let kept_rows = kept_indexes.len();
         self.table_mut(table_name)?.retain_indexes(&kept_indexes)?;
+        let apply_us = apply_started.elapsed().as_micros();
+        note_mutation(MutationNote::scan(
+            planned,
+            deleted,
+            heap_rows,
+            kept_rows,
+            width,
+            MutationTiming {
+                probe_us: 0,
+                validate_us: 0,
+                filter_us: discover_us,
+                stage_us: 0,
+                apply_us,
+            },
+        ));
         Ok(StatementResult::Delete { count: deleted })
     }
+
+    /// `true` when every `WHERE` cell is NULL or its declared type.
+    ///
+    /// The walk is one pass over the referenced columns. It does not read the
+    /// index and it does not copy rows. Production always runs it. A test can
+    /// skip it to show the omission it prevents.
+    fn where_cells_allow_index(
+        &self,
+        table_name: &str,
+        filter: &BoundExpr,
+    ) -> Result<bool, DbError> {
+        #[cfg(test)]
+        if skip_where_schema_check() {
+            return Ok(true);
+        }
+        let table = self.table(table_name)?;
+        let types = declared_types(table);
+        if table.rows().iter().any(|row| row.len() != types.len()) {
+            return Ok(false);
+        }
+        let mut columns = Vec::new();
+        bound_columns(filter, &mut columns);
+        Ok(columns.into_iter().all(|index| {
+            let Some(expected) = types.get(index).copied() else {
+                return false;
+            };
+            table
+                .rows()
+                .iter()
+                .all(|row| cell_matches_type(row.get(index), expected))
+        }))
+    }
+
+    /// Index positions for `key`, or an error when the heap disagrees.
+    ///
+    /// The probe runs first. A corrupt page, a broken leaf, a stale row id, a
+    /// repeated row id, or a stored integer that is not `key` keeps that
+    /// error. The heap walk then lists every `INTEGER` equal to `key`, in
+    /// heap order. `NULL` is not a member. The two lists must be the same,
+    /// including order. `WHERE` has not run, so a row that would fail a
+    /// residual predicate still needs its posting. A wrong-typed cell in the
+    /// indexed column is rejected here as well: the schema check normally
+    /// switches to the heap scan before this function is called.
+    fn checked_equality_positions(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        ordinal: usize,
+        key: i64,
+    ) -> Result<(Vec<usize>, u128, u128), DbError> {
+        let probe_started = std::time::Instant::now();
+        let indexed =
+            self.indexed_positions(table_name, index_name, ordinal, Some(key), None, None)?;
+        let probe_us = probe_started.elapsed().as_micros();
+        let validate_started = std::time::Instant::now();
+        let heap = self.heap_equality_positions(table_name, ordinal, key)?;
+        if indexed != heap {
+            return Err(corrupt_index(index_name));
+        }
+        let validate_us = validate_started.elapsed().as_micros();
+        Ok((indexed, probe_us, validate_us))
+    }
+
+    /// Heap positions whose indexed column is the integer `key`, in heap order.
+    fn heap_equality_positions(
+        &self,
+        table_name: &str,
+        ordinal: usize,
+        key: i64,
+    ) -> Result<Vec<usize>, DbError> {
+        let table = self.table(table_name)?;
+        let mut positions = Vec::new();
+        for (position, row) in table.rows().iter().enumerate() {
+            match row.get(ordinal) {
+                Some(Value::Integer(stored)) if *stored == key => positions.push(position),
+                Some(Value::Integer(_)) | Some(Value::Null) => {}
+                _ => {
+                    return Err(DbError::Internal(format!(
+                        "indexed column of '{table_name}' has a value that was not checked"
+                    )));
+                }
+            }
+        }
+        Ok(positions)
+    }
+
+    /// Row ids that pass `WHERE`, in heap order, with duplicates rejected.
+    ///
+    /// `positions` comes from the index and is already heap order. This reads
+    /// those rows and does not modify them.
+    fn matched_ids(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        positions: &[usize],
+        filter: Option<&BoundExpr>,
+    ) -> Result<Vec<u64>, DbError> {
+        let table = self.table(table_name)?;
+        let mut seen = HashSet::with_capacity(positions.len());
+        let mut matched = Vec::new();
+        for position in positions {
+            let Some(row) = table.rows().get(*position) else {
+                return Err(DbError::Internal(format!(
+                    "index position {position} is outside table '{table_name}'"
+                )));
+            };
+            let Some(row_id) = table.row_id_at(*position) else {
+                return Err(corrupt_index(index_name));
+            };
+            if !expr::row_matches(filter, row)? {
+                continue;
+            }
+            if !seen.insert(row_id) {
+                return Err(corrupt_index(index_name));
+            }
+            matched.push(row_id);
+        }
+        Ok(matched)
+    }
+
+    /// Build the full replacement. Only `matched` row ids are assigned.
+    ///
+    /// The walk is heap order, so a row changes once and the vector positions
+    /// stay aligned with the existing row ids. `rewrite_all` sees that vector
+    /// only after every assignment has succeeded.
+    fn assigned_rows(
+        &self,
+        table_name: &str,
+        matched: &[u64],
+        assignments: &[BoundAssignment],
+    ) -> Result<(Vec<Vec<Value>>, usize, usize), DbError> {
+        let table = self.table(table_name)?;
+        let width = table.schema().len();
+        let targets: HashSet<u64> = matched.iter().copied().collect();
+        let mut new_rows = Vec::with_capacity(table.rows().len());
+        let mut count = 0usize;
+        for (position, row) in table.rows().iter().enumerate() {
+            let Some(row_id) = table.row_id_at(position) else {
+                return Err(DbError::Internal(format!(
+                    "table '{table_name}' is missing a row id at {position}"
+                )));
+            };
+            if !targets.contains(&row_id) {
+                new_rows.push(row.clone());
+                continue;
+            }
+            new_rows.push(assign_row(row, assignments)?);
+            count += 1;
+        }
+        if count != matched.len() {
+            return Err(DbError::Internal(format!(
+                "table '{table_name}' matched {} rows and updated {count}",
+                matched.len()
+            )));
+        }
+        Ok((new_rows, count, width))
+    }
+
+    /// Heap slots that survive `DELETE`, in increasing order.
+    fn retained_indexes(
+        &self,
+        table_name: &str,
+        matched: &[u64],
+    ) -> Result<(Vec<usize>, usize, usize, usize), DbError> {
+        let table = self.table(table_name)?;
+        let width = table.schema().len();
+        let targets: HashSet<u64> = matched.iter().copied().collect();
+        let mut kept_indexes = Vec::new();
+        let mut deleted = 0usize;
+        for (position, _) in table.rows().iter().enumerate() {
+            let Some(row_id) = table.row_id_at(position) else {
+                return Err(DbError::Internal(format!(
+                    "table '{table_name}' is missing a row id at {position}"
+                )));
+            };
+            if targets.contains(&row_id) {
+                deleted += 1;
+            } else {
+                kept_indexes.push(position);
+            }
+        }
+        if deleted != matched.len() {
+            return Err(DbError::Internal(format!(
+                "table '{table_name}' matched {} rows and deleted {deleted}",
+                matched.len()
+            )));
+        }
+        let heap_rows = kept_indexes.len() + deleted;
+        Ok((kept_indexes, deleted, heap_rows, width))
+    }
+}
+
+/// Counts for one indexed `UPDATE` or `DELETE`.
+struct MutationCounts {
+    candidates: usize,
+    examined: usize,
+    heap_rows: usize,
+    staged_rows: usize,
+    modified: usize,
+    width: usize,
+}
+
+/// Phase times for one `UPDATE` or `DELETE`, in microseconds.
+///
+/// `probe_us` is the index lookup. `validate_us` is the heap equality walk.
+/// `filter_us` is the original `WHERE`. `stage_us` builds the replacement.
+/// `apply_us` installs it in memory. The WAL and the publish compare are later.
+struct MutationTiming {
+    probe_us: u128,
+    validate_us: u128,
+    filter_us: u128,
+    stage_us: u128,
+    apply_us: u128,
+}
+
+/// One `UPDATE` or `DELETE`, recorded for tests and the release profile.
+///
+/// `staged_bytes` is the target-id list plus the replacement cells. It is not
+/// process RSS. `discover_us` is the probe, the heap equality check, and
+/// `WHERE`. `apply_us` is the in-memory install. A heap scan folds its filter
+/// into `filter_us` and leaves the probe and the equality check at zero. The
+/// WAL and the heap compare happen later, in publish.
+#[cfg_attr(test, derive(Clone))]
+#[cfg_attr(not(test), allow(dead_code))]
+struct MutationNote {
+    planned: &'static str,
+    executed: &'static str,
+    index: String,
+    predicate: String,
+    residual: String,
+    probes: u64,
+    candidates: u64,
+    examined: u64,
+    heap_rows: u64,
+    modified: u64,
+    staged_bytes: u64,
+    discover_us: u128,
+    probe_us: u128,
+    validate_us: u128,
+    filter_us: u128,
+    stage_us: u128,
+    apply_us: u128,
+}
+
+impl MutationNote {
+    fn index(
+        planned: &plan::MutationAccess,
+        counts: MutationCounts,
+        timing: MutationTiming,
+    ) -> Self {
+        let (index, predicate, residual) = mutation_fields(planned);
+        Self {
+            planned: mutation_kind(planned),
+            executed: "IndexLookup",
+            index,
+            predicate,
+            residual,
+            probes: 1,
+            candidates: u64::try_from(counts.candidates).unwrap_or(u64::MAX),
+            examined: u64::try_from(counts.examined).unwrap_or(u64::MAX),
+            heap_rows: u64::try_from(counts.heap_rows).unwrap_or(u64::MAX),
+            modified: u64::try_from(counts.modified).unwrap_or(u64::MAX),
+            staged_bytes: staged_mutation_bytes(counts.modified, counts.staged_rows, counts.width),
+            discover_us: timing.probe_us + timing.validate_us + timing.filter_us,
+            probe_us: timing.probe_us,
+            validate_us: timing.validate_us,
+            filter_us: timing.filter_us,
+            stage_us: timing.stage_us,
+            apply_us: timing.apply_us,
+        }
+    }
+
+    fn scan(
+        planned: &plan::MutationAccess,
+        modified: usize,
+        heap_rows: usize,
+        staged_rows: usize,
+        width: usize,
+        timing: MutationTiming,
+    ) -> Self {
+        let (index, predicate, residual) = mutation_fields(planned);
+        Self {
+            planned: mutation_kind(planned),
+            executed: "HeapScan",
+            index,
+            predicate,
+            residual,
+            probes: 0,
+            candidates: u64::try_from(heap_rows).unwrap_or(u64::MAX),
+            examined: u64::try_from(heap_rows).unwrap_or(u64::MAX),
+            heap_rows: u64::try_from(heap_rows).unwrap_or(u64::MAX),
+            modified: u64::try_from(modified).unwrap_or(u64::MAX),
+            staged_bytes: staged_mutation_bytes(modified, staged_rows, width),
+            discover_us: timing.filter_us,
+            probe_us: timing.probe_us,
+            validate_us: timing.validate_us,
+            filter_us: timing.filter_us,
+            stage_us: timing.stage_us,
+            apply_us: timing.apply_us,
+        }
+    }
+}
+
+fn mutation_kind(access: &plan::MutationAccess) -> &'static str {
+    match access {
+        plan::MutationAccess::HeapScan => "HeapScan",
+        plan::MutationAccess::IndexLookup { .. } => "IndexLookup",
+    }
+}
+
+fn mutation_fields(access: &plan::MutationAccess) -> (String, String, String) {
+    match access {
+        plan::MutationAccess::HeapScan => (String::new(), String::new(), String::new()),
+        plan::MutationAccess::IndexLookup {
+            name,
+            predicate,
+            residual,
+            ..
+        } => (
+            name.clone(),
+            predicate.clone(),
+            residual.clone().unwrap_or_default(),
+        ),
+    }
+}
+
+fn staged_mutation_bytes(modified: usize, rows: usize, width: usize) -> u64 {
+    let ids = modified.saturating_mul(std::mem::size_of::<u64>());
+    let cells = rows
+        .saturating_mul(width)
+        .saturating_mul(std::mem::size_of::<Value>());
+    u64::try_from(ids.saturating_add(cells)).unwrap_or(u64::MAX)
+}
+
+fn note_mutation(note: MutationNote) {
+    #[cfg(test)]
+    LAST_MUTATION.with(|slot| *slot.borrow_mut() = Some(note));
+    #[cfg(not(test))]
+    let _ = note;
 }
 
 fn durable_change(statement: &Statement) -> DurableChange {
@@ -4326,6 +4903,47 @@ impl Drop for ForceNestedJoin {
     }
 }
 
+/// Forces the heap scan for `UPDATE` and `DELETE` for the life of the guard.
+///
+/// The planner can still choose an index. The guard does not change `SELECT`
+/// or either join planner.
+#[cfg(test)]
+pub(crate) struct ForceHeapMutation;
+
+#[cfg(test)]
+impl ForceHeapMutation {
+    pub(crate) fn new() -> Self {
+        FORCE_HEAP_MUTATION.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceHeapMutation {
+    fn drop(&mut self) {
+        FORCE_HEAP_MUTATION.with(|flag| flag.set(false));
+    }
+}
+
+/// Skips the `WHERE` cell-type check so a test can show the missed row.
+#[cfg(test)]
+struct SkipWhereSchemaCheck;
+
+#[cfg(test)]
+impl SkipWhereSchemaCheck {
+    fn new() -> Self {
+        SKIP_WHERE_SCHEMA_CHECK.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for SkipWhereSchemaCheck {
+    fn drop(&mut self) {
+        SKIP_WHERE_SCHEMA_CHECK.with(|flag| flag.set(false));
+    }
+}
+
 /// Skips the `ON` cell-type check so a profile can time that pass.
 #[cfg(test)]
 struct SkipOnSchemaCheck;
@@ -5257,6 +5875,11 @@ thread_local! {
     /// `Some(0)` fails the next distinct reservation. `None` does not.
     static DISTINCT_RESERVE_BUDGET: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    static FORCE_HEAP_MUTATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// When set, an indexed `UPDATE` or `DELETE` does not precheck `WHERE` cells.
+    static SKIP_WHERE_SCHEMA_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LAST_MUTATION: std::cell::RefCell<Option<MutationNote>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -5267,6 +5890,25 @@ fn force_nested_join() -> bool {
 #[cfg(test)]
 fn force_left_index() -> bool {
     FORCE_LEFT_INDEX.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn force_heap_mutation() -> bool {
+    FORCE_HEAP_MUTATION.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn skip_where_schema_check() -> bool {
+    SKIP_WHERE_SCHEMA_CHECK.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn mutation_note() -> MutationNote {
+    LAST_MUTATION.with(|slot| {
+        slot.borrow()
+            .clone()
+            .expect("an UPDATE or DELETE should record its access path")
+    })
 }
 
 #[cfg(test)]
@@ -14006,5 +14648,823 @@ mod tests {
             ),
             limit_checksum: checksum_rows(&ordered[..limited]),
         }
+    }
+
+    fn open_mutation(label: &str) -> (crate::test_dir::TestDir, Database) {
+        let dir = crate::test_dir::TestDir::new(label);
+        let path = dir.join("db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INT, name TEXT, active BOOLEAN, bucket INT);")
+                .unwrap();
+            db.execute(
+                "INSERT INTO users VALUES (1, 'Ada', TRUE, 1), (1, 'Ann', FALSE, 1), (2, 'Bea', TRUE, 2), (NULL, 'Dee', TRUE, 3), (4, 'Cy', FALSE, 1);",
+            )
+            .unwrap();
+        }
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_users_bucket ON users(bucket);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_id ON users(id);")
+            .unwrap();
+        (dir, db)
+    }
+
+    fn change_count(db: &mut Database, sql: &str) -> usize {
+        match db
+            .execute(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"))
+            .pop()
+            .unwrap()
+        {
+            StatementResult::Update { count } | StatementResult::Delete { count } => count,
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+
+    fn table_rows(db: &mut Database) -> Vec<Vec<Value>> {
+        query(
+            db,
+            "SELECT id, name, active, bucket FROM users WHERE TRUE OR id = 1;",
+        )
+        .rows
+    }
+
+    fn index_entries(db: &mut Database, name: &str) -> Vec<(i64, u64)> {
+        db.read_indexed_keys(name, None, None, None).unwrap().1
+    }
+
+    fn assert_same_writes(label: &str, steps: &[(&str, bool)]) {
+        let (_indexed_dir, mut indexed) = open_mutation(label);
+        let (_scanned_dir, mut scanned) = open_mutation(&format!("{label}-scan"));
+        for (sql, expect_index) in steps {
+            let left = change_count(&mut indexed, sql);
+            let indexed_note = mutation_note();
+            let right = {
+                let _force = ForceHeapMutation::new();
+                change_count(&mut scanned, sql)
+            };
+            let scanned_note = mutation_note();
+            assert_eq!(left, right, "{sql}");
+            assert_eq!(indexed_note.modified, right as u64, "{sql}");
+            assert_eq!(scanned_note.planned, indexed_note.planned, "{sql}");
+            assert_eq!(scanned_note.executed, "HeapScan", "{sql}");
+            if *expect_index {
+                assert_eq!(indexed_note.planned, "IndexLookup", "{sql}");
+                assert_eq!(indexed_note.executed, "IndexLookup", "{sql}");
+                assert_eq!(indexed_note.probes, 1, "{sql}");
+                assert!(indexed_note.examined >= indexed_note.modified, "{sql}");
+            } else {
+                assert_eq!(indexed_note.planned, "HeapScan", "{sql}");
+                assert_eq!(indexed_note.executed, "HeapScan", "{sql}");
+                assert_eq!(indexed_note.probes, 0, "{sql}");
+            }
+            assert_eq!(table_rows(&mut indexed), table_rows(&mut scanned), "{sql}");
+            assert_eq!(
+                index_entries(&mut indexed, "idx_users_id"),
+                index_entries(&mut scanned, "idx_users_id"),
+                "{sql}"
+            );
+            assert_eq!(
+                index_entries(&mut indexed, "idx_users_bucket"),
+                index_entries(&mut scanned, "idx_users_bucket"),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_update_and_delete_match_the_heap_scan() {
+        assert_same_writes(
+            "m25-equiv",
+            &[
+                ("UPDATE users SET active = FALSE WHERE id = 2;", true),
+                ("UPDATE users SET id = 9 WHERE id = 2;", true),
+                ("UPDATE users SET id = 1 WHERE id = 9;", true),
+                ("UPDATE users SET name = 'A' WHERE id = 1;", true),
+                ("UPDATE users SET name = 'A' WHERE id = 1;", true),
+                (
+                    "UPDATE users SET active = FALSE WHERE id = 1 AND name = 'A';",
+                    true,
+                ),
+                ("UPDATE users SET name = 'Z' WHERE id = 70;", true),
+                ("UPDATE users SET id = 8 WHERE bucket = 3;", true),
+                ("UPDATE users SET id = NULL WHERE id = 4;", true),
+                ("UPDATE users SET active = TRUE WHERE name = 'Bea';", false),
+                (
+                    "UPDATE users SET active = FALSE WHERE active = TRUE;",
+                    false,
+                ),
+                ("UPDATE users SET name = 'Y' WHERE id < 3;", false),
+                (
+                    "UPDATE users SET name = 'Y' WHERE id = 8 OR bucket = 2;",
+                    false,
+                ),
+                ("UPDATE users SET name = 'Q' WHERE id IS NULL;", false),
+                ("DELETE FROM users WHERE id = 1;", true),
+                ("DELETE FROM users WHERE id = 8 AND active = TRUE;", true),
+                ("DELETE FROM users WHERE id = 70;", true),
+                ("DELETE FROM users WHERE name = 'Bea';", false),
+                ("DELETE FROM users WHERE id < 0 OR bucket = 9;", false),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_index_update_lists_targets_before_it_changes_a_key() {
+        let (_dir, mut db) = open_mutation("m25-targets");
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'B' WHERE 2 = id;"),
+            1
+        );
+        let note = mutation_note();
+        assert_eq!(note.index, "idx_users_id");
+        assert_eq!(note.predicate, "2 = id");
+        assert!(note.residual.is_empty());
+        assert_eq!(note.candidates, 1);
+        assert_eq!(note.modified, 1);
+        assert_eq!(
+            change_count(
+                &mut db,
+                "UPDATE users SET name = 'X' WHERE id = 1 AND bucket = 1;"
+            ),
+            2
+        );
+        let note = mutation_note();
+        assert_eq!(note.index, "idx_users_bucket");
+        assert_eq!(note.predicate, "bucket = 1");
+        assert_eq!(note.residual, "id = 1 AND bucket = 1");
+        assert_eq!(note.candidates, 3);
+        assert_eq!(note.examined, 3);
+        assert_eq!(note.modified, 2);
+        assert!(note.staged_bytes > 0);
+        let rows = table_rows(&mut db);
+        assert_eq!(rows[0][1], Value::Text("X".to_string()));
+        assert_eq!(rows[1][1], Value::Text("X".to_string()));
+        assert_eq!(rows[2][1], Value::Text("B".to_string()));
+        assert_eq!(rows[4][1], Value::Text("Cy".to_string()));
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET id = NULL WHERE id = 1;"),
+            2
+        );
+        assert!(
+            index_entries(&mut db, "idx_users_id")
+                .iter()
+                .all(|(key, _)| *key != 1)
+        );
+        assert_eq!(
+            change_count(&mut db, "DELETE FROM users WHERE bucket = 1;"),
+            3
+        );
+        let note = mutation_note();
+        assert_eq!(note.index, "idx_users_bucket");
+        assert_eq!(note.modified, 3);
+        assert_eq!(table_rows(&mut db).len(), 2);
+    }
+
+    #[test]
+    fn deleting_and_reinserting_does_not_reuse_the_index_row_id() {
+        let (dir, mut db) = open_mutation("m25-reinsert");
+        let path = dir.join("db");
+        let old = index_entries(&mut db, "idx_users_id")
+            .into_iter()
+            .find(|(key, _)| *key == 2)
+            .unwrap();
+        assert_eq!(change_count(&mut db, "DELETE FROM users WHERE id = 2;"), 1);
+        assert!(
+            index_entries(&mut db, "idx_users_id")
+                .iter()
+                .all(|(key, _)| *key != 2)
+        );
+        db.execute("INSERT INTO users VALUES (2, 'Bea', TRUE, 2);")
+            .unwrap();
+        let new = index_entries(&mut db, "idx_users_id")
+            .into_iter()
+            .filter(|(key, _)| *key == 2)
+            .collect::<Vec<_>>();
+        assert_eq!(new.len(), 1);
+        assert_ne!(new[0].1, old.1);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT name FROM users WHERE id = 2;").rows,
+            vec![vec![Value::Text("Bea".to_string())]]
+        );
+        let reopened = index_entries(&mut db, "idx_users_id")
+            .into_iter()
+            .filter(|(key, _)| *key == 2)
+            .collect::<Vec<_>>();
+        assert_eq!(reopened, new);
+    }
+
+    #[test]
+    fn a_malformed_where_cell_uses_the_scan_before_the_probe() {
+        let (dir, mut db) = open_mutation("m25-malformed");
+        let path = dir.join("db");
+        let before = std::fs::read(&path).unwrap();
+        replace_cell(&mut db, "users", 2, 1, Value::Integer(1));
+        let error = db
+            .execute("UPDATE users SET active = FALSE WHERE id = 1 AND name = 'Ada';")
+            .unwrap_err();
+        assert!(error.to_string().contains("different types"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(table_rows(&mut db)[0][2], Value::Boolean(true));
+
+        let (_dir, mut skipped) = open_mutation("m25-malformed-skip");
+        let path = _dir.join("db");
+        let before = std::fs::read(&path).unwrap();
+        replace_cell(&mut skipped, "users", 2, 1, Value::Integer(1));
+        let error = {
+            let _skip = SkipWhereSchemaCheck::new();
+            skipped
+                .execute("UPDATE users SET active = FALSE WHERE id = 1 AND name = 'Ada';")
+                .unwrap_err()
+        };
+        assert!(
+            error.to_string().contains("does not match its column"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(table_rows(&mut skipped)[0][2], Value::Boolean(true));
+    }
+
+    #[test]
+    fn a_corrupt_mutation_index_fails_before_it_writes() {
+        let (dir, mut db) = open_mutation("m25-disagree");
+        let path = dir.join("db");
+        let before = std::fs::read(&path).unwrap();
+        replace_cell(&mut db, "users", 0, 0, Value::Integer(99));
+        let error = db
+            .execute("UPDATE users SET name = 'Z' WHERE id = 1;")
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(table_rows(&mut db)[0][0], Value::Integer(99));
+
+        let (dir, mut db) = open_mutation("m25-corrupt-page");
+        let path = dir.join("db");
+        let before = std::fs::read(&path).unwrap();
+        db.corrupt_index_root_type("idx_users_id").unwrap();
+        let error = db.execute("DELETE FROM users WHERE id = 1;").unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(table_rows(&mut db).len(), 5);
+
+        let (dir, mut db) = open_mutation("m25-broken-link");
+        let path = dir.join("db");
+        let mut sql = String::from("INSERT INTO users VALUES ");
+        for index in 0..260 {
+            if index > 0 {
+                sql.push(',');
+            }
+            sql.push_str("(1, 'n', TRUE, 1)");
+        }
+        sql.push(';');
+        db.execute(&sql).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        db.zero_leftmost_leaf_right("idx_users_id").unwrap();
+        let error = db.execute("DELETE FROM users WHERE id = 1;").unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            query(&mut db, "SELECT COUNT(*) FROM users WHERE TRUE OR id = 1;").rows,
+            vec![vec![Value::Integer(265)]]
+        );
+    }
+
+    #[test]
+    fn a_missing_posting_rejects_an_indexed_update_and_delete() {
+        let reference = vec![
+            vec![Value::Integer(1), Value::Text("Ada".to_string())],
+            vec![Value::Integer(1), Value::Text("Ann".to_string())],
+        ];
+        let (dir, mut db) = open_duplicate_ids("m25-missing");
+        let path = dir.join("db");
+        let original_rows = id_rows(&mut db);
+        let original_index = index_entries(&mut db, "idx_users_id");
+        assert_eq!(original_rows, reference);
+        assert_eq!(
+            original_index,
+            vec![(1, 1), (1, 2)],
+            "index postings before the posting is removed"
+        );
+        assert_eq!(reference_ids(&reference, 1), vec![0, 1]);
+        db.patch_root_leaf_entry("idx_users_id", 1, Some(99), None)
+            .unwrap();
+        let damaged = index_entries(&mut db, "idx_users_id");
+        assert_eq!(damaged, vec![(1, 1), (99, 2)]);
+        let before = durable_bytes(&path);
+        let error = db
+            .execute("UPDATE users SET name = 'Z' WHERE id = 1;")
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error}");
+        assert!(!error.to_string().contains("rows updated"), "{error}");
+        assert_eq!(durable_bytes(&path), before);
+        assert_eq!(id_rows(&mut db), reference);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(id_rows(&mut db), reference);
+        assert_eq!(index_entries(&mut db, "idx_users_id"), original_index);
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Z' WHERE id = 1;"),
+            2
+        );
+        assert_eq!(id_rows(&mut db), reference_rename(&reference, 1, "Z"));
+
+        let (dir, mut db) = open_duplicate_ids("m25-missing-delete");
+        let path = dir.join("db");
+        db.drop_root_leaf_entry("idx_users_id", 0).unwrap();
+        assert_eq!(index_entries(&mut db, "idx_users_id"), vec![(1, 2)]);
+        let before = durable_bytes(&path);
+        let error = db.execute("DELETE FROM users WHERE id = 1;").unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error}");
+        assert!(!error.to_string().contains("rows deleted"), "{error}");
+        assert_eq!(durable_bytes(&path), before);
+        assert_eq!(id_rows(&mut db), reference);
+
+        let (dir, mut probed) = open_duplicate_ids("m25-displaced");
+        let probed_path = dir.join("db");
+        let probed_before = durable_bytes(&probed_path);
+        probed
+            .patch_root_leaf_entry("idx_users_id", 1, Some(99), None)
+            .unwrap();
+        let error = probed
+            .execute("UPDATE users SET name = 'Q' WHERE id = 99;")
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error}");
+        assert_eq!(durable_bytes(&probed_path), probed_before);
+        assert_eq!(id_rows(&mut probed), reference);
+    }
+
+    #[test]
+    fn missing_postings_fail_for_every_duplicate_position() {
+        for (slot, label) in [(0, "first"), (1, "middle"), (2, "last")] {
+            for sql in [
+                "UPDATE users SET name = 'Z' WHERE bucket = 1;",
+                "UPDATE users SET bucket = 9 WHERE bucket = 1;",
+                "UPDATE users SET bucket = NULL WHERE bucket = 1;",
+                "UPDATE users SET bucket = 2 WHERE bucket = 1;",
+                "DELETE FROM users WHERE bucket = 1;",
+            ] {
+                let (dir, mut db) = open_mutation(&format!("m25-{label}-{}", sql.len()));
+                let path = dir.join("db");
+                let rows = table_rows(&mut db);
+                let postings = index_entries(&mut db, "idx_users_bucket");
+                assert_eq!(
+                    postings,
+                    vec![(1, 1), (1, 2), (1, 5), (2, 3), (3, 4)],
+                    "{label}"
+                );
+                assert_eq!(reference_bucket(&rows), vec![0, 1, 4], "{label}");
+                db.drop_root_leaf_entry("idx_users_bucket", slot).unwrap();
+                let before = durable_bytes(&path);
+                let error = db.execute(sql).unwrap_err();
+                assert!(
+                    error.to_string().contains("does not match"),
+                    "{label} {sql}: {error}"
+                );
+                assert_eq!(durable_bytes(&path), before, "{label} {sql}");
+                assert_eq!(table_rows(&mut db), rows, "{label} {sql}");
+            }
+        }
+
+        let (dir, mut db) = open_mutation("m25-residual-missing");
+        let path = dir.join("db");
+        let rows = table_rows(&mut db);
+        db.drop_root_leaf_entry("idx_users_bucket", 1).unwrap();
+        let before = durable_bytes(&path);
+        let error = db
+            .execute("UPDATE users SET name = 'Z' WHERE bucket = 1 AND active = TRUE;")
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error}");
+        assert_eq!(durable_bytes(&path), before);
+        assert_eq!(table_rows(&mut db), rows);
+
+        let (dir, mut db) = open_mutation("m25-valid-reopen");
+        let path = dir.join("db");
+        let mut expected = table_rows(&mut db);
+        let count = change_count(&mut db, "UPDATE users SET name = 'Z' WHERE bucket = 1;");
+        let forced = {
+            let (_scan_dir, mut scanned) = open_mutation("m25-valid-scan");
+            let _force = ForceHeapMutation::new();
+            change_count(
+                &mut scanned,
+                "UPDATE users SET name = 'Z' WHERE bucket = 1;",
+            )
+        };
+        assert_eq!(count, forced);
+        assert_eq!(count, 3);
+        for position in reference_bucket(&expected) {
+            expected[position][1] = Value::Text("Z".to_string());
+        }
+        assert_eq!(table_rows(&mut db), expected);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut db), expected);
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'N' WHERE id = 70;"),
+            0
+        );
+        assert_eq!(table_rows(&mut db), expected);
+    }
+
+    #[test]
+    fn a_malformed_where_cell_wins_over_a_missing_posting() {
+        let (dir, mut db) = open_mutation("m25-type-before-posting");
+        let path = dir.join("db");
+        replace_cell(&mut db, "users", 2, 1, Value::Integer(1));
+        db.drop_root_leaf_entry("idx_users_id", 0).unwrap();
+        let before = durable_bytes(&path);
+        let error = db
+            .execute("UPDATE users SET active = FALSE WHERE id = 1 AND name = 'Ada';")
+            .unwrap_err();
+        assert!(error.to_string().contains("different types"), "{error}");
+        assert_eq!(durable_bytes(&path), before);
+        assert!(table_rows(&mut db)[0][2] == Value::Boolean(true));
+    }
+
+    fn id_rows(db: &mut Database) -> Vec<Vec<Value>> {
+        query(db, "SELECT id, name FROM users WHERE TRUE OR id = 0;").rows
+    }
+
+    fn durable_bytes(path: &std::path::Path) -> (Vec<u8>, Vec<u8>) {
+        let wal = path.with_extension("wal");
+        (
+            std::fs::read(path).unwrap(),
+            std::fs::read(&wal).unwrap_or_default(),
+        )
+    }
+
+    /// Heap positions whose first cell is `key`. This does not read an index.
+    fn reference_ids(rows: &[Vec<Value>], key: i64) -> Vec<usize> {
+        rows.iter()
+            .enumerate()
+            .filter(|(_, row)| row.first() == Some(&Value::Integer(key)))
+            .map(|(position, _)| position)
+            .collect()
+    }
+
+    fn reference_bucket(rows: &[Vec<Value>]) -> Vec<usize> {
+        rows.iter()
+            .enumerate()
+            .filter(|(_, row)| row.get(3) == Some(&Value::Integer(1)))
+            .map(|(position, _)| position)
+            .collect()
+    }
+
+    fn reference_rename(rows: &[Vec<Value>], key: i64, name: &str) -> Vec<Vec<Value>> {
+        rows.iter()
+            .map(|row| {
+                let mut row = row.clone();
+                if row.first() == Some(&Value::Integer(key)) {
+                    row[1] = Value::Text(name.to_string());
+                }
+                row
+            })
+            .collect()
+    }
+
+    fn open_duplicate_ids(label: &str) -> (crate::test_dir::TestDir, Database) {
+        let dir = crate::test_dir::TestDir::new(label);
+        let path = dir.join("db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INT, name TEXT);")
+                .unwrap();
+            db.execute("INSERT INTO users VALUES (1, 'Ada'), (1, 'Ann');")
+                .unwrap();
+        }
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_users_id ON users(id);")
+            .unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn an_indexed_write_keeps_the_existing_commit_boundaries() {
+        let (_dir, mut db) = open_mutation("m25-before-log");
+        db.set_inject(crate::storage::Inject::BeforeLogSync);
+        let error = db
+            .execute("UPDATE users SET name = 'Z' WHERE id = 2;")
+            .unwrap_err();
+        assert!(!error.to_string().contains("rows updated"), "{error}");
+        assert_eq!(table_rows(&mut db)[2][1], Value::Text("Bea".to_string()));
+        assert_eq!(
+            change_count(&mut db, "UPDATE users SET name = 'Z' WHERE id = 2;"),
+            1
+        );
+
+        let (dir, mut db) = open_mutation("m25-after-log");
+        let path = dir.join("db");
+        db.set_inject(crate::storage::Inject::AfterLogSync);
+        let error = db.execute("DELETE FROM users WHERE id = 4;").unwrap_err();
+        assert!(
+            error.to_string().contains("checkpoint did not finish"),
+            "{error}"
+        );
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert!(
+            table_rows(&mut db)
+                .iter()
+                .all(|row| row[0] != Value::Integer(4))
+        );
+
+        let (dir, mut db) = open_mutation("m25-sync-failed");
+        let path = dir.join("db");
+        db.set_inject(crate::storage::Inject::CommitSyncFailed);
+        let error = db
+            .execute("UPDATE users SET active = FALSE WHERE id = 2;")
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("outcome is unknown"), "{message}");
+        assert!(message.contains("not a confirmed rollback"), "{message}");
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert_eq!(table_rows(&mut db)[2][2], Value::Boolean(false));
+
+        let (dir, mut db) = open_mutation("m25-checkpoint");
+        let path = dir.join("db");
+        db.set_inject(crate::storage::Inject::DuringCheckpoint(1));
+        assert!(
+            db.execute("DELETE FROM users WHERE bucket = 2;")
+                .unwrap_err()
+                .to_string()
+                .contains("checkpoint")
+        );
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        assert!(
+            table_rows(&mut db)
+                .iter()
+                .all(|row| row[3] != Value::Integer(2))
+        );
+    }
+
+    #[test]
+    #[ignore = "release profile of indexed UPDATE and DELETE"]
+    fn profile_milestone25() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone25 cpu={cpu} mem_bytes={mem} rustc={rustc} value_bytes={}",
+            std::mem::size_of::<Value>()
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            for workload in [
+                "point",
+                "miss",
+                "duplicates",
+                "residual",
+                "key",
+                "delete_one",
+                "delete_many",
+            ] {
+                profile_mutation(rows, workload);
+            }
+        }
+    }
+
+    fn profile_mutation(rows: i64, workload: &str) {
+        let (_index_dir, mut indexed) = open_profile_db("m25-index", rows);
+        let (_scan_dir, mut scanned) = open_profile_db("m25-scan", rows);
+        let (sql, restore) = mutation_work(workload, rows);
+        let index_count = change_count(&mut indexed, &sql);
+        let index_note = mutation_note();
+        let scan_count = {
+            let _force = ForceHeapMutation::new();
+            change_count(&mut scanned, &sql)
+        };
+        assert_eq!(index_count, scan_count, "{workload}");
+        assert_eq!(index_note.executed, "IndexLookup", "{workload}");
+        assert_eq!(index_note.modified, scan_count as u64, "{workload}");
+        let checksum = mutation_checksum(&mut indexed);
+        assert_eq!(checksum, mutation_checksum(&mut scanned), "{workload}");
+        if let Some(restore) = restore.as_deref() {
+            indexed.execute(restore).unwrap();
+            scanned.execute(restore).unwrap();
+        }
+        let samples = if rows >= 100_000 { 3 } else { 6 };
+        let alternate = matches!(workload, "point" | "duplicates" | "residual");
+        let index_time = time_mutation(
+            &mut indexed,
+            &sql,
+            restore.as_deref(),
+            samples,
+            false,
+            alternate,
+        );
+        let scan_time = time_mutation(
+            &mut scanned,
+            &sql,
+            restore.as_deref(),
+            samples,
+            true,
+            alternate,
+        );
+        println!(
+            "milestone25 workload={workload} rows={rows} candidates={} examined={} modified={} probes={} heap_rows={} staged_bytes={} discover_us={} probe_us={} validate_us={} filter_us={} stage_us={} apply_us={} index_cold_us={} index_warm_us={} scan_cold_us={} scan_warm_us={} wal_cold_us={} wal_warm_us={} publish_cold_us={} publish_warm_us={} compare_cold_us={} compare_warm_us={} compares={} checksum={checksum}",
+            index_note.candidates,
+            index_note.examined,
+            index_note.modified,
+            index_note.probes,
+            index_note.heap_rows,
+            index_note.staged_bytes,
+            index_note.discover_us,
+            index_note.probe_us,
+            index_note.validate_us,
+            index_note.filter_us,
+            index_note.stage_us,
+            index_note.apply_us,
+            index_time.cold,
+            index_time.warm,
+            scan_time.cold,
+            scan_time.warm,
+            index_time.wal_cold,
+            index_time.wal_warm,
+            index_time.publish_cold,
+            index_time.publish_warm,
+            index_time.compare_cold,
+            index_time.compare_warm,
+            index_time.compares,
+        );
+    }
+
+    fn mutation_work(workload: &str, rows: i64) -> (String, Option<String>) {
+        match workload {
+            "point" => (
+                "UPDATE users SET name = 'n' WHERE id = 1;".to_string(),
+                None,
+            ),
+            "miss" => (
+                "UPDATE users SET name = 'n' WHERE id = -1;".to_string(),
+                None,
+            ),
+            "duplicates" => (
+                "UPDATE users SET name = 'n' WHERE bucket = 1;".to_string(),
+                None,
+            ),
+            "residual" => (
+                "UPDATE users SET name = 'n' WHERE id = 1 AND active = TRUE;".to_string(),
+                None,
+            ),
+            "key" => (
+                "UPDATE users SET id = -1 WHERE id = 1;".to_string(),
+                Some("UPDATE users SET id = 1 WHERE id = -1;".to_string()),
+            ),
+            "delete_one" => (
+                "DELETE FROM users WHERE id = 1;".to_string(),
+                Some("INSERT INTO users VALUES (1, 'n1', TRUE, 1);".to_string()),
+            ),
+            "delete_many" => (
+                "DELETE FROM users WHERE bucket = 1;".to_string(),
+                Some(bucket_restore(rows)),
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    fn bucket_restore(rows: i64) -> String {
+        let mut sql = String::from("INSERT INTO users VALUES ");
+        let mut first = true;
+        for id in 0..rows {
+            if id % 10 != 1 {
+                continue;
+            }
+            if !first {
+                sql.push(',');
+            }
+            first = false;
+            sql.push_str(&format!("({id}, 'n{id}', TRUE, 1)"));
+        }
+        sql.push(';');
+        sql
+    }
+
+    struct TimedMutation {
+        cold: u128,
+        warm: u128,
+        wal_cold: u128,
+        wal_warm: u128,
+        publish_cold: u128,
+        publish_warm: u128,
+        compare_cold: u128,
+        compare_warm: u128,
+        compares: u64,
+    }
+
+    fn time_mutation(
+        db: &mut Database,
+        sql: &str,
+        restore: Option<&str>,
+        samples: usize,
+        force_scan: bool,
+        alternate: bool,
+    ) -> TimedMutation {
+        let mut totals = Vec::with_capacity(samples);
+        let mut wal = Vec::with_capacity(samples);
+        let mut publish = Vec::with_capacity(samples);
+        let mut compare = Vec::with_capacity(samples);
+        let mut compares = 0_u64;
+        for sample in 0..samples {
+            let statement = sample_statement(sql, sample, alternate);
+            crate::storage::reset_phases();
+            let started = std::time::Instant::now();
+            if force_scan {
+                let _force = ForceHeapMutation::new();
+                db.execute(&statement).unwrap();
+            } else {
+                db.execute(&statement).unwrap();
+            }
+            totals.push(started.elapsed().as_micros());
+            let taken = crate::storage::take_phases();
+            let wal_us = (taken.wal_write
+                + taken.wal_sync
+                + taken.db_write
+                + taken.db_sync
+                + taken.wal_clear)
+                .as_micros();
+            wal.push(wal_us);
+            publish.push(taken.apply.as_micros());
+            compare.push(taken.compare.as_micros());
+            compares = taken.row_compares;
+            if let Some(restore) = restore {
+                db.execute(restore).unwrap();
+            }
+        }
+        TimedMutation {
+            cold: totals[0],
+            warm: median(&totals[1..]),
+            wal_cold: wal[0],
+            wal_warm: median(&wal[1..]),
+            publish_cold: publish[0],
+            publish_warm: median(&publish[1..]),
+            compare_cold: compare[0],
+            compare_warm: median(&compare[1..]),
+            compares,
+        }
+    }
+
+    /// `point`, `duplicates`, and `residual` assign a name. The untimed
+    /// statement used `'n'`, so sample 0 assigns `'m'` and later samples
+    /// alternate. Every timed sample then changes a cell and writes the WAL.
+    fn sample_statement(sql: &str, sample: usize, alternate: bool) -> String {
+        if !alternate {
+            return sql.to_string();
+        }
+        let name = if sample.is_multiple_of(2) { "m" } else { "n" };
+        sql.replacen("SET name = 'n'", &format!("SET name = '{name}'"), 1)
+    }
+
+    fn median(values: &[u128]) -> u128 {
+        let mut warm = values.to_vec();
+        warm.sort_unstable();
+        warm[warm.len() / 2]
+    }
+
+    fn mutation_checksum(db: &mut Database) -> i64 {
+        query(db, "SELECT id, name, active, bucket FROM users;")
+            .rows
+            .iter()
+            .fold(0_i64, |sum, row| {
+                row.iter()
+                    .fold(sum, |sum, cell| sum.wrapping_add(profile_cell(cell)))
+            })
+    }
+
+    fn open_profile_db(label: &str, rows: i64) -> (crate::test_dir::TestDir, Database) {
+        let dir = crate::test_dir::TestDir::new(label);
+        let path = dir.join("db");
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE users (id INT, name TEXT, active BOOLEAN, bucket INT);")
+                .unwrap();
+            let mut start = 0_i64;
+            while start < rows {
+                let end = (start + 500).min(rows);
+                let mut sql = String::from("INSERT INTO users VALUES ");
+                for id in start..end {
+                    if id > start {
+                        sql.push(',');
+                    }
+                    let bucket = id % 10;
+                    sql.push_str(&format!("({id}, 'n{id}', TRUE, {bucket})"));
+                }
+                sql.push(';');
+                db.execute(&sql).unwrap();
+                start = end;
+            }
+        }
+        Database::migrate(&path).unwrap();
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE INDEX idx_users_bucket ON users(bucket);")
+            .unwrap();
+        db.execute("CREATE INDEX idx_users_id ON users(id);")
+            .unwrap();
+        (dir, db)
     }
 }

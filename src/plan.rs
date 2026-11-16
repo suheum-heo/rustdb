@@ -29,6 +29,14 @@
 //! and, when needed, the index's minimum and maximum key. It does not assume
 //! that integers are uniformly distributed, and it does not treat `INTEGER` as
 //! nonnegative. Equality stays an index lookup.
+//!
+//! `UPDATE` and `DELETE` do not use this scan. One integer equality on an
+//! indexed column of the target table is an index lookup. The earliest index
+//! in catalog order wins when several equalities match. The original `WHERE`
+//! is the residual when it is wider than that equality. A range, `OR`,
+//! `IS NULL`, a non-indexed column, and a `TEXT` or `BOOLEAN` equality stay a
+//! heap scan. That choice does not change [`choose`], [`choose_join`], or
+//! [`choose_left_join`].
 
 use std::collections::HashMap;
 
@@ -785,6 +793,85 @@ fn indexed_comparison<'a>(expr: &'a Expr, table: &str) -> Option<(&'a str, BinOp
 
 fn qualifier_matches(qualifier: &Option<String>, table: &str) -> bool {
     qualifier.as_deref().is_none_or(|name| name == table)
+}
+
+/// How `UPDATE` or `DELETE` finds candidate rows.
+///
+/// [`MutationAccess::IndexLookup`] supplies row ids. The original `WHERE` still
+/// decides which of those rows change. This is a shape rule, not a cost model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MutationAccess {
+    /// Read the heap from front to back.
+    HeapScan,
+    /// Look up one integer key in one index, then evaluate `WHERE`.
+    IndexLookup {
+        /// Index that supplies the candidate row ids.
+        name: String,
+        /// Indexed column.
+        column: String,
+        /// Schema position of `column`.
+        ordinal: usize,
+        /// Integer key from the equality.
+        key: i64,
+        /// The equality that supplies `key`.
+        predicate: String,
+        /// Original `WHERE` text when it is not exactly `predicate`.
+        residual: Option<String>,
+    },
+}
+
+/// Pick an `UPDATE` or `DELETE` path from `WHERE`.
+///
+/// An equality on an indexed integer column is an index lookup. Reversed
+/// operands are the same equality. `AND` may hide it among other predicates.
+/// The earliest matching index in `indexes` wins, and `indexes` is catalog
+/// order. A later equality on that same column is not a second probe. `OR`
+/// anywhere, a range, `IS NULL`, a non-indexed column, or a non-integer
+/// comparison stays a heap scan. There is no cost comparison.
+pub(crate) fn choose_mutation(
+    table: &str,
+    selection: Option<&Expr>,
+    indexes: &[IndexChoice],
+) -> MutationAccess {
+    let Some(selection) = selection else {
+        return MutationAccess::HeapScan;
+    };
+    if indexes.is_empty() || contains_or(selection) {
+        return MutationAccess::HeapScan;
+    }
+    let mut atoms = Vec::new();
+    flatten_and(selection, &mut atoms);
+    let mut best: Option<(usize, &Expr)> = None;
+    for atom in atoms {
+        let Some((column, BinOp::Eq, _)) = indexed_comparison(atom, table) else {
+            continue;
+        };
+        let Some(index_pos) = indexes.iter().position(|index| index.column == column) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(best_pos, _)| index_pos < *best_pos)
+        {
+            best = Some((index_pos, atom));
+        }
+    }
+    let Some((index_pos, atom)) = best else {
+        return MutationAccess::HeapScan;
+    };
+    let Some((_, BinOp::Eq, key)) = indexed_comparison(atom, table) else {
+        return MutationAccess::HeapScan;
+    };
+    let index = &indexes[index_pos];
+    let predicate = atom.render();
+    MutationAccess::IndexLookup {
+        name: index.name.clone(),
+        column: index.column.clone(),
+        ordinal: index.ordinal,
+        key,
+        predicate: predicate.clone(),
+        residual: residual(selection, &predicate),
+    }
 }
 
 fn flip(op: BinOp) -> BinOp {
@@ -1648,6 +1735,156 @@ mod tests {
                 assert!(residual.is_some());
             }
             other => panic!("a small indexed equality hashes those columns, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_and_delete_use_one_integer_equality_and_leave_joins_alone() {
+        let age = binary(column("age"), BinOp::Eq, integer(10));
+        match choose_mutation("users", Some(&age), &indexes()) {
+            MutationAccess::IndexLookup {
+                name,
+                column,
+                ordinal,
+                key,
+                predicate,
+                residual,
+            } => {
+                assert_eq!(name, "idx_age");
+                assert_eq!(column, "age");
+                assert_eq!(ordinal, 1);
+                assert_eq!(key, 10);
+                assert_eq!(predicate, "age = 10");
+                assert!(residual.is_none());
+            }
+            MutationAccess::HeapScan => panic!("expected an index lookup"),
+        }
+
+        let reversed = binary(integer(10), BinOp::Eq, column("age"));
+        match choose_mutation("users", Some(&reversed), &indexes()) {
+            MutationAccess::IndexLookup { key, predicate, .. } => {
+                assert_eq!(key, 10);
+                assert_eq!(predicate, "10 = age");
+            }
+            MutationAccess::HeapScan => panic!("reversed equality"),
+        }
+
+        let qualified = binary(
+            Expr::Column {
+                name: "age".to_string(),
+                qualifier: Some("users".to_string()),
+            },
+            BinOp::Eq,
+            integer(3),
+        );
+        match choose_mutation("users", Some(&qualified), &indexes()) {
+            MutationAccess::IndexLookup { key, predicate, .. } => {
+                assert_eq!(key, 3);
+                assert_eq!(predicate, "users.age = 3");
+            }
+            MutationAccess::HeapScan => panic!("qualified equality"),
+        }
+
+        let both = binary(
+            binary(column("id"), BinOp::Eq, integer(1)),
+            BinOp::And,
+            binary(column("age"), BinOp::Eq, integer(2)),
+        );
+        match choose_mutation("users", Some(&both), &indexes()) {
+            MutationAccess::IndexLookup {
+                name,
+                key,
+                predicate,
+                residual,
+                ..
+            } => {
+                assert_eq!(name, "idx_age");
+                assert_eq!(key, 2);
+                assert_eq!(predicate, "age = 2");
+                assert_eq!(residual.as_deref(), Some("id = 1 AND age = 2"));
+            }
+            MutationAccess::HeapScan => panic!("earliest catalog index"),
+        }
+
+        let residual_name = binary(
+            binary(column("age"), BinOp::Eq, integer(10)),
+            BinOp::And,
+            binary(
+                column("name"),
+                BinOp::Eq,
+                Expr::Literal(Value::Text("Ada".to_string())),
+            ),
+        );
+        match choose_mutation("users", Some(&residual_name), &indexes()) {
+            MutationAccess::IndexLookup {
+                name,
+                predicate,
+                residual,
+                ..
+            } => {
+                assert_eq!(name, "idx_age");
+                assert_eq!(predicate, "age = 10");
+                assert!(residual.unwrap().contains("name = 'Ada'"));
+            }
+            MutationAccess::HeapScan => panic!("text residual"),
+        }
+
+        let scans = [
+            binary(column("age"), BinOp::Lt, integer(10)),
+            binary(
+                binary(column("id"), BinOp::Eq, integer(1)),
+                BinOp::Or,
+                binary(column("id"), BinOp::Eq, integer(2)),
+            ),
+            Expr::IsNull(Box::new(column("id"))),
+            binary(
+                column("name"),
+                BinOp::Eq,
+                Expr::Literal(Value::Text("Ada".to_string())),
+            ),
+            binary(column("active"), BinOp::Eq, boolean(true)),
+            binary(column("missing"), BinOp::Eq, integer(1)),
+        ];
+        for expr in &scans {
+            assert!(
+                matches!(
+                    choose_mutation("users", Some(expr), &indexes()),
+                    MutationAccess::HeapScan
+                ),
+                "{expr:?}"
+            );
+        }
+        assert!(matches!(
+            choose_mutation("users", None, &indexes()),
+            MutationAccess::HeapScan
+        ));
+        assert!(matches!(
+            choose_mutation("users", Some(&age), &[]),
+            MutationAccess::HeapScan
+        ));
+
+        let other = binary(integer(4), BinOp::Eq, column("id"));
+        match choose("users", Some(&other), &indexes()) {
+            AccessPath::IndexScan { name, bounds, .. } => {
+                assert_eq!(name, "idx_id");
+                assert_eq!(bounds, Bounds::Equal(4));
+            }
+            AccessPath::SeqScan => panic!("select equality"),
+        }
+        match choose_join(
+            "users",
+            &[("id".to_string(), DataType::Integer)],
+            "orders",
+            &[("user_id".to_string(), DataType::Integer)],
+            &binary(column("id"), BinOp::Eq, column("user_id")),
+            &[IndexChoice {
+                name: "idx_orders_user".to_string(),
+                column: "user_id".to_string(),
+                ordinal: 0,
+            }],
+        ) {
+            JoinAccess::IndexNestedLoop { name, .. } => assert_eq!(name, "idx_orders_user"),
+            other => panic!("inner join planner changed: {other:?}"),
         }
     }
 }

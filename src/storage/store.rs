@@ -202,6 +202,13 @@ impl Store {
     }
 
     #[cfg(test)]
+    pub(crate) fn drop_root_leaf_entry(&mut self, name: &str, slot: usize) -> Result<(), DbError> {
+        let root = self.index_root(name)?;
+        let page = self.pager.cached_page_mut(root)?;
+        btree::drop_leaf_entry(page, slot)
+    }
+
+    #[cfg(test)]
     pub(crate) fn zero_leftmost_leaf_right(&mut self, name: &str) -> Result<(), DbError> {
         let root = self.index_root(name)?;
         let leaf_id = {

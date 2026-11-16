@@ -161,7 +161,17 @@ Before hashing or probing, execution walks each input once to check row width, t
 
 A schema-valid index whose leaf is unsorted, whose row id is duplicated, or whose page type is wrong still returns the existing corrupt-index error. The fallback does not run after that error and does not turn it into a successful nested loop. A malformed `ON` cell is a recoverable query error and is detected before the index is read, including when the index is also damaged. A later statement sees the same database. `SELECT` and `EXPLAIN` do not publish a partial row and do not append a log frame.
 
-The check does not look at `WHERE`. Both paths already agree there. It does not change the 64× index threshold, the hash build side, or the index page format.
+The check does not look at `WHERE` for joins. Both join paths already agree there. It does not change the 64× index threshold, the hash build side, or the index page format.
+
+## Indexed UPDATE and DELETE
+
+`UPDATE` and `DELETE` look up one integer equality before they change a row. The lookup returns row ids. Those ids are resolved and checked against the heap. The statement then walks every heap row and collects the ones whose indexed column is that integer. `NULL` is not a member. The index list and the heap list must be the same positions, in heap order. That comparison happens before the original `WHERE`, so a missing posting is visible even when the omitted row would fail a residual predicate. Only a matching set is filtered, listed, and published. The index is not edited while the lookup cursor is open. Changing an indexed key cannot make the same row match twice, and deleting an earlier row cannot shift a later target, because the targets are row ids rather than slots captured after a mutation.
+
+The checks run in this order. Binding and assignment types fail first. A wrong-typed `WHERE` cell then uses the heap scan, so the comparison reports `comparison values have different types` when the scan evaluates it. That choice is made before the probe, including when a posting is also missing. A corrupt page, a broken leaf link, a missing row id, a repeated row id, or an index key that disagrees with a returned heap integer fails during the probe. A set that disagrees with the heap equality walk fails next, with the same index-mismatch error. `WHERE` runs only after that. Publish has not started, so memory and the file stay as they were, and no affected-row count is reported. Publish also rejects a table image whose stored cell does not match the column.
+
+Open compares the whole tree with the heap, so a file that is already missing a posting fails to open. The mutation walk covers a posting removed after open for the chosen key. It does not audit other keys, and `SELECT` and join probes still do not walk the heap for an absent posting. An `UPDATE` publish compares every heap value while it installs the replacement. A `DELETE` unlinks the listed row ids and does not do that value compare.
+
+Injected commit failures keep the previous boundaries. A failure before the log sync restores memory. A failed commit sync, a failure after the log sync, and a failure during checkpoint fence the process; the next open can still show the statement. None of those injections is a power loss. The exclusive file lock is unchanged.
 
 ## Suggested next reliability work
 

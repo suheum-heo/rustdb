@@ -1045,6 +1045,29 @@ pub(crate) fn patch_leaf_entry(
     Ok(())
 }
 
+/// Remove one leaf slot from a cached page. The page is not resealed.
+///
+/// Later slots shift down and stay in their previous order, so a sorted leaf
+/// stays sorted. The caller uses this to drop a posting after open.
+#[cfg(test)]
+pub(crate) fn drop_leaf_entry(page: &mut Page, slot: usize) -> Result<(), DbError> {
+    let id = read_u32(page.as_slice(), OFF_ID);
+    if read_u16(page.as_slice(), OFF_TYPE) != TYPE_INDEX_LEAF {
+        return Err(corrupt(id));
+    }
+    let count = usize::from(read_u16(page.as_slice(), LEAF_COUNT));
+    if slot >= count {
+        return Err(corrupt(id));
+    }
+    let start = LEAF_BODY + slot * ENTRY_LEN;
+    let end = LEAF_BODY + count * ENTRY_LEN;
+    let bytes = page.as_mut_slice();
+    bytes.copy_within(start + ENTRY_LEN..end, start);
+    bytes[end - ENTRY_LEN..end].fill(0);
+    write_u16(bytes, LEAF_COUNT, (count - 1) as u16);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
