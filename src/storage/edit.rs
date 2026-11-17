@@ -157,9 +157,7 @@ impl Editor {
                     "updated row {row_id} is not stored in '{table}'"
                 )));
             };
-            if !self.same_values(pager, table, index, values)? {
-                self.rewrite_row(pager, table, index, *row_id, values)?;
-            }
+            self.rewrite_row(pager, table, index, *row_id, values)?;
         }
         self.prepared(pager)
     }
@@ -246,9 +244,7 @@ impl Editor {
         for index in 0..count {
             let row_id = self.snapshot.tables[scan.name].row_ids[index];
             let values = &scan.rows[index];
-            if !self.same_values(pager, scan.name, index, values)? {
-                self.rewrite_row(pager, scan.name, index, row_id, values)?;
-            }
+            self.rewrite_row(pager, scan.name, index, row_id, values)?;
         }
         Ok(())
     }
@@ -332,9 +328,7 @@ impl Editor {
         let desired_ids: Vec<u64> = desired.rows.iter().map(|(id, _)| *id).collect();
         if desired_ids == current_ids {
             for (index, (row_id, values)) in desired.rows.iter().enumerate() {
-                if !self.same_values(pager, &desired.name, index, values)? {
-                    self.rewrite_row(pager, &desired.name, index, *row_id, values)?;
-                }
+                self.rewrite_row(pager, &desired.name, index, *row_id, values)?;
             }
         } else if desired_ids.starts_with(&current_ids) {
             for (row_id, values) in desired.rows.iter().skip(current_ids.len()) {
@@ -357,24 +351,6 @@ impl Editor {
         }
         self.set_next_row_id(pager, &desired.name, desired.next_row_id)?;
         Ok(())
-    }
-
-    fn same_values(
-        &mut self,
-        pager: &mut Pager,
-        name: &str,
-        index: usize,
-        values: &[Value],
-    ) -> Result<bool, DbError> {
-        let mark = profile::start();
-        let link = self.snapshot.tables[name].links[index];
-        self.ensure(pager, link.page)?;
-        let bytes = page::cell(&self.pages[&link.page], link.slot)?.to_vec();
-        let record = record::decode_record(&bytes).map_err(|_| page::corrupt(link.page))?;
-        let same = record.values == values;
-        profile::note_row_compare();
-        profile::add_compare(mark);
-        Ok(same)
     }
 
     fn append_row(
@@ -458,9 +434,27 @@ impl Editor {
     ) -> Result<(), DbError> {
         let link = self.snapshot.tables[name].links[index];
         let table_id = self.snapshot.tables[name].table_id;
-        let old_values = self.row_values(pager, link)?;
+        // Compare and retain the complete record before any edit. Nothing can
+        // change this slot between this decode and its rewrite. A later row
+        // still decodes its current image, including earlier neighbor patches.
+        let mark = profile::start();
         self.ensure(pager, link.page)?;
-        let (prev, next) = self.read_links(link)?;
+        let bytes = page::cell(&self.pages[&link.page], link.slot)?.to_vec();
+        let old = record::decode_record(&bytes).map_err(|_| page::corrupt(link.page))?;
+        let same = old.values == values;
+        profile::note_row_compare();
+        profile::add_compare(mark);
+        if same {
+            return Ok(());
+        }
+        let (old_values, prev, next) = if repeat_update_decode() {
+            drop(old);
+            let values = self.row_values(pager, link)?;
+            let (prev, next) = self.read_links(link)?;
+            (values, prev, next)
+        } else {
+            (old.values, old.prev, old.next)
+        };
         let bytes = record::encode_record(&StoredRecord {
             row_id,
             prev,
@@ -1609,6 +1603,40 @@ fn patch_doomed_pages() -> bool {
     #[cfg(test)]
     {
         FORCE_DOOMED_PATCHES.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPEAT_UPDATE_DECODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restore the M43 comparison, old-value decode, and link decode.
+#[cfg(test)]
+pub(crate) struct ForceRepeatedUpdateDecode(bool);
+
+#[cfg(test)]
+impl ForceRepeatedUpdateDecode {
+    pub(crate) fn new() -> Self {
+        Self(REPEAT_UPDATE_DECODE.with(|flag| flag.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceRepeatedUpdateDecode {
+    fn drop(&mut self) {
+        REPEAT_UPDATE_DECODE.with(|flag| flag.set(self.0));
+    }
+}
+
+fn repeat_update_decode() -> bool {
+    #[cfg(test)]
+    {
+        REPEAT_UPDATE_DECODE.with(|flag| flag.get())
     }
     #[cfg(not(test))]
     {

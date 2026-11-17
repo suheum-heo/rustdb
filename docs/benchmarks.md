@@ -1930,3 +1930,50 @@ commit `e3ab50b09dc21f84541b156a4e2c37e17d6af161`; it is not pushed or merged.
 The archived patch SHA-256 is
 `a30df9bd4a7e6442dbd3bb5cead2bb3bc8d3491893dc1490cf96782185887846`.
 Only this measurement and rejection note belongs in the M44 pull request.
+
+
+## Milestone 45: decode an updated heap record once
+
+17 Nov 2026, Apple M5, release tests, seed `0x3100`, durable syncs enabled.
+The starting point is M44 merge `fa1adeb`, whose production source is M43.
+A fresh `profile_milestone39` measured a 50,000-row non-indexed update at
+69,929 µs, including 37,438 µs in apply and 5,103 µs in comparison.
+The editor decoded each changed record once for comparison, again for old
+index values, and again for links. The new path retains the first complete
+decoded record until that row is rewritten. No page changes between comparison
+and use. Each subsequent row reads its current slot, so earlier relocation
+and neighbor-link edits are observed. Unchanged rows still decode and compare.
+No cross-row or cross-statement record cache is introduced.
+
+`ForceRepeatedUpdateDecode` restores the old three-decode path in tests only.
+`profile_milestone45` uses fresh copies, one read warmup, five samples per arm
+at 10,000 and 100,000 rows, one at 1,000, alternating arm order. All syncs
+remain enabled. Two isolated runs measured the following microseconds for
+`UPDATE users SET name = 'edited' WHERE active = TRUE` at 100,000 rows:
+
+| pass | single decode median | range | repeated median | range |
+| --- | ---: | --- | ---: | --- |
+| 1 | 61,937 | 59,323–62,946 | 69,505 | 67,211–71,624 |
+| 2 | 62,699 | 59,725–66,337 | 69,566 | 67,110–71,228 |
+
+The reduction is 9.9–10.9%, with non-overlapping ranges in both passes.
+Pass 2 explicitly drops the comparison record before the repeated decodes,
+matching the old allocation lifetime. One-row updates, inserts, and delete-all
+have overlapping ranges; no improvement is claimed for those controls.
+Both arms retain 6,309,996 WAL bytes and 1,539 frames for the large update,
+with result checksum 5,001,151,280. Page and WAL formats are unchanged.
+
+Validation: formatting, strict Clippy, all-target build, full suite (602 passed,
+0 failed, 39 ignored, including one doctest), and all 17 storage reliability
+tests with `PROPTEST_CASES=256`. Expanded differential tests also pass for
+no-op/no-match updates, NULL and duplicate index keys, growing/shrinking text,
+neighbor relocation, database bytes, row IDs/counters, both indexes, and reopen.
+The four-workload recovery matrix compares exact WAL bytes in both modes,
+pre-sync rollback, post-sync recovery, ambiguous commit-sync failure, partial
+checkpoint, fencing, checksums, and repeated reopen. These are injected faults,
+not physical power-loss tests. An initially added arithmetic SQL case was
+corrected to supported constant assignment before the targeted tests passed.
+
+Decision: merge. The next candidate is repeated whole-vector free-list sorting
+on page release; it has not been optimized in this milestone. Rejected M37,
+M38, M41, and M44 implementations remain absent.
