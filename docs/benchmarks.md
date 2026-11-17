@@ -1696,4 +1696,52 @@ Parsing, mutation planning, candidate filtering, and the in-memory scan of a `SE
 
 ### Milestone 40
 
-Drop the redundant full-page checksum in `Editor::finish` only. Keep the structural checks there. Keep `page::verify` on open, recovery, and migration. Do not change the page format or the WAL record. Do not disable `sync_all`. The reference is this profile's 100,000-row delete-all: `verify` should fall, WAL length should stay 12,168,896, the checksum should stay 0, and the statement median should fall by about the old `verify` time. Accept the change only if a repeat of this profile shows that fall outside the few-millisecond spread, and the existing recovery injections still match.
+The estimate in this note is measured in the Milestone 40 section below. The 100,000-row delete-all median fell by 65.6 ms. The WAL length stayed 12,168,896 and the checksum stayed 0.
+
+## Milestone 40 fresh-seal validation
+
+16 Nov 2026, 8:14–8:16 PM CST, Apple M5, 17,179,869,184 bytes of memory, Darwin 25.2.0 arm64, rustc 1.100.0 (`0ef1bc386 2026-11-09`). The ignored test is `profile_milestone40`. Build mode is `cargo test --release --locked`. Seed `0x3100`. The table and the SQL are the Milestone 39 workloads, without the read-only statements. `fresh` is the commit that seals a page and checks its structure. `full` forces the Milestone 39 checksum after that seal, then runs the same structural checks. Sample index alternates which arm runs first. Each arm uses a new copy of the same seeded file. At 10,000 and 100,000 rows each statement is the median of three copies. At 100 and 1,000 rows it is one copy. This is not a power-loss test.
+
+`structure` is the header, type, slotted-directory, and index-node checks. `recheck` is the second checksum. It is zero on `fresh` and about the size of `seal` on `full`. `seal` and `encode` still checksum. The log trailer is unchanged. `scratch_bytes` is the recorder's scratch counter, not process RSS.
+
+The first pass wrapped `cargo test`, so its resident set includes the compiler. The second pass ran the test binary alone. `/usr/bin/time -l` reported a maximum resident set of 434,044,928 bytes and a peak memory footprint of 419,611,536 bytes for that whole process. Those figures cover every size and both arms. They are not a per-statement peak. On the 100,000-row delete-all, `scratch_bytes` was 2,875,248 on both arms.
+
+### 100,000-row medians, first pass
+
+Times are microseconds. `structure` is the fresh median-wall copy. `recheck` is the full median-wall copy. The two arms wrote the same log length, the same frame count, and the same result checksum on every copy.
+
+| kind | fresh | fresh range | full | full range | structure | recheck | WAL | frames | checksum |
+| --- | ---: | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| one | 19,801 | 19,098–19,862 | 21,190 | 20,666–21,471 | 1 | 204 | 36,996 | 9 | 5001482560 |
+| ten | 51,921 | 51,302–52,009 | 62,841 | 61,725–63,965 | 11 | 11,312 | 2,045,996 | 499 | 5001482470 |
+| buckets | 190,509 | 188,702–210,440 | 259,630 | 248,209–273,277 | 397 | 63,183 | 10,906,096 | 2,660 | 3000897535 |
+| half | 153,416 | 152,539–153,942 | 192,795 | 189,846–197,289 | 37 | 39,412 | 7,101,296 | 1,732 | 3750796338 |
+| alternating | 199,421 | 198,513–200,882 | 262,709 | 262,098–263,174 | 311 | 63,611 | 11,537,496 | 2,814 | 2500711280 |
+| consecutive | 104,055 | 102,725–105,774 | 127,506 | 126,254–128,928 | 24 | 25,322 | 4,555,196 | 1,111 | 4688644540 |
+| sparse | 152,259 | 151,753–153,604 | 205,121 | 204,572–209,038 | 347 | 53,023 | 9,581,796 | 2,337 | 4001250051 |
+| all | 237,281 | 237,217–237,498 | 302,843 | 302,307–303,339 | 57 | 67,405 | 12,168,896 | 2,968 | 0 |
+| wide | 188,185 | 186,398–188,590 | 254,021 | 253,996–257,934 | 393 | 67,277 | 12,181,196 | 2,971 | 4546235365 |
+| update-index | 16,583 | 15,102–16,737 | 16,161 | 16,093–16,512 | 1 | 87 | 12,396 | 3 | 5001482567 |
+| update-scan | 139,137 | 136,921–140,786 | 172,140 | 172,023–174,621 | 461 | 34,889 | 6,309,996 | 1,539 | 5001151280 |
+| insert-one | 28,508 | 27,474–29,160 | 29,450 | 27,265–29,464 | 2 | 249 | 36,996 | 9 | 5001582569 |
+
+Delete-all's median fresh copy sealed in 67,355 µs and encoded the log in 68,314 µs. Structure was 57 µs. The matching full copy rechecked in 67,405 µs, sealed in 67,101 µs, and encoded in 68,128 µs. Log write was 1,045 µs and 1,182 µs. Log sync was 6,500 µs and 6,422 µs. Database sync was 4,918 µs and 5,028 µs. The fresh wall is 65,562 µs under the full wall. The fresh range ends 64,809 µs before the full range starts. The log, the frame count, and the checksum match Milestone 36 and Milestone 39.
+
+The same gap appears on the other large writes. Ten rows, buckets, half, alternating, consecutive, sparse, wide, and the scan update each have a fresh maximum below the full minimum. The recheck on those median copies is 11.3 ms to 67.3 ms, and the structure check stays under half a millisecond. The indexed update and the one-row insert stay near 16 ms and 28 ms. Their recheck is 87 µs and 249 µs. The indexed-update ranges overlap. The one-row delete is still the two syncs and the log truncate: its fresh copies were faster in this pass, and the recheck itself is about 200 µs.
+
+### Delete-all scaling, first pass
+
+| rows | fresh | full | structure | recheck | WAL | frames |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 13,123 | 11,982 | 1 | 205 | 28,796 | 7 |
+| 1,000 | 15,049 | 14,336 | 0 | 731 | 131,296 | 32 |
+| 10,000 | 34,254 | 39,896 | 6 | 7,278 | 1,213,696 | 296 |
+| 100,000 | 237,281 | 302,843 | 57 | 67,405 | 12,168,896 | 2,968 |
+
+At 100 and 1,000 rows there is one copy, and the fresh wall is about 1 ms slower. The recheck is 205 µs and 731 µs. The rest is sync variation on a statement that is mostly `sync_all`. At 10,000 rows the medians differ by 5.6 ms. One fresh copy took 42,867 µs because its seal and encode stalled at 9,997 µs and 12,989 µs. That copy overlaps the full range. The other two fresh copies were 32,711 µs and 34,254 µs, both under the full minimum of 38,633 µs.
+
+### Second pass
+
+8:16 PM CST, the test binary alone, same seed and the same three copies at 100,000 rows. Delete-all fresh median 238,363 µs (237,790–255,317). Full median 303,552 µs (302,450–310,691). The slow fresh copy spent 80,777 µs in log encoding. Its wall, 255,317 µs, is still 47,133 µs under the fastest full copy. The median gap is 65,189 µs. Structure on the median fresh copy was 56 µs. Recheck on the median full copy was 67,717 µs. WAL length stayed 12,168,896, the frame count stayed 2,968, and the checksum stayed 0. Buckets, half, alternating, consecutive, sparse, wide, and the scan update again kept the fresh maximum under the full minimum. The one-row delete stayed near 21 ms. The indexed update's fresh copies were about 1 ms slower, and that gap is the database sync, not the 70 µs recheck.
+
+The structural check is measurable and small. The statement time falls by about the old second checksum, outside the spread of the large deletes. Small statements stay in the sync-dominated band. The page format and the WAL record are unchanged.

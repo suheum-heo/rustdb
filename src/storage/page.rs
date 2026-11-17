@@ -519,7 +519,12 @@ pub(crate) fn seal(page: &mut Page) {
     write_u32(bytes, OFF_CHECKSUM, checksum);
 }
 
-pub(crate) fn verify(page: &Page, expected_id: u32) -> Result<(), DbError> {
+/// Recompute the CRC of a page that did not just come from [`seal`].
+///
+/// The CRC covers all [`PAGE_SIZE`] bytes. Bytes `8..12`, the stored
+/// checksum, are treated as zero. File reads, redo-log replay, open, and
+/// migration use this. A page the editor just sealed does not.
+pub(crate) fn recheck_checksum(page: &Page, expected_id: u32) -> Result<(), DbError> {
     let bytes = page.as_slice();
     if bytes.len() != PAGE_SIZE {
         return Err(corrupt(expected_id));
@@ -528,6 +533,19 @@ pub(crate) fn verify(page: &Page, expected_id: u32) -> Result<(), DbError> {
     let mut cleared = bytes.to_vec();
     write_u32(&mut cleared, OFF_CHECKSUM, 0);
     if crc32(&cleared) != stored {
+        return Err(corrupt(expected_id));
+    }
+    Ok(())
+}
+
+/// Header, page-type, slotted-directory, and index-node checks.
+///
+/// This does not recompute the checksum. [`verify`] runs it after
+/// [`recheck_checksum`]. The editor's commit runs it on a page whose
+/// checksum [`seal`] just wrote, while that editor still owns the page.
+pub(crate) fn validate_fresh_seal(page: &Page, expected_id: u32) -> Result<(), DbError> {
+    let bytes = page.as_slice();
+    if bytes.len() != PAGE_SIZE {
         return Err(corrupt(expected_id));
     }
     if read_u32(bytes, OFF_ID) != expected_id
@@ -556,6 +574,49 @@ pub(crate) fn verify(page: &Page, expected_id: u32) -> Result<(), DbError> {
         verify_index_node(bytes, expected_id, page_type)?;
     }
     Ok(())
+}
+
+pub(crate) fn verify(page: &Page, expected_id: u32) -> Result<(), DbError> {
+    recheck_checksum(page, expected_id)?;
+    validate_fresh_seal(page, expected_id)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_CHECKSUM_RECHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Recompute the page checksum at commit, after `seal`, as Milestone 39 did.
+///
+/// The default commit checks page structure and keeps the checksum `seal`
+/// just stored. This guard is the reference path for that comparison.
+#[cfg(test)]
+pub(crate) struct ForceChecksumRecheck;
+
+#[cfg(test)]
+impl ForceChecksumRecheck {
+    pub(crate) fn new() -> Self {
+        FORCE_CHECKSUM_RECHECK.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceChecksumRecheck {
+    fn drop(&mut self) {
+        FORCE_CHECKSUM_RECHECK.with(|flag| flag.set(false));
+    }
+}
+
+pub(crate) fn checksum_recheck_forced() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_CHECKSUM_RECHECK.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 fn verify_index_node(bytes: &[u8], page_id: u32, page_type: u16) -> Result<(), DbError> {
@@ -902,5 +963,118 @@ mod tests {
             verify(&page, 4).unwrap_err().to_string(),
             "database page 4 is corrupt"
         );
+    }
+
+    fn sealed_heap() -> Page {
+        let mut page = Page::new();
+        init_slotted(&mut page, TYPE_HEAP, 4);
+        insert_cell(&mut page, &[1, 2, 3, 4]).unwrap();
+        insert_cell(&mut page, &[5, 6, 7, 8]).unwrap();
+        seal(&mut page);
+        page
+    }
+
+    fn seal_index(page_type: u16, id: u32, count: u16) -> Page {
+        let mut page = Page::new();
+        init_slotted(&mut page, page_type, id);
+        write_u16(page.as_mut_slice(), OFF_UPPER, HEADER_LEN as u16);
+        write_u16(page.as_mut_slice(), HEADER_LEN, count);
+        seal(&mut page);
+        page
+    }
+
+    #[test]
+    fn a_fresh_seal_matches_verify_on_valid_pages_and_keeps_its_checksum() {
+        for (page_type, id) in [(TYPE_HEAP, 4), (TYPE_CATALOG, 2), (TYPE_INDEX_CATALOG, 6)] {
+            let mut page = Page::new();
+            init_slotted(&mut page, page_type, id);
+            insert_cell(&mut page, b"cell").unwrap();
+            seal(&mut page);
+            let checksum = read_u32(page.as_slice(), OFF_CHECKSUM);
+            verify(&page, id).unwrap();
+            validate_fresh_seal(&page, id).unwrap();
+            assert_eq!(read_u32(page.as_slice(), OFF_CHECKSUM), checksum);
+        }
+        let leaf = seal_index(TYPE_INDEX_LEAF, 8, 1);
+        verify(&leaf, 8).unwrap();
+        validate_fresh_seal(&leaf, 8).unwrap();
+        let internal = seal_index(TYPE_INDEX_INTERNAL, 9, 1);
+        verify(&internal, 9).unwrap();
+        validate_fresh_seal(&internal, 9).unwrap();
+        let mut free = Page::new();
+        write_free_data(&mut free, 5);
+        seal(&mut free);
+        verify(&free, 5).unwrap();
+        validate_fresh_seal(&free, 5).unwrap();
+    }
+
+    #[test]
+    fn structural_damage_is_rejected_with_and_without_a_second_checksum() {
+        let cases: &[fn(&mut Page)] = &[
+            |page| write_u16(page.as_mut_slice(), OFF_TYPE, 99),
+            |page| write_u32(page.as_mut_slice(), OFF_ID, 1),
+            |page| write_u16(page.as_mut_slice(), OFF_FLAGS, 1),
+            |page| write_u16(page.as_mut_slice(), OFF_RESERVED, 1),
+            |page| write_u16(page.as_mut_slice(), HEADER_LEN + 2, 5000),
+            |page| {
+                let first = read_u16(page.as_slice(), HEADER_LEN);
+                write_u16(page.as_mut_slice(), HEADER_LEN + SLOT_LEN, first);
+                write_u16(page.as_mut_slice(), HEADER_LEN + SLOT_LEN + 2, 4);
+            },
+        ];
+        for damage in cases {
+            let mut page = sealed_heap();
+            damage(&mut page);
+            seal(&mut page);
+            let full = verify(&page, 4).unwrap_err().to_string();
+            let fresh = validate_fresh_seal(&page, 4).unwrap_err().to_string();
+            assert_eq!(full, "database page 4 is corrupt");
+            assert_eq!(fresh, full);
+        }
+        let leaf = seal_index(TYPE_INDEX_LEAF, 8, 0);
+        assert_eq!(
+            verify(&leaf, 8).unwrap_err().to_string(),
+            validate_fresh_seal(&leaf, 8).unwrap_err().to_string()
+        );
+        let mut internal = seal_index(TYPE_INDEX_INTERNAL, 9, 1);
+        write_u16(internal.as_mut_slice(), HEADER_LEN + 2, 1);
+        seal(&mut internal);
+        assert_eq!(
+            verify(&internal, 9).unwrap_err().to_string(),
+            validate_fresh_seal(&internal, 9).unwrap_err().to_string()
+        );
+        write_u32(internal.as_mut_slice(), PAGE_SIZE - 4, 1);
+        write_u16(internal.as_mut_slice(), HEADER_LEN + 2, 0);
+        seal(&mut internal);
+        assert_eq!(
+            verify(&internal, 9).unwrap_err().to_string(),
+            validate_fresh_seal(&internal, 9).unwrap_err().to_string()
+        );
+    }
+
+    #[test]
+    fn a_bad_checksum_fails_verify_and_is_not_what_a_fresh_seal_checks() {
+        let mut page = sealed_heap();
+        page.as_mut_slice()[OFF_CHECKSUM] ^= 0xff;
+        assert_eq!(
+            verify(&page, 4).unwrap_err().to_string(),
+            "database page 4 is corrupt"
+        );
+        validate_fresh_seal(&page, 4).unwrap();
+        page.as_mut_slice()[OFF_CHECKSUM] ^= 0xff;
+        page.as_mut_slice()[HEADER_LEN] ^= 0xff;
+        assert!(recheck_checksum(&page, 4).is_err());
+        assert!(verify(&page, 4).is_err());
+    }
+
+    #[test]
+    fn a_payload_changed_after_seal_fails_the_untrusted_checksum() {
+        let mut page = sealed_heap();
+        let sealed = page.as_slice().to_vec();
+        page.as_mut_slice()[PAGE_SIZE - 1] ^= 0xff;
+        assert!(recheck_checksum(&page, 4).is_err());
+        assert!(verify(&page, 4).is_err());
+        page.as_mut_slice().copy_from_slice(&sealed);
+        verify(&page, 4).unwrap();
     }
 }

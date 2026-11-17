@@ -168,9 +168,13 @@ pub(crate) struct Profile {
     /// Checksumming a dirty page during `page_gather`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub page_seal: Duration,
-    /// Re-checking a page just sealed during `page_gather`.
+    /// Structural checks of a page just sealed during `page_gather`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub page_verify: Duration,
+    /// A second checksum of a page `seal` just wrote. The commit leaves this
+    /// at zero unless a test forces the Milestone 39 recheck.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub page_recheck: Duration,
     /// Encoding the redo-log bytes. This is outside `wal_write`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub wal_encode: Duration,
@@ -243,6 +247,7 @@ thread_local! {
         page_gather: Duration::ZERO,
         page_seal: Duration::ZERO,
         page_verify: Duration::ZERO,
+        page_recheck: Duration::ZERO,
         wal_encode: Duration::ZERO,
         indexes_updated: 0,
     }) };

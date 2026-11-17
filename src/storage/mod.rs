@@ -30,10 +30,10 @@ pub(crate) use btree::ForceLatePresence;
 pub(crate) use btree::ForcePriorPlan;
 #[cfg(test)]
 pub(crate) use edit::ForcePerRowUnlink;
+#[cfg(test)]
+pub(crate) use page::{ForceChecksumRecheck, TYPE_HEAP, init_slotted, insert_cell, seal};
 pub use page::{MAX_RECORD_LEN, PAGE_SIZE};
 pub(crate) use page::{Page, cell, live_slots, page_id_of, verify};
-#[cfg(test)]
-pub(crate) use page::{TYPE_HEAP, init_slotted, insert_cell, seal};
 #[cfg(test)]
 pub(crate) use profile::{
     Profile, SuspendSync, enable as enable_phases, reset as reset_phases,

@@ -140,7 +140,7 @@ A successful `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `INSERT
 
 The commit sequence is:
 
-1. Build sealed images of the dirty pages, including page 0 with `commit id + 1`.
+1. Build sealed images of the dirty pages, including page 0 with `commit id + 1`. The editor checksums each page once, stores that CRC-32 in bytes 8..12, and checks the header and directory while it still owns the page. It does not checksum the page a second time. Open, recovery, and migration still do.
 2. Write those images to `PATH.wal` in the same directory. The log is not renamed over the database.
 3. Sync the same file that wrote the log. This is the commit point when the sync returns success.
 4. Write the same pages into the database at `page id * 4096`, extending the file when a new page id is past the old end.
