@@ -2092,3 +2092,68 @@ measured tradeoff. Further work should resolve the small-update sync interaction
 or independently profile the remaining index-edit/full-image INSERT costs
 before introducing another optimization. Existing M37/M38/M41/M44 archives and
 rejections remain intact; no page/WAL format or recovery guarantee changed.
+
+## Milestone 48: ordered stored-row lookup
+
+17 Nov 2026, Apple M5, baseline M47 report merge `984cad1` (M46 production
+source). `rewrite_changes` and `deleted_positions` built a complete row-ID map
+before resolving even a single requested row. The new `RowPositions` first
+checks strict increasing order. That proves uniqueness and permits binary search
+without allocating the map. Unordered vectors use the original map construction
+and first-duplicate error. Nothing sorts or renumbers stored IDs.
+
+The plan is local to one editor operation. Update rewrites change values and
+links but never the stored row-ID vector; delete resolves all positions before
+compaction. Request validation remains interleaved with update edits, preserving
+an earlier corrupt-record error over a later missing ID. Zero/counter checks,
+duplicate requests, original positions, and the order of errors are unchanged.
+The ordered check is still O(n), not constant time. The lookup map is avoided,
+but snapshot cloning and other validation allocations remain.
+
+`ForceRowMap` restores the original lookup in test builds. `profile_milestone48`
+uses release tests, seed `0x3100`, one read warmup per fresh copy, alternating arm
+order, durable syncs, five samples per arm at 10,000/100,000 rows and three at
+1,000. Two isolated passes measured these statement medians in microseconds at
+100,000 stored rows:
+
+| workload | pass | ordered | map | ordered range | map range |
+| --- | --- | ---: | ---: | --- | --- |
+| single delete | 1 | 17,963 | 20,327 | 17,022–18,304 | 19,546–20,803 |
+| single delete | 2 | 18,250 | 19,252 | 18,011–19,301 | 16,719–19,651 |
+| indexed update | 1 | 13,681 | 15,521 | 13,092–14,079 | 13,651–15,683 |
+| indexed update | 2 | 14,007 | 15,778 | 13,272–14,307 | 14,903–16,151 |
+| half delete | 1 | 64,394 | 66,208 | 63,191–65,500 | 65,439–66,690 |
+| half delete | 2 | 64,895 | 66,577 | 63,231–65,450 | 65,586–68,027 |
+| delete-all | 1 | 82,919 | 85,224 | 82,212–88,494 | 84,166–86,544 |
+| delete-all | 2 | 83,333 | 84,806 | 80,780–85,103 | 81,167–86,547 |
+
+Indexed update improves 11.2–11.9%; single delete improves 5.2–11.6% by median.
+Each is faster in 9/10 paired copies across the two passes; paired median savings
+are 1,734 and 1,799 µs respectively. Some ranges overlap because storage timing
+varies; no claim is made that every statement is faster. Pass 1 single-delete
+validation falls from 1,443 to 23 µs, and indexed-update apply from 1,408 to
+65 µs. Delete-all validation falls from 3,543 to 1,802 µs. Small updates and
+unchanged INSERT controls have overlapping ranges. Ten-row-delete medians move
+in opposite directions between passes, so no gain is claimed there.
+
+Both arms retain results, checksum, WAL size, and frames. Single delete writes
+36,996 bytes / 9 frames; indexed update 12,396 / 3; delete-all 12,168,896 /
+2,968 with checksum 0. Page/WAL formats, checksums, and syncs are unchanged.
+
+Validation: formatting, strict Clippy, all-target build, 615 tests passed,
+0 failed, 41 ignored, including a doctest. Three lookup tests pass with
+`PROPTEST_CASES=512`, including randomized ordered/unordered/duplicate IDs checked
+against a linear reference, extreme u64 IDs, and explicit error priority. All
+17 storage reliability tests pass with `PROPTEST_CASES=256`. Actual persisted
+unordered-ID fixtures retain order, indexes, failed-update rollback, exact WAL,
+post-sync recovery, deletion, and a subsequent update. A corrupt first record
+still wins over a later missing requested ID in both modes. SQL differential
+and two-mode update/delete recovery matrices retain exact database/WAL bytes,
+row counters, both indexes, relocation, no-op/no-match, rollback, sync ambiguity,
+partial checkpoint, fencing, and repeated reopen. A fixture initially omitted
+the explicit migration needed for indexes; its setup was corrected before the
+final passing suite. Fault injection is not a physical power-loss test.
+
+Decision: merge. M47's borrowed-record experiment remains archived. A separate
+INSERT candidate is the redundant full-table image clone in `publish_indexes`;
+this milestone does not change that path.

@@ -1288,6 +1288,165 @@ mod tests {
     }
 
     #[test]
+    fn row_lookup_keeps_unordered_ids_errors_and_recovery() {
+        for ids in [[1_u64, 3, 7], [7, 1, 3]] {
+            let base = TempPath::new();
+            let indexes = vec![IndexImage {
+                name: "idx_users_id".to_string(),
+                table: "users".to_string(),
+                column: "id".to_string(),
+            }];
+            let (empty, _) = Store::open(base.path()).unwrap();
+            drop(empty);
+            Store::migrate(base.path()).unwrap();
+            let (mut seed, _) = Store::open(base.path()).unwrap();
+            seed.publish_indexes(
+                &[image(
+                    "users",
+                    ids.iter()
+                        .map(|id| (*id, sample(*id as i64, "seed")))
+                        .collect(),
+                    10,
+                )],
+                &indexes,
+            )
+            .unwrap();
+            drop(seed);
+            let fast_file = TempPath::new();
+            let old_file = TempPath::new();
+            fs::copy(base.path(), fast_file.path()).unwrap();
+            fs::copy(base.path(), old_file.path()).unwrap();
+            let (mut fast, _) = Store::open(fast_file.path()).unwrap();
+            let (mut old, _) = Store::open(old_file.path()).unwrap();
+            assert_eq!(fast.stored_row_ids("users"), Some(ids.as_slice()));
+            for changes in [
+                vec![(3, sample(31, "changed")), (9, sample(9, "missing"))],
+                vec![(1, sample(11, "first")), (1, sample(12, "duplicate"))],
+            ] {
+                let before = fs::read(fast_file.path()).unwrap();
+                let fast_error = fast.publish_row_changes("users", &changes).unwrap_err();
+                let old_error = {
+                    let _guard = crate::storage::ForceRowMap::new();
+                    old.publish_row_changes("users", &changes).unwrap_err()
+                };
+                assert!(matches!(fast_error, StepError::BeforeCommit(_)));
+                assert!(matches!(old_error, StepError::BeforeCommit(_)));
+                assert_eq!(
+                    fast_error.into_db().to_string(),
+                    old_error.into_db().to_string()
+                );
+                assert_eq!(fs::read(fast_file.path()).unwrap(), before);
+                assert_eq!(fs::read(old_file.path()).unwrap(), before);
+                assert_eq!(fast.stored_row_ids("users"), Some(ids.as_slice()));
+            }
+            let changes = vec![
+                (3, sample(30, &"long".repeat(100))),
+                (7, sample(70, "updated")),
+            ];
+            fast.publish_row_changes("users", &changes).unwrap();
+            {
+                let _guard = crate::storage::ForceRowMap::new();
+                old.publish_row_changes("users", &changes).unwrap();
+            }
+            assert_eq!(
+                fs::read(fast_file.path()).unwrap(),
+                fs::read(old_file.path()).unwrap()
+            );
+            for deleted in [vec![7, 9], vec![3, 3], vec![0]] {
+                let before = fs::read(fast_file.path()).unwrap();
+                let error = fast
+                    .publish_deletes("users", &deleted, &[], &indexes)
+                    .unwrap_err();
+                let reference = {
+                    let _guard = crate::storage::ForceRowMap::new();
+                    old.publish_deletes("users", &deleted, &[], &indexes)
+                        .unwrap_err()
+                };
+                assert!(matches!(error, StepError::BeforeCommit(_)));
+                assert_eq!(error.into_db().to_string(), reference.into_db().to_string());
+                assert_eq!(fs::read(fast_file.path()).unwrap(), before);
+                assert_eq!(fs::read(old_file.path()).unwrap(), before);
+            }
+            fast.inject = Some(Inject::AfterLogSync);
+            old.inject = Some(Inject::AfterLogSync);
+            assert!(matches!(
+                fast.publish_deletes("users", &[3, 7], &[], &indexes),
+                Err(StepError::AfterCommit(_))
+            ));
+            {
+                let _guard = crate::storage::ForceRowMap::new();
+                assert!(matches!(
+                    old.publish_deletes("users", &[3, 7], &[], &indexes),
+                    Err(StepError::AfterCommit(_))
+                ));
+            }
+            assert_eq!(
+                fs::read(wal::path_for(fast_file.path())).unwrap(),
+                fs::read(wal::path_for(old_file.path())).unwrap()
+            );
+            drop(fast);
+            drop(old);
+            let (mut fast, fast_rows) = Store::open(fast_file.path()).unwrap();
+            let (mut old, old_rows) = Store::open(old_file.path()).unwrap();
+            assert_eq!(fast_rows[0].rows, old_rows[0].rows);
+            assert_eq!(fast.stored_row_ids("users"), Some([1].as_slice()));
+            fast.publish_row_changes("users", &[(1, sample(99, "after recovery"))])
+                .unwrap();
+            {
+                let _guard = crate::storage::ForceRowMap::new();
+                old.publish_row_changes("users", &[(1, sample(99, "after recovery"))])
+                    .unwrap();
+            }
+            assert_eq!(
+                fs::read(fast_file.path()).unwrap(),
+                fs::read(old_file.path()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn row_lookup_keeps_corruption_before_a_later_missing_update() {
+        for ids in [[1_u64, 3, 7], [7, 1, 3]] {
+            for mapped in [false, true] {
+                let file = TempPath::new();
+                let (mut store, _) = Store::open(file.path()).unwrap();
+                store
+                    .publish(&[image(
+                        "users",
+                        ids.iter()
+                            .map(|id| (*id, sample(*id as i64, "seed")))
+                            .collect(),
+                        10,
+                    )])
+                    .unwrap();
+                let before = fs::read(file.path()).unwrap();
+                let link = store.state.tables["users"].links[0];
+                let page = store.pager.cached_page_mut(link.page).unwrap();
+                // An impossible value count corrupts the first requested record.
+                page::cell_mut(page, link.slot).unwrap()[20..22]
+                    .copy_from_slice(&u16::MAX.to_le_bytes());
+                let _guard = mapped.then(crate::storage::ForceRowMap::new);
+                let error = store
+                    .publish_row_changes(
+                        "users",
+                        &[
+                            (ids[0], sample(99, "first")),
+                            (9, sample(9, "missing later")),
+                        ],
+                    )
+                    .unwrap_err();
+                assert!(matches!(error, StepError::BeforeCommit(_)));
+                assert_eq!(
+                    error.into_db().to_string(),
+                    page::corrupt(link.page).to_string()
+                );
+                assert_eq!(fs::read(file.path()).unwrap(), before);
+                assert_eq!(store.stored_row_ids("users"), Some(ids.as_slice()));
+            }
+        }
+    }
+
+    #[test]
     fn preserves_row_ids_nulls_and_order_across_reopen() {
         let file = TempPath::new();
         let rows = vec![

@@ -135,16 +135,11 @@ impl Editor {
             let live = self.snapshot.tables.get(table).ok_or_else(|| {
                 DbError::Internal(format!("updated table '{table}' is not stored"))
             })?;
-            let mut positions = HashMap::with_capacity(live.row_ids.len());
-            for (index, row_id) in live.row_ids.iter().copied().enumerate() {
-                if positions.insert(row_id, index).is_some() {
-                    return Err(DbError::Internal(format!(
-                        "stored table '{table}' repeats row {row_id}"
-                    )));
-                }
-            }
-            positions
+            RowPositions::new(&live.row_ids, table)?
         };
+        // Rewrites can relocate slots and patch links, but never change this
+        // stored row-id vector. Keep request validation interleaved with edits
+        // so a later missing id cannot mask an earlier record/index error.
         let mut seen = HashSet::with_capacity(changes.len());
         for (row_id, values) in changes {
             if !seen.insert(*row_id) {
@@ -152,7 +147,7 @@ impl Editor {
                     "update lists row {row_id} twice in '{table}'"
                 )));
             }
-            let Some(index) = positions.get(row_id).copied() else {
+            let Some(index) = positions.find(&self.snapshot.tables[table].row_ids, *row_id) else {
                 return Err(DbError::Internal(format!(
                     "updated row {row_id} is not stored in '{table}'"
                 )));
@@ -1659,14 +1654,7 @@ fn deleted_positions(
     table: &str,
     deleted: &[u64],
 ) -> Result<Vec<usize>, DbError> {
-    let mut positions = HashMap::with_capacity(live.row_ids.len());
-    for (index, row_id) in live.row_ids.iter().copied().enumerate() {
-        if positions.insert(row_id, index).is_some() {
-            return Err(DbError::Internal(format!(
-                "stored table '{table}' repeats row {row_id}"
-            )));
-        }
-    }
+    let positions = RowPositions::new(&live.row_ids, table)?;
     let mut seen = HashSet::with_capacity(deleted.len());
     let mut indexes = Vec::with_capacity(deleted.len());
     for row_id in deleted {
@@ -1680,7 +1668,7 @@ fn deleted_positions(
                 "delete lists row {row_id} twice in '{table}'"
             )));
         }
-        let Some(index) = positions.get(row_id).copied() else {
+        let Some(index) = positions.find(&live.row_ids, *row_id) else {
             return Err(DbError::Internal(format!(
                 "deleted row {row_id} is not stored in '{table}'"
             )));
@@ -1776,5 +1764,191 @@ mod free_list_tests {
             assert_eq!(ids.pop(), Some(id));
         }
         assert!(ids.is_empty());
+    }
+}
+
+/// Lookup for a row-id vector that stays unchanged while this plan is used.
+/// Strict ordering proves uniqueness without a hash allocation. Unordered
+/// vectors retain the original map and its first-duplicate error. No stored
+/// row ids are sorted or renumbered here.
+enum RowPositions {
+    Ordered,
+    Mapped(HashMap<u64, usize>),
+}
+
+impl RowPositions {
+    fn new(ids: &[u64], table: &str) -> Result<Self, DbError> {
+        if !row_map_forced() && ids.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Ok(Self::Ordered);
+        }
+        let mut positions = HashMap::with_capacity(ids.len());
+        for (index, row_id) in ids.iter().copied().enumerate() {
+            if positions.insert(row_id, index).is_some() {
+                return Err(DbError::Internal(format!(
+                    "stored table '{table}' repeats row {row_id}"
+                )));
+            }
+        }
+        Ok(Self::Mapped(positions))
+    }
+
+    fn find(&self, ids: &[u64], id: u64) -> Option<usize> {
+        match self {
+            Self::Ordered => ids.binary_search(&id).ok(),
+            Self::Mapped(positions) => positions.get(&id).copied(),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_ROW_MAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) struct ForceRowMap(bool);
+#[cfg(test)]
+impl ForceRowMap {
+    pub(crate) fn new() -> Self {
+        Self(FORCE_ROW_MAP.with(|flag| flag.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for ForceRowMap {
+    fn drop(&mut self) {
+        FORCE_ROW_MAP.with(|flag| flag.set(self.0));
+    }
+}
+fn row_map_forced() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_ROW_MAP.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+mod row_position_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // A linear reference checks positions and the first repeated stored id.
+    fn check(ids: &[u64]) {
+        let duplicate = ids
+            .iter()
+            .enumerate()
+            .find(|(at, id)| ids[..*at].contains(id))
+            .map(|(_, id)| *id);
+        for mapped in [false, true] {
+            let _guard = mapped.then(ForceRowMap::new);
+            let lookup = RowPositions::new(ids, "users");
+            if let Some(id) = duplicate {
+                assert_eq!(
+                    lookup.err().unwrap().to_string(),
+                    DbError::Internal(format!("stored table 'users' repeats row {id}")).to_string()
+                );
+            } else {
+                let lookup = lookup.unwrap();
+                for id in (0..=90).chain([u64::MAX - 1, u64::MAX]) {
+                    assert_eq!(
+                        lookup.find(ids, id),
+                        ids.iter().position(|stored| *stored == id)
+                    );
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn ordered_and_unordered_positions_match_linear_reference(mut ids in prop::collection::vec(0u64..90, 0..200)) {
+            check(&ids);
+            ids.sort_unstable();
+            ids.dedup();
+            check(&ids);
+        }
+    }
+
+    #[test]
+    fn ordering_is_checked_and_extreme_ids_are_preserved() {
+        for ids in [
+            vec![],
+            vec![0],
+            vec![1, 3, u64::MAX],
+            vec![u64::MAX, 0, 3],
+            vec![7, 2, 7, 2],
+        ] {
+            check(&ids);
+        }
+        assert!(matches!(
+            RowPositions::new(&[1, 3, 7], "users").unwrap(),
+            RowPositions::Ordered
+        ));
+        assert!(matches!(
+            RowPositions::new(&[7, 1, 3], "users").unwrap(),
+            RowPositions::Mapped(_)
+        ));
+    }
+
+    #[test]
+    fn deletion_validation_keeps_error_order_and_original_positions() {
+        for (ids, request, expected) in [
+            (vec![1, 3, 7], vec![7, 1], Ok(vec![2, 0])),
+            (vec![7, 1, 3], vec![7, 1], Ok(vec![1, 0])),
+            (
+                vec![1, 3, 1],
+                vec![0],
+                Err("stored table 'users' repeats row 1"),
+            ),
+            (
+                vec![1, 3, 7],
+                vec![3, 3],
+                Err("delete lists row 3 twice in 'users'"),
+            ),
+            (
+                vec![1, 3, 7],
+                vec![9, 9],
+                Err("deleted row 9 is not stored in 'users'"),
+            ),
+            (
+                vec![1, 3, 7],
+                vec![0],
+                Err("deleted row 0 is outside the counter for table 'users'"),
+            ),
+            (
+                vec![1, 3, 7],
+                vec![10],
+                Err("deleted row 10 is outside the counter for table 'users'"),
+            ),
+            (
+                vec![],
+                vec![1],
+                Err("deleted row 1 is not stored in 'users'"),
+            ),
+        ] {
+            let live = LiveTable {
+                table_id: 1,
+                catalog_page: 1,
+                catalog_slot: 0,
+                head: NULL_LINK,
+                tail: NULL_LINK,
+                next_row_id: 10,
+                links: vec![],
+                row_ids: ids,
+            };
+            for mapped in [false, true] {
+                let _guard = mapped.then(ForceRowMap::new);
+                let actual = deleted_positions(&live, "users", &request);
+                match &expected {
+                    Ok(positions) => assert_eq!(&actual.unwrap(), positions),
+                    Err(message) => assert_eq!(
+                        actual.unwrap_err().to_string(),
+                        DbError::Internal((*message).to_string()).to_string()
+                    ),
+                }
+            }
+        }
     }
 }

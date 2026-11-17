@@ -25041,6 +25041,134 @@ mod tests {
     }
 
     #[test]
+    fn ordered_row_lookup_matches_mapped_pages() {
+        let (_dir, base) = seed_delete_db("m48-bytes", 400, 0x4800);
+        let statements = [
+            "UPDATE users SET name = name WHERE id = 1;",
+            "UPDATE users SET name = 'absent' WHERE id = -1;",
+            "UPDATE users SET bucket = NULL WHERE active = TRUE;",
+            "UPDATE users SET id = 1000 WHERE id < 200;",
+            "UPDATE users SET name = 'x' WHERE id >= 1 AND id <= 10;",
+            "UPDATE users SET bucket = 3 WHERE bucket = 0 OR bucket = 1;",
+            "UPDATE users SET name = 'a longer replacement value for relocation coverage' WHERE id < 200;",
+            "UPDATE users SET active = FALSE WHERE active = TRUE;",
+            "DELETE FROM users WHERE id >= 1 AND id < 100;",
+            "DELETE FROM users WHERE bucket IS NULL;",
+            "UPDATE users SET name = 'updated' WHERE TRUE OR id = 0;",
+            "UPDATE users SET name = 'edited' WHERE id = 2;",
+            "INSERT INTO users VALUES (401, 'added', TRUE, 1);",
+        ];
+        for sql in statements {
+            let (_fast_dir, fast_path, mut fast) = open_copy(&base, "m48-fast");
+            let (_slow_dir, slow_path, mut slow) = open_copy(&base, "m48-slow");
+            let fast_result = fast.execute(sql).unwrap();
+            let slow_result = {
+                let _guard = crate::storage::ForceRowMap::new();
+                slow.execute(sql).unwrap()
+            };
+            assert_eq!(fast_result, slow_result, "{sql}");
+            assert_eq!(
+                fast.table("users").unwrap().row_ids(),
+                slow.table("users").unwrap().row_ids(),
+                "{sql}"
+            );
+            assert_eq!(
+                fast.table("users").unwrap().next_row_id(),
+                slow.table("users").unwrap().next_row_id(),
+                "{sql}"
+            );
+            assert_eq!(table_rows(&mut fast), table_rows(&mut slow), "{sql}");
+            assert_eq!(
+                index_postings(&mut fast, "idx_users_id"),
+                index_postings(&mut slow, "idx_users_id"),
+                "{sql}"
+            );
+            assert_eq!(
+                index_postings(&mut fast, "idx_users_bucket"),
+                index_postings(&mut slow, "idx_users_bucket"),
+                "{sql}"
+            );
+            assert_eq!(db_file(&fast_path), db_file(&slow_path), "{sql}");
+            drop(fast);
+            drop(slow);
+            let mut again = Database::open(&fast_path).unwrap();
+            let mut slow_open = Database::open(&slow_path).unwrap();
+            assert_eq!(table_rows(&mut again), table_rows(&mut slow_open), "{sql}");
+        }
+        let sql = "UPDATE users SET name = 'updated' WHERE TRUE OR id = 0;";
+        let wal_of = |label: &str, repeated: bool| -> Vec<u8> {
+            let (_dir, path, mut db) = open_copy(&base, label);
+            db.set_inject(crate::storage::Inject::AfterLogSync);
+            let error = if repeated {
+                let _guard = crate::storage::ForceRowMap::new();
+                db.execute(sql)
+            } else {
+                db.execute(sql)
+            };
+            assert!(error.is_err(), "{label}");
+            wal_bytes(&path)
+        };
+        assert_eq!(wal_of("m48-wal-fast", false), wal_of("m48-wal-slow", true));
+        assert_precommit(&base, "m48-pre", sql, crate::storage::Inject::BeforeLogSync);
+        for inject in [
+            crate::storage::Inject::AfterLogSync,
+            crate::storage::Inject::CommitSyncFailed,
+            crate::storage::Inject::DuringCheckpoint(1),
+        ] {
+            assert_postcommit(&base, &format!("m48-post-{inject:?}"), sql, inject);
+        }
+        let half = "UPDATE users SET name = 'a longer replacement value for relocation coverage' WHERE id < 200;";
+        {
+            let _guard = crate::storage::ForceRowMap::new();
+            assert_precommit(
+                &base,
+                "m48-pre-old",
+                half,
+                crate::storage::Inject::BeforeLogSync,
+            );
+            assert_postcommit(
+                &base,
+                "m48-post-old",
+                half,
+                crate::storage::Inject::DuringCheckpoint(1),
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_row_lookup_matches_mapped_update_recovery() {
+        let (_dir, base) = seed_delete_db("m48-fault-matrix", 400, 0x48f0);
+        for (case, sql) in [
+            "UPDATE users SET name = 'a longer replacement value for relocation coverage' WHERE id < 200;",
+            "UPDATE users SET active = FALSE WHERE active = TRUE;",
+            "UPDATE users SET bucket = 3 WHERE bucket = 0 OR bucket = 1;",
+            "UPDATE users SET name = 'updated' WHERE TRUE OR id = 0;",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut logs = Vec::new();
+            for repeated in [false, true] {
+                let _guard = repeated.then(crate::storage::ForceRowMap::new);
+                let label = format!("m48-matrix-{case}-{repeated}");
+                let (_copy_dir, path, mut db) = open_copy(&base, &label);
+                db.set_inject(crate::storage::Inject::AfterLogSync);
+                assert!(db.execute(sql).is_err());
+                logs.push(wal_bytes(&path));
+                assert_precommit(&base, &label, sql, crate::storage::Inject::BeforeLogSync);
+                for inject in [
+                    crate::storage::Inject::AfterLogSync,
+                    crate::storage::Inject::CommitSyncFailed,
+                    crate::storage::Inject::DuringCheckpoint(1),
+                ] {
+                    assert_postcommit(&base, &format!("{label}-{inject:?}"), sql, inject);
+                }
+            }
+            assert_eq!(logs[0], logs[1], "{sql}");
+        }
+    }
+
+    #[test]
     fn single_update_decode_matches_repeated_decode_pages() {
         let (_dir, base) = seed_delete_db("m45-bytes", 400, 0x4500);
         let statements = [
@@ -25323,6 +25451,39 @@ mod tests {
     }
 
     #[test]
+    fn ordered_row_lookup_matches_mapped_delete_recovery() {
+        let (_dir, base) = seed_delete_db("m48-fault-matrix", 400, 0x48d0);
+        for (case, sql) in [
+            "DELETE FROM users WHERE id < 200;",
+            "DELETE FROM users WHERE active = TRUE;",
+            "DELETE FROM users WHERE bucket = 0 OR bucket = 1;",
+            "DELETE FROM users WHERE TRUE OR id = 0;",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut logs = Vec::new();
+            for patched in [false, true] {
+                let _guard = patched.then(crate::storage::ForceRowMap::new);
+                let label = format!("m48-matrix-{case}-{patched}");
+                let (_copy_dir, path, mut db) = open_copy(&base, &label);
+                db.set_inject(crate::storage::Inject::AfterLogSync);
+                assert!(db.execute(sql).is_err());
+                logs.push(wal_bytes(&path));
+                assert_precommit(&base, &label, sql, crate::storage::Inject::BeforeLogSync);
+                for inject in [
+                    crate::storage::Inject::AfterLogSync,
+                    crate::storage::Inject::CommitSyncFailed,
+                    crate::storage::Inject::DuringCheckpoint(1),
+                ] {
+                    assert_postcommit(&base, &format!("{label}-{inject:?}"), sql, inject);
+                }
+            }
+            assert_eq!(logs[0], logs[1], "{sql}");
+        }
+    }
+
+    #[test]
     fn ordered_free_list_matches_wal_and_recovery() {
         let (_dir, base) = seed_delete_db("m46-fault-matrix", 400, 0x46f0);
         for (case, sql) in [
@@ -25477,6 +25638,83 @@ mod tests {
                 }
             }
             assert_eq!(logs[0], logs[1], "{sql}");
+        }
+    }
+
+    #[test]
+    #[ignore = "release comparison of ordered row-id lookup with the original map"]
+    fn profile_milestone48() {
+        println!(
+            "milestone48 cpu={} os={} rustc={} seed=0x3100 durable=true warmup=1",
+            profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]),
+            profile_command("uname", &["-smr"]),
+            profile_command("rustc", &["--version"])
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [1_000_i64, 10_000, 100_000] {
+            let (_base_dir, base) = seed_delete_db("m48-base", rows, 0x3100);
+            let samples = if rows >= 10_000 { 5 } else { 3 };
+            for kind in [
+                "one",
+                "ten",
+                "half",
+                "all",
+                "update-index",
+                "update-scan",
+                "insert-one",
+            ] {
+                let sql = milestone39_sql(kind, rows);
+                let mut ordered = Vec::new();
+                let mut mapped = Vec::new();
+                for sample in 0..samples {
+                    let run = |map: bool| {
+                        let (_dir, _, mut db) =
+                            open_copy(&base, &format!("m48-{kind}-{sample}-{map}"));
+                        db.execute("SELECT COUNT(*) FROM users;").unwrap();
+                        crate::storage::reset_phases();
+                        let _guard = map.then(crate::storage::ForceRowMap::new);
+                        let start = std::time::Instant::now();
+                        let outcome = db.execute(&sql).unwrap();
+                        let wall = start.elapsed().as_micros();
+                        let p = crate::storage::take_phases();
+                        let checksum = mutation_checksum(&mut db);
+                        println!(
+                            "milestone48 sample kind={kind} rows={rows} n={sample} map={map} wall_us={wall} apply_us={} validate_us={} compare_us={} memory_us={} wal_sync_us={} db_sync_us={} wal_clear_us={} wal_bytes={} frames={} checksum={checksum}",
+                            p.apply.as_micros(),
+                            p.validate_ids.as_micros(),
+                            p.compare.as_micros(),
+                            p.memory.as_micros(),
+                            p.wal_sync.as_micros(),
+                            p.db_sync.as_micros(),
+                            p.wal_clear.as_micros(),
+                            p.wal_bytes,
+                            p.frames
+                        );
+                        (wall, p.wal_bytes, p.frames, checksum, outcome)
+                    };
+                    let (fast, old) = if sample % 2 == 0 {
+                        (run(false), run(true))
+                    } else {
+                        let old = run(true);
+                        (run(false), old)
+                    };
+                    assert_eq!(
+                        (&fast.1, &fast.2, &fast.3, &fast.4),
+                        (&old.1, &old.2, &old.3, &old.4)
+                    );
+                    ordered.push(fast.0);
+                    mapped.push(old.0);
+                }
+                println!(
+                    "milestone48 median kind={kind} rows={rows} samples={samples} ordered_us={} mapped_us={} ordered_min={} ordered_max={} mapped_min={} mapped_max={}",
+                    median(&ordered),
+                    median(&mapped),
+                    ordered.iter().min().unwrap(),
+                    ordered.iter().max().unwrap(),
+                    mapped.iter().min().unwrap(),
+                    mapped.iter().max().unwrap()
+                );
+            }
         }
     }
 
