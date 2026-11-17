@@ -25040,6 +25040,108 @@ mod tests {
         }
     }
 
+    fn publish_image_fixture(label: &str) -> (crate::test_dir::TestDir, std::path::PathBuf) {
+        let (dir, base) = seed_delete_db(label, 400, 0x4900);
+        let mut db = Database::open(&base).unwrap();
+        db.execute("CREATE TABLE spare (id INT, name TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO spare VALUES (1, 'existing');")
+            .unwrap();
+        drop(db);
+        (dir, base)
+    }
+
+    #[test]
+    fn borrowed_publish_images_match_copies_for_inserts_and_schema_edits() {
+        let (_dir, base) = publish_image_fixture("m49-images");
+        for (case, sql) in [
+            "INSERT INTO users VALUES (401, 'added', TRUE, 1);",
+            "INSERT INTO users VALUES (401, 'a', TRUE, NULL), (402, 'b', FALSE, 3);",
+            "INSERT INTO spare VALUES (2, 'other table');",
+            "CREATE TABLE later (id INT, name TEXT);",
+            "DROP TABLE spare;",
+            "CREATE INDEX idx_spare_id ON spare(id);",
+            "DROP INDEX idx_users_bucket;",
+            "UPDATE users SET name = 'edited' WHERE id = 2;",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (_fast_dir, fast_path, mut fast) = open_copy(&base, &format!("m49-fast-{case}"));
+            let (_old_dir, old_path, mut old) = open_copy(&base, &format!("m49-copy-{case}"));
+            let result = fast.execute(sql).unwrap();
+            let reference = {
+                let _guard = crate::storage::ForcePublishImageCopy::new();
+                old.execute(sql).unwrap()
+            };
+            assert_eq!(result, reference, "{sql}");
+            assert_eq!(db_file(&fast_path), db_file(&old_path), "{sql}");
+            assert_eq!(
+                fast.table("users").unwrap().row_ids(),
+                old.table("users").unwrap().row_ids()
+            );
+            assert_eq!(
+                fast.table("users").unwrap().next_row_id(),
+                old.table("users").unwrap().next_row_id()
+            );
+            drop(fast);
+            drop(old);
+            let mut fast = Database::open(&fast_path).unwrap();
+            let mut old = Database::open(&old_path).unwrap();
+            for query in [
+                "SELECT * FROM users;",
+                "SELECT * FROM spare;",
+                "SELECT * FROM later;",
+            ] {
+                assert_eq!(
+                    fast.execute(query).map_err(|e| e.to_string()),
+                    old.execute(query).map_err(|e| e.to_string()),
+                    "{sql}: {query}"
+                );
+            }
+            let mut logs = Vec::new();
+            for copy in [false, true] {
+                let _guard = copy.then(crate::storage::ForcePublishImageCopy::new);
+                let (_dir, path, mut db) = open_copy(&base, &format!("m49-log-{case}-{copy}"));
+                db.set_inject(crate::storage::Inject::AfterLogSync);
+                assert!(db.execute(sql).is_err());
+                logs.push(wal_bytes(&path));
+            }
+            assert_eq!(logs[0], logs[1], "{sql}");
+        }
+    }
+
+    #[test]
+    fn borrowed_publish_images_keep_insert_recovery() {
+        let (_dir, base) = publish_image_fixture("m49-recovery");
+        let wide = format!(
+            "INSERT INTO users VALUES (401, '{}', TRUE, 1);",
+            "x".repeat(3000)
+        );
+        for (case, sql) in [
+            "INSERT INTO users VALUES (401, 'added', TRUE, 1);",
+            "INSERT INTO users VALUES (401, 'a', TRUE, NULL), (402, 'b', FALSE, 3);",
+            "INSERT INTO spare VALUES (2, 'other table');",
+            wide.as_str(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            for copy in [false, true] {
+                let _guard = copy.then(crate::storage::ForcePublishImageCopy::new);
+                let label = format!("m49-recovery-{case}-{copy}");
+                assert_precommit(&base, &label, sql, crate::storage::Inject::BeforeLogSync);
+                for inject in [
+                    crate::storage::Inject::AfterLogSync,
+                    crate::storage::Inject::CommitSyncFailed,
+                    crate::storage::Inject::DuringCheckpoint(1),
+                ] {
+                    assert_postcommit(&base, &format!("{label}-{inject:?}"), sql, inject);
+                }
+            }
+        }
+    }
+
     #[test]
     fn ordered_row_lookup_matches_mapped_pages() {
         let (_dir, base) = seed_delete_db("m48-bytes", 400, 0x4800);
@@ -25638,6 +25740,76 @@ mod tests {
                 }
             }
             assert_eq!(logs[0], logs[1], "{sql}");
+        }
+    }
+
+    #[test]
+    #[ignore = "release comparison of borrowed publish images with full copies"]
+    fn profile_milestone49() {
+        println!(
+            "milestone49 cpu={} os={} rustc={} seed=0x3100 durable=true warmup=1",
+            profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]),
+            profile_command("uname", &["-smr"]),
+            profile_command("rustc", &["--version"])
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [1_000_i64, 10_000, 100_000] {
+            let (_base_dir, base) = seed_delete_db("m49-base", rows, 0x3100);
+            let samples = if rows >= 10_000 { 5 } else { 3 };
+            for kind in ["insert-one", "insert-batch", "update-index", "all"] {
+                let sql = milestone39_sql(kind, rows);
+                let mut borrowed = Vec::new();
+                let mut copied = Vec::new();
+                for sample in 0..samples {
+                    let run = |copy: bool| {
+                        let (_dir, _, mut db) =
+                            open_copy(&base, &format!("m49-{kind}-{sample}-{copy}"));
+                        db.execute("SELECT COUNT(*) FROM users;").unwrap();
+                        crate::storage::reset_phases();
+                        let _guard = copy.then(crate::storage::ForcePublishImageCopy::new);
+                        let start = std::time::Instant::now();
+                        let outcome = db.execute(&sql).unwrap();
+                        let wall = start.elapsed().as_micros();
+                        let p = crate::storage::take_phases();
+                        let checksum = mutation_checksum(&mut db);
+                        println!(
+                            "milestone49 sample kind={kind} rows={rows} n={sample} copy={copy} wall_us={wall} apply_us={} validate_us={} compare_us={} prepare_us={} memory_us={} wal_sync_us={} db_sync_us={} wal_clear_us={} wal_bytes={} frames={} checksum={checksum}",
+                            p.apply.as_micros(),
+                            p.validate_ids.as_micros(),
+                            p.compare.as_micros(),
+                            p.prepare.as_micros(),
+                            p.memory.as_micros(),
+                            p.wal_sync.as_micros(),
+                            p.db_sync.as_micros(),
+                            p.wal_clear.as_micros(),
+                            p.wal_bytes,
+                            p.frames
+                        );
+                        (wall, p.wal_bytes, p.frames, checksum, outcome)
+                    };
+                    let (fast, old) = if sample % 2 == 0 {
+                        (run(false), run(true))
+                    } else {
+                        let old = run(true);
+                        (run(false), old)
+                    };
+                    assert_eq!(
+                        (&fast.1, &fast.2, &fast.3, &fast.4),
+                        (&old.1, &old.2, &old.3, &old.4)
+                    );
+                    borrowed.push(fast.0);
+                    copied.push(old.0);
+                }
+                println!(
+                    "milestone49 median kind={kind} rows={rows} samples={samples} borrowed_us={} copied_us={} borrowed_min={} borrowed_max={} copied_min={} copied_max={}",
+                    median(&borrowed),
+                    median(&copied),
+                    borrowed.iter().min().unwrap(),
+                    borrowed.iter().max().unwrap(),
+                    copied.iter().min().unwrap(),
+                    copied.iter().max().unwrap()
+                );
+            }
         }
     }
 

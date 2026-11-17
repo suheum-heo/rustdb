@@ -62,3 +62,6 @@ pub(crate) use wal::Inject;
 pub(crate) use wal::{LogClass, StepError, classify_log};
 #[cfg(test)]
 pub(crate) use wal::{Plan, encode_committed};
+
+#[cfg(test)]
+pub(crate) use store::ForcePublishImageCopy;
