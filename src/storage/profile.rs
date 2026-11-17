@@ -176,8 +176,12 @@ pub(crate) struct Profile {
     #[cfg_attr(not(test), allow(dead_code))]
     pub page_recheck: Duration,
     /// Encoding the redo-log bytes. This is outside `wal_write`.
+    /// `wal_crc` sits inside it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub wal_encode: Duration,
+    /// The trailer CRC of the finished frame bytes. This sits inside `wal_encode`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub wal_crc: Duration,
     /// Index trees that received a posting change.
     #[cfg_attr(not(test), allow(dead_code))]
     pub indexes_updated: u64,
@@ -249,6 +253,7 @@ thread_local! {
         page_verify: Duration::ZERO,
         page_recheck: Duration::ZERO,
         wal_encode: Duration::ZERO,
+        wal_crc: Duration::ZERO,
         indexes_updated: 0,
     }) };
     static SUSPEND_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -505,6 +510,10 @@ pub(crate) fn add_page_gather(mark: Option<Instant>) {
 
 pub(crate) fn add_wal_encode(mark: Option<Instant>) {
     add(|profile| &mut profile.wal_encode, mark);
+}
+
+pub(crate) fn add_wal_crc(mark: Option<Instant>) {
+    add(|profile| &mut profile.wal_crc, mark);
 }
 
 pub(crate) fn note_index_updated() {

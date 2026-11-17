@@ -24943,6 +24943,205 @@ mod tests {
     }
 
     #[test]
+    fn table_crc_matches_bitwise_crc_and_keeps_recovery() {
+        let (_dir, base) = seed_delete_db("m42-agree", 300, 0x4200);
+        let wide = "w".repeat(80);
+        let statements = [
+            "INSERT INTO users VALUES (301, 'added', TRUE, 1);".to_string(),
+            "SELECT id, name FROM users WHERE id = 1;".to_string(),
+            "UPDATE users SET name = 'edited' WHERE id = 2;".to_string(),
+            "UPDATE users SET name = 'edited' WHERE active = TRUE;".to_string(),
+            "DELETE FROM users WHERE id = 1;".to_string(),
+            "DELETE FROM users WHERE bucket = 0 OR bucket = 1;".to_string(),
+            "DELETE FROM users WHERE id < 150;".to_string(),
+            "DELETE FROM users WHERE TRUE OR id = 0;".to_string(),
+            format!("DELETE FROM users WHERE name = '{wide}';"),
+        ];
+        for sql in &statements {
+            let (_fast_dir, fast_path, mut fast) = open_copy(&base, "m42-fast");
+            let (_slow_dir, slow_path, mut slow) = open_copy(&base, "m42-slow");
+            let fast_result = fast.execute(sql).unwrap();
+            let slow_result = {
+                let _guard = crate::storage::ForceBitwiseCrc::new();
+                slow.execute(sql).unwrap()
+            };
+            assert_eq!(fast_result, slow_result, "{sql}");
+            assert_eq!(
+                fast.table("users").unwrap().row_ids(),
+                slow.table("users").unwrap().row_ids(),
+                "{sql}"
+            );
+            assert_eq!(
+                fast.table("users").unwrap().next_row_id(),
+                slow.table("users").unwrap().next_row_id(),
+                "{sql}"
+            );
+            assert_eq!(table_rows(&mut fast), table_rows(&mut slow), "{sql}");
+            assert_eq!(
+                index_postings(&mut fast, "idx_users_id"),
+                index_postings(&mut slow, "idx_users_id"),
+                "{sql}"
+            );
+            assert_eq!(
+                index_postings(&mut fast, "idx_users_bucket"),
+                index_postings(&mut slow, "idx_users_bucket"),
+                "{sql}"
+            );
+            assert_eq!(db_file(&fast_path), db_file(&slow_path), "{sql}");
+            drop(fast);
+            drop(slow);
+            let mut again = Database::open(&fast_path).unwrap();
+            let mut slow_open = Database::open(&slow_path).unwrap();
+            assert_eq!(table_rows(&mut again), table_rows(&mut slow_open), "{sql}");
+            assert_eq!(db_file(&fast_path), db_file(&slow_path), "{sql}");
+        }
+        let delete_sql = "DELETE FROM users WHERE bucket = 0 OR bucket = 1;";
+        let wal_of = |label: &str, bitwise: bool| -> Vec<u8> {
+            let (_dir, path, mut db) = open_copy(&base, label);
+            db.set_inject(crate::storage::Inject::AfterLogSync);
+            let error = if bitwise {
+                let _guard = crate::storage::ForceBitwiseCrc::new();
+                db.execute(delete_sql)
+            } else {
+                db.execute(delete_sql)
+            };
+            assert!(error.is_err(), "{label}");
+            wal_bytes(&path)
+        };
+        assert_eq!(wal_of("m42-wal-fast", false), wal_of("m42-wal-slow", true));
+        assert_precommit(
+            &base,
+            "m42-pre",
+            delete_sql,
+            crate::storage::Inject::BeforeLogSync,
+        );
+        for inject in [
+            crate::storage::Inject::AfterLogSync,
+            crate::storage::Inject::CommitSyncFailed,
+            crate::storage::Inject::DuringCheckpoint(1),
+        ] {
+            assert_postcommit(&base, &format!("m42-post-{inject:?}"), delete_sql, inject);
+        }
+        {
+            let _guard = crate::storage::ForceBitwiseCrc::new();
+            assert_precommit(
+                &base,
+                "m42-pre-bit",
+                delete_sql,
+                crate::storage::Inject::BeforeLogSync,
+            );
+            for inject in [
+                crate::storage::Inject::AfterLogSync,
+                crate::storage::Inject::CommitSyncFailed,
+                crate::storage::Inject::DuringCheckpoint(1),
+            ] {
+                assert_postcommit(&base, &format!("m42-bit-{inject:?}"), delete_sql, inject);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release profile of the slicing-by-8 checksum"]
+    fn profile_milestone42() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let os = profile_command("uname", &["-smr"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone42 cpu={cpu} mem_bytes={mem} os={os} rustc={rustc} build=release-test seed=0x3100 warmup=1"
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            let (_base_dir, base) = seed_delete_db("m42-base", rows, 0x3100);
+            let samples = if rows >= 10_000 { 3 } else { 1 };
+            let kinds: &[&str] = if rows >= 10_000 {
+                &[
+                    "all",
+                    "buckets",
+                    "half",
+                    "alternating",
+                    "sparse",
+                    "wide",
+                    "update-scan",
+                    "one",
+                    "update-index",
+                    "insert-one",
+                ]
+            } else {
+                &["all", "one", "update-index", "insert-one"]
+            };
+            for kind in kinds {
+                milestone42_pair(&base, rows, kind, samples);
+            }
+        }
+    }
+
+    fn milestone42_pair(base: &std::path::Path, rows: i64, kind: &str, samples: usize) {
+        let sql = milestone39_sql(kind, rows);
+        let mut table_walls = Vec::new();
+        let mut bit_walls = Vec::new();
+        for sample in 0..samples {
+            let table_first = sample % 2 == 0;
+            let run = |label: &str, bitwise: bool| -> (u128, u64, u32, i64) {
+                let (_dir, _, mut db) = open_copy(base, &format!("m42-{label}-{sample}"));
+                db.execute("SELECT COUNT(*) FROM users;").unwrap();
+                crate::storage::reset_phases();
+                let started = std::time::Instant::now();
+                let count = if bitwise {
+                    let _guard = crate::storage::ForceBitwiseCrc::new();
+                    db.execute(&sql).unwrap().pop().unwrap()
+                } else {
+                    db.execute(&sql).unwrap().pop().unwrap()
+                };
+                let wall = started.elapsed().as_micros();
+                let phases = crate::storage::take_phases();
+                let checksum = mutation_checksum(&mut db);
+                println!(
+                    "milestone42 sample kind={kind} rows={rows} n={sample} mode={} wall_us={wall} seal_us={} verify_us={} encode_us={} crc_us={} wal_write_us={} wal_sync_us={} db_write_us={} db_sync_us={} wal_bytes={} frames={} heap_pages={} index_pages={} other_pages={} scratch_bytes={} checksum={checksum} count={count:?}",
+                    if bitwise { "bitwise" } else { "slice8" },
+                    phases.page_seal.as_micros(),
+                    phases.page_verify.as_micros(),
+                    phases.wal_encode.as_micros(),
+                    phases.wal_crc.as_micros(),
+                    phases.wal_write.as_micros(),
+                    phases.wal_sync.as_micros(),
+                    phases.db_write.as_micros(),
+                    phases.db_sync.as_micros(),
+                    phases.wal_bytes,
+                    phases.frames,
+                    phases.heap_pages,
+                    phases.index_pages,
+                    phases.other_pages,
+                    phases.scratch_bytes
+                );
+                assert!(phases.page_seal > std::time::Duration::ZERO);
+                assert!(phases.wal_crc > std::time::Duration::ZERO);
+                (wall, phases.wal_bytes, phases.frames, checksum)
+            };
+            let (table, bit) = if table_first {
+                (run("table", false), run("bitwise", true))
+            } else {
+                let bit = run("bitwise", true);
+                (run("table", false), bit)
+            };
+            assert_eq!(table.1, bit.1, "{kind} rows={rows} wal");
+            assert_eq!(table.2, bit.2, "{kind} rows={rows} frames");
+            assert_eq!(table.3, bit.3, "{kind} rows={rows} checksum");
+            table_walls.push(table.0);
+            bit_walls.push(bit.0);
+        }
+        println!(
+            "milestone42 median kind={kind} rows={rows} samples={samples} slice8_us={} bitwise_us={} slice8_min_us={} slice8_max_us={} bitwise_min_us={} bitwise_max_us={}",
+            median(&table_walls),
+            median(&bit_walls),
+            table_walls.iter().min().copied().unwrap_or(0),
+            table_walls.iter().max().copied().unwrap_or(0),
+            bit_walls.iter().min().copied().unwrap_or(0),
+            bit_walls.iter().max().copied().unwrap_or(0)
+        );
+    }
+
+    #[test]
     #[ignore = "release profile of fresh-seal validation"]
     fn profile_milestone40() {
         let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);

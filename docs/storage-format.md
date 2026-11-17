@@ -156,7 +156,7 @@ An `UPDATE` asks the editor for the matched row ids only. The page format is unc
 
 `SELECT` reads the in-memory tables and does not write the log. A no-op publish that dirties nothing also skips the log.
 
-The log layout is a 64-byte header, then frames, then a 32-byte trailer. The header is magic `RUSTWAL\0`, log version `1`, page size `4096`, the database nonce, and the base commit id. A frame is a `u32` page id plus the 4096-byte sealed page. The trailer is magic `RUSTCMT\0`, the frame count, a CRC-32 of the frame bytes, and the new commit id, which must be the base commit id plus one. The trailer is valid only when the file length is `64 + frame count * 4100 + 32`, the magic and checksum match, and the new commit id is exactly one past the base.
+The log layout is a 64-byte header, then frames, then a 32-byte trailer. The header is magic `RUSTWAL\0`, log version `1`, page size `4096`, the database nonce, and the base commit id. A frame is a `u32` page id plus the 4096-byte sealed page. The trailer is magic `RUSTCMT\0`, the frame count, a CRC-32 of the frame bytes, and the new commit id, which must be the base commit id plus one. That CRC is CRC-32/ISO-HDLC, polynomial `0xEDB88320`, initial state `0xFFFFFFFF`, final invert, over the frames only. The encoder computes it with the same eight-byte tables used to seal a page. Recovery computes it again from the bytes in the file. The trailer is valid only when the file length is `64 + frame count * 4100 + 32`, the magic and checksum match, and the new commit id is exactly one past the base.
 
 Recovery runs before the catalog is loaded:
 
