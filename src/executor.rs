@@ -25041,6 +25041,134 @@ mod tests {
     }
 
     #[test]
+    fn single_update_decode_matches_repeated_decode_pages() {
+        let (_dir, base) = seed_delete_db("m45-bytes", 400, 0x4500);
+        let statements = [
+            "UPDATE users SET name = name WHERE id = 1;",
+            "UPDATE users SET name = 'absent' WHERE id = -1;",
+            "UPDATE users SET bucket = NULL WHERE active = TRUE;",
+            "UPDATE users SET id = 1000 WHERE id < 200;",
+            "UPDATE users SET name = 'x' WHERE id >= 1 AND id <= 10;",
+            "UPDATE users SET bucket = 3 WHERE bucket = 0 OR bucket = 1;",
+            "UPDATE users SET name = 'a longer replacement value for relocation coverage' WHERE id < 200;",
+            "UPDATE users SET active = FALSE WHERE active = TRUE;",
+            "DELETE FROM users WHERE id >= 1 AND id < 100;",
+            "DELETE FROM users WHERE bucket IS NULL;",
+            "UPDATE users SET name = 'updated' WHERE TRUE OR id = 0;",
+            "UPDATE users SET name = 'edited' WHERE id = 2;",
+            "INSERT INTO users VALUES (401, 'added', TRUE, 1);",
+        ];
+        for sql in statements {
+            let (_fast_dir, fast_path, mut fast) = open_copy(&base, "m45-fast");
+            let (_slow_dir, slow_path, mut slow) = open_copy(&base, "m45-slow");
+            let fast_result = fast.execute(sql).unwrap();
+            let slow_result = {
+                let _guard = crate::storage::ForceRepeatedUpdateDecode::new();
+                slow.execute(sql).unwrap()
+            };
+            assert_eq!(fast_result, slow_result, "{sql}");
+            assert_eq!(
+                fast.table("users").unwrap().row_ids(),
+                slow.table("users").unwrap().row_ids(),
+                "{sql}"
+            );
+            assert_eq!(
+                fast.table("users").unwrap().next_row_id(),
+                slow.table("users").unwrap().next_row_id(),
+                "{sql}"
+            );
+            assert_eq!(table_rows(&mut fast), table_rows(&mut slow), "{sql}");
+            assert_eq!(
+                index_postings(&mut fast, "idx_users_id"),
+                index_postings(&mut slow, "idx_users_id"),
+                "{sql}"
+            );
+            assert_eq!(
+                index_postings(&mut fast, "idx_users_bucket"),
+                index_postings(&mut slow, "idx_users_bucket"),
+                "{sql}"
+            );
+            assert_eq!(db_file(&fast_path), db_file(&slow_path), "{sql}");
+            drop(fast);
+            drop(slow);
+            let mut again = Database::open(&fast_path).unwrap();
+            let mut slow_open = Database::open(&slow_path).unwrap();
+            assert_eq!(table_rows(&mut again), table_rows(&mut slow_open), "{sql}");
+        }
+        let sql = "UPDATE users SET name = 'updated' WHERE TRUE OR id = 0;";
+        let wal_of = |label: &str, repeated: bool| -> Vec<u8> {
+            let (_dir, path, mut db) = open_copy(&base, label);
+            db.set_inject(crate::storage::Inject::AfterLogSync);
+            let error = if repeated {
+                let _guard = crate::storage::ForceRepeatedUpdateDecode::new();
+                db.execute(sql)
+            } else {
+                db.execute(sql)
+            };
+            assert!(error.is_err(), "{label}");
+            wal_bytes(&path)
+        };
+        assert_eq!(wal_of("m45-wal-fast", false), wal_of("m45-wal-slow", true));
+        assert_precommit(&base, "m45-pre", sql, crate::storage::Inject::BeforeLogSync);
+        for inject in [
+            crate::storage::Inject::AfterLogSync,
+            crate::storage::Inject::CommitSyncFailed,
+            crate::storage::Inject::DuringCheckpoint(1),
+        ] {
+            assert_postcommit(&base, &format!("m45-post-{inject:?}"), sql, inject);
+        }
+        let half = "UPDATE users SET name = 'a longer replacement value for relocation coverage' WHERE id < 200;";
+        {
+            let _guard = crate::storage::ForceRepeatedUpdateDecode::new();
+            assert_precommit(
+                &base,
+                "m45-pre-old",
+                half,
+                crate::storage::Inject::BeforeLogSync,
+            );
+            assert_postcommit(
+                &base,
+                "m45-post-old",
+                half,
+                crate::storage::Inject::DuringCheckpoint(1),
+            );
+        }
+    }
+
+    #[test]
+    fn single_update_decode_matches_wal_and_recovery() {
+        let (_dir, base) = seed_delete_db("m45-fault-matrix", 400, 0x45f0);
+        for (case, sql) in [
+            "UPDATE users SET name = 'a longer replacement value for relocation coverage' WHERE id < 200;",
+            "UPDATE users SET active = FALSE WHERE active = TRUE;",
+            "UPDATE users SET bucket = 3 WHERE bucket = 0 OR bucket = 1;",
+            "UPDATE users SET name = 'updated' WHERE TRUE OR id = 0;",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut logs = Vec::new();
+            for repeated in [false, true] {
+                let _guard = repeated.then(crate::storage::ForceRepeatedUpdateDecode::new);
+                let label = format!("m45-matrix-{case}-{repeated}");
+                let (_copy_dir, path, mut db) = open_copy(&base, &label);
+                db.set_inject(crate::storage::Inject::AfterLogSync);
+                assert!(db.execute(sql).is_err());
+                logs.push(wal_bytes(&path));
+                assert_precommit(&base, &label, sql, crate::storage::Inject::BeforeLogSync);
+                for inject in [
+                    crate::storage::Inject::AfterLogSync,
+                    crate::storage::Inject::CommitSyncFailed,
+                    crate::storage::Inject::DuringCheckpoint(1),
+                ] {
+                    assert_postcommit(&base, &format!("{label}-{inject:?}"), sql, inject);
+                }
+            }
+            assert_eq!(logs[0], logs[1], "{sql}");
+        }
+    }
+
+    #[test]
     fn skipping_doomed_heap_patches_matches_the_milestone42_pages() {
         let (_dir, base) = seed_delete_db("m43-bytes", 400, 0x4300);
         let statements = [
@@ -25163,6 +25291,159 @@ mod tests {
             }
             assert_eq!(logs[0], logs[1], "{sql}");
         }
+    }
+
+    #[test]
+    #[ignore = "release profile of the post-checksum delete path"]
+    fn profile_milestone45() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let os = profile_command("uname", &["-smr"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone45 cpu={cpu} mem_bytes={mem} os={os} rustc={rustc} build=release-test seed=0x3100 warmup=1"
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [1_000_i64, 10_000, 100_000] {
+            let (_base_dir, base) = seed_delete_db("m45-base", rows, 0x3100);
+            let samples = if rows >= 10_000 { 5 } else { 1 };
+            for kind in ["update-index", "update-scan", "insert-one", "all"] {
+                milestone45_workload(&base, rows, kind, samples);
+            }
+        }
+    }
+
+    fn milestone45_workload(base: &std::path::Path, rows: i64, kind: &str, samples: usize) {
+        let sql = milestone39_sql(kind, rows);
+        let mut fast_walls = Vec::with_capacity(samples);
+        let mut full_walls = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            let fast_first = sample % 2 == 0;
+            let run = |label: &str, repeated: bool| {
+                let (_dir, _, mut db) = open_copy(base, &format!("m45-{label}-{sample}"));
+                db.execute("SELECT COUNT(*) FROM users;").unwrap();
+                crate::storage::reset_phases();
+                let started = std::time::Instant::now();
+                let outcome = if repeated {
+                    let _guard = crate::storage::ForceRepeatedUpdateDecode::new();
+                    db.execute(&sql).unwrap().pop().unwrap()
+                } else {
+                    db.execute(&sql).unwrap().pop().unwrap()
+                };
+                let wall = started.elapsed().as_micros();
+                let phases = crate::storage::take_phases();
+                let note = mutation_note();
+                let (exclusive, gap) = milestone39_gap(wall, &phases);
+                let presence = phases.presence_build.as_micros();
+                let member = phases.presence_member.as_micros();
+                let index_rest = phases
+                    .index_edit
+                    .as_micros()
+                    .saturating_sub(presence)
+                    .saturating_sub(member);
+                let gather_rest = phases
+                    .page_gather
+                    .as_micros()
+                    .saturating_sub(phases.page_seal.as_micros())
+                    .saturating_sub(phases.page_verify.as_micros())
+                    .saturating_sub(phases.page_recheck.as_micros());
+                let encode_rest = phases
+                    .wal_encode
+                    .as_micros()
+                    .saturating_sub(phases.wal_crc.as_micros());
+                let count = match &outcome {
+                    StatementResult::Delete { count }
+                    | StatementResult::Update { count }
+                    | StatementResult::Insert { count } => *count,
+                    _ => 0,
+                };
+                println!(
+                    "milestone45 sample kind={kind} rows={rows} n={sample} mode={} count={count} wall_us={wall} exclusive_us={exclusive} gap_us={gap} parse_us={} plan_us={} discover_us={} probe_us={} validate_rows_us={} filter_us={} undo_us={} memory_rest_us={} prepare_us={} validate_us={} decode_us={} heap_us={} presence_us={} path_us={} member_us={} index_rest_us={index_rest} index_us={} gather_rest_us={gather_rest} seal_us={} verify_us={} encode_rest_us={encode_rest} crc_us={} wal_write_us={} wal_sync_us={} db_write_us={} db_sync_us={} wal_clear_us={} apply_rest_us={} checksum={} wal_bytes={} frames={} heap_pages={} index_pages={} other_pages={} leaf_decodes={} bulk_spans={} descents={} scratch_bytes={} presence_builds={} ancestor_reads={}",
+                    if repeated { "repeated" } else { "single" },
+                    phases.parse.as_micros(),
+                    phases.plan.as_micros(),
+                    note.discover_us,
+                    note.probe_us,
+                    note.validate_us,
+                    note.filter_us,
+                    phases.undo.as_micros(),
+                    phases
+                        .memory
+                        .as_micros()
+                        .saturating_sub(phases.plan.as_micros())
+                        .saturating_sub(phases.undo.as_micros()),
+                    phases.prepare.as_micros(),
+                    phases.validate_ids.as_micros(),
+                    phases.decode.as_micros(),
+                    phases.heap_edit.as_micros(),
+                    presence,
+                    phases.path_record.as_micros(),
+                    member,
+                    phases.index_edit.as_micros(),
+                    phases.page_seal.as_micros(),
+                    phases.page_verify.as_micros(),
+                    phases.wal_crc.as_micros(),
+                    phases.wal_write.as_micros(),
+                    phases.wal_sync.as_micros(),
+                    phases.db_write.as_micros(),
+                    phases.db_sync.as_micros(),
+                    phases.wal_clear.as_micros(),
+                    phases.apply.as_micros().saturating_sub(
+                        phases.validate_ids.as_micros()
+                            + phases.decode.as_micros()
+                            + phases.heap_edit.as_micros()
+                            + phases.index_edit.as_micros()
+                            + phases.compare.as_micros()
+                            + phases.page_gather.as_micros()
+                    ),
+                    mutation_checksum(&mut db),
+                    phases.wal_bytes,
+                    phases.frames,
+                    phases.heap_pages,
+                    phases.index_pages,
+                    phases.other_pages,
+                    phases.leaf_decodes,
+                    phases.bulk_spans,
+                    phases.descents,
+                    phases.scratch_bytes,
+                    phases.presence_builds,
+                    phases.ancestor_reads
+                );
+                (
+                    wall,
+                    phases.wal_bytes,
+                    phases.frames,
+                    phases.heap_pages,
+                    phases.index_pages,
+                    phases.other_pages,
+                    mutation_checksum(&mut db),
+                    phases.heap_edit.as_micros(),
+                )
+            };
+            let (fast, full) = if fast_first {
+                (run("single", false), run("repeated", true))
+            } else {
+                let full = run("repeated", true);
+                (run("single", false), full)
+            };
+            assert_eq!(fast.1, full.1, "{kind} rows={rows} wal");
+            assert_eq!(fast.2, full.2, "{kind} rows={rows} frames");
+            assert_eq!(fast.3, full.3, "{kind} rows={rows} heap pages");
+            assert_eq!(fast.4, full.4, "{kind} rows={rows} index pages");
+            assert_eq!(fast.5, full.5, "{kind} rows={rows} other pages");
+            assert_eq!(fast.6, full.6, "{kind} rows={rows} checksum");
+            fast_walls.push(fast.0);
+            full_walls.push(full.0);
+        }
+        println!(
+            "milestone45 median kind={kind} rows={rows} samples={samples} single_us={} repeated_us={} single_min_us={} single_max_us={} repeated_min_us={} repeated_max_us={}",
+            median(&fast_walls),
+            median(&full_walls),
+            fast_walls.iter().copied().min().unwrap_or(0),
+            fast_walls.iter().copied().max().unwrap_or(0),
+            full_walls.iter().copied().min().unwrap_or(0),
+            full_walls.iter().copied().max().unwrap_or(0)
+        );
     }
 
     #[test]
