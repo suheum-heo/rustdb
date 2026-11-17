@@ -1749,3 +1749,72 @@ The structural check is measurable and small. The statement time falls by about 
 ## Milestone 41 streaming redo-log checksum
 
 16 Nov 2026, 10:48 PM to 10:49 PM CST, Apple M5. A local experiment folded the redo-log trailer CRC into frame serialization. The streaming CRC and the finished-buffer CRC produced identical WAL bytes. Corruption and recovery tests passed. Two release passes of `profile_milestone41`, seed `0x3100`, three samples at 100,000 rows, did not establish a repeatable latency benefit. The 100,000-row delete-all medians were 228.979 ms streaming versus 235.621 ms one-shot, then 225.265 ms versus 225.861 ms. The measured ranges overlapped. The CRC bit loop still took about 64–69 ms, and the frame copy stayed under about 1.1 ms. The implementation was reverted. It was not committed and it has no pull request. Milestone 40 remains the production baseline.
+
+## Milestone 42 slicing-by-8 checksum
+
+16 Nov 2026, 11:34–11:36 PM CST, Apple M5, 17,179,869,184 bytes of memory, Darwin 25.2.0 arm64, rustc 1.100.0 (`0ef1bc386 2026-11-09`). The checksum is still CRC-32/ISO-HDLC: reflected polynomial `0xEDB88320`, initial state `0xFFFFFFFF`, final invert. Empty input is `0x00000000`. ASCII `123456789` is `0xCBF43926`. Tables are generated from that polynomial. A commit folds eight bytes per step. The one-byte table and the original bit loop stay in the tests. ARM CRC32 and SSE4.2 CRC32 are a different polynomial and are not used. The page format and the WAL record are unchanged. This is not a power-loss test.
+
+### CRC microbenchmark
+
+`profile_crc32_implementations`, release, one buffer per length, five warm repetitions after one cold call. The timed region is the checksum. `std::hint::black_box` keeps the result. Warm time is the median nanoseconds per call. Throughput is that median.
+
+| bytes | bitwise | one-byte table | slicing-by-8 |
+| ---: | ---: | ---: | ---: |
+| 24 | 105 ns, 218 MiB/s | 12 ns, 1,907 MiB/s | 3 ns, 7,629 MiB/s |
+| 64 | 336 ns, 182 MiB/s | 58 ns, 1,052 MiB/s | 11 ns, 5,549 MiB/s |
+| 4,096 | 24,623 ns, 159 MiB/s | 7,578 ns, 516 MiB/s | 1,590 ns, 2,457 MiB/s |
+| 65,536 | 420,556 ns, 149 MiB/s | 122,185 ns, 512 MiB/s | 25,800 ns, 2,423 MiB/s |
+| 1,048,576 | 6,378,986 ns, 157 MiB/s | 1,992,725 ns, 502 MiB/s | 434,334 ns, 2,302 MiB/s |
+| 12,582,912 | 77,293,171 ns, 155 MiB/s | 23,122,468 ns, 519 MiB/s | 4,923,942 ns, 2,437 MiB/s |
+
+On a 4 KiB page and on a 12 MiB buffer, slicing-by-8 is about 15 times the bit loop and about 4.7 times the one-byte table. The one-byte table already beats the bit loop by about 3.3 times. The extra factor is large on the buffer sizes a commit checksums, and the extra code is the eight generated tables. That is the implementation a commit uses.
+
+The cold call is slower on the large buffers and agrees with the warm checksum. At 12 MiB the cold times were 78.3 ms, 22.1 ms, and 5.0 ms.
+
+### End-to-end profile
+
+`profile_milestone42`, the release test binary alone, seed `0x3100`. `slice8` is the commit checksum. `bitwise` forces the original bit loop through the same seal and the same trailer. Sample index alternates which arm runs first. Each arm uses a new copy. At 10,000 and 100,000 rows each statement is the median of three copies. At 100 and 1,000 rows it is one copy. Both arms wrote the same log length, the same frame count, and the same result checksum on every copy.
+
+Pass 1 took 22.95 seconds. Its maximum resident set was 308,789,248 bytes and its peak memory footprint was 259,490,464 bytes. Pass 2 took 22.22 seconds, with 312,000,512 and 253,280,928 bytes. Those figures cover every size and both arms. On the 100,000-row delete-all, `scratch_bytes` was 2,875,248 on both arms. The log was 12,168,896 bytes, 2,968 frames, result checksum 0. Dirty pages were 0 heap, 1 index, and 2,967 other.
+
+### 100,000-row medians, pass 1
+
+Times are microseconds.
+
+| kind | slice8 | slice8 range | bitwise | bitwise range | WAL | frames |
+| --- | ---: | --- | ---: | --- | ---: | ---: |
+| all | 113,615 | 108,341–115,348 | 234,528 | 232,205–234,918 | 12,168,896 | 2,968 |
+| buckets | 73,702 | 73,493–75,861 | 186,355 | 186,174–196,218 | 10,906,096 | 2,660 |
+| half | 84,912 | 78,798–94,456 | 154,472 | 152,596–176,074 | 7,101,296 | 1,732 |
+| alternating | 92,708 | 89,175–97,675 | 212,086 | 208,052–213,023 | 11,537,496 | 2,814 |
+| sparse | 56,127 | 55,389–59,730 | 161,401 | 152,026–165,400 | 9,581,796 | 2,337 |
+| wide | 68,493 | 66,248–97,068 | 228,807 | 208,009–281,479 | 12,181,196 | 2,971 |
+| update-scan | 73,908 | 73,365–80,198 | 142,379 | 141,506–145,164 | 6,309,996 | 1,539 |
+| one | 20,213 | 19,475–20,507 | 20,872 | 19,364–21,749 | 36,996 | 9 |
+| update-index | 16,002 | 15,881–16,048 | 16,188 | 14,236–19,393 | 12,396 | 3 |
+| insert-one | 26,834 | 26,485–27,118 | 26,235 | 26,199–27,993 | 36,996 | 9 |
+
+Delete-all's slicing-by-8 copies sealed in 4,861 µs, 4,977 µs, and 4,849 µs. The trailer CRC was 4,896 µs, 4,911 µs, and 4,942 µs, inside an encode of 5,829 µs, 5,893 µs, and 5,668 µs. The bitwise copies sealed in 66,910 µs, 66,900 µs, and 66,809 µs. The trailer CRC was 66,985 µs, 66,947 µs, and 66,955 µs, inside an encode of 67,838 µs, 67,975 µs, and 67,758 µs. Log sync stayed about 4.5–6.7 ms and database sync about 2.5–5.2 ms on both arms. The median gap is 120.9 ms. The fastest bitwise copy, 232,205 µs, is 116.9 ms above the slowest slicing-by-8 copy.
+
+Buckets, half, alternating, sparse, wide, and the scan update keep the same shape: the slicing-by-8 maximum is below the bitwise minimum. The one-row delete, the indexed update, and the one-row insert stay near 16–27 ms, and their ranges overlap. Structure checks stay under 70 µs.
+
+### 100,000-row medians, pass 2
+
+| kind | slice8 | slice8 range | bitwise | bitwise range |
+| --- | ---: | --- | ---: | --- |
+| all | 120,404 | 109,621–133,784 | 249,266 | 244,942–256,433 |
+| buckets | 76,737 | 73,102–84,183 | 190,514 | 186,052–203,170 |
+| half | 78,969 | 77,524–83,186 | 153,747 | 153,097–159,039 |
+| alternating | 82,103 | 80,220–87,490 | 198,975 | 198,497–199,646 |
+| sparse | 56,174 | 51,146–60,582 | 158,254 | 154,755–159,837 |
+| wide | 59,095 | 58,469–59,456 | 184,610 | 184,384–188,766 |
+| update-scan | 71,287 | 69,917–72,478 | 137,225 | 135,843–142,420 |
+| one | 21,186 | 20,917–21,380 | 20,982 | 20,685–21,027 |
+| update-index | 15,904 | 15,686–17,345 | 16,488 | 16,006–16,605 |
+| insert-one | 26,107 | 25,565–26,885 | 26,873 | 26,641–27,093 |
+
+The delete-all median gap is 128.9 ms. The slowest slicing-by-8 copy, 133,784 µs, is 111.2 ms under the fastest bitwise copy. Seal on the slicing-by-8 copies was 5,119 µs, 4,874 µs, and 5,783 µs. The trailer CRC was 5,270 µs, 4,905 µs, and 5,007 µs. The bitwise seal was 67,779 µs, 69,483 µs, and 72,539 µs, and the trailer CRC was 67,406 µs, 67,795 µs, and 73,198 µs. WAL length, frame count, and the result checksum stayed 12,168,896, 2,968, and 0.
+
+At 10,000 rows the delete-all medians were 19,207 µs versus 32,026 µs on pass 1 and 20,087 µs versus 33,192 µs on pass 2. Those ranges do not overlap. At 100 and 1,000 rows the statement is still mostly `sync_all`, and the two arms differ by about 1–2 ms.
+
+The persisted checksum matches the bit loop. The large deletes move by about the old checksum time, outside the spread of the copies. Small statements stay in the sync-dominated band. Milestone 41's folded checksum remains rejected. The Milestone 40 rule still applies: a page the editor just sealed is not checksummed a second time, and open, recovery, and migration still recompute the CRC.

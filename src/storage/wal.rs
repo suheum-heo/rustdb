@@ -79,7 +79,10 @@ pub(crate) fn encode_committed(plan: &Plan<'_>) -> Result<Vec<u8>, DbError> {
             .map_err(|_| DbError::Internal("redo log frame count does not fit".to_string()))?
             .to_le_bytes(),
     );
-    trailer[12..16].copy_from_slice(&page::checksum(frames).to_le_bytes());
+    let crc_mark = super::profile::start();
+    let checksum = page::checksum(frames);
+    super::profile::add_wal_crc(crc_mark);
+    trailer[12..16].copy_from_slice(&checksum.to_le_bytes());
     let new_commit = plan
         .base_commit
         .checked_add(1)
@@ -421,4 +424,64 @@ pub(crate) fn truncate_log(wal_path: &Path) -> Result<(), DbError> {
         ))
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::page::ForceBitwiseCrc;
+
+    fn sealed(id: u32, byte: u8) -> Page {
+        let mut page = Page::new();
+        page::init_slotted(&mut page, page::TYPE_HEAP, id);
+        page::insert_cell(&mut page, &[byte; 4]).unwrap();
+        page::seal(&mut page);
+        page
+    }
+
+    fn both(frames: &[(u32, Page)]) -> (Vec<u8>, Vec<u8>) {
+        let plan = Plan {
+            nonce: 9,
+            base_commit: 4,
+            frames,
+        };
+        let table = encode_committed(&plan).unwrap();
+        let bitwise = {
+            let _guard = ForceBitwiseCrc::new();
+            encode_committed(&plan).unwrap()
+        };
+        (table, bitwise)
+    }
+
+    #[test]
+    fn table_and_bitwise_logs_are_the_same_bytes() {
+        let one = vec![(1, sealed(1, 1))];
+        let many = vec![(2, sealed(2, 2)), (9, sealed(9, 3)), (4, sealed(4, 4))];
+        for frames in [one, many] {
+            let (table, bitwise) = both(&frames);
+            assert_eq!(table, bitwise);
+            assert_eq!(
+                table.len(),
+                HEADER_LEN + frames.len() * FRAME_LEN + TRAILER_LEN
+            );
+            assert!(matches!(classify_log(&table), LogClass::Committed));
+            let mut damaged = table.clone();
+            let at = damaged.len() - 20;
+            damaged[at] ^= 0xff;
+            assert!(matches!(classify_log(&damaged), LogClass::Damaged));
+            let mut body = table.clone();
+            body[68] ^= 0xff;
+            assert!(matches!(classify_log(&body), LogClass::Damaged));
+        }
+    }
+
+    #[test]
+    fn the_maximum_frame_count_matches_the_bitwise_trailer() {
+        let frames: Vec<(u32, Page)> = (0..page::MAX_COMMIT_FRAMES as u32)
+            .map(|id| (id, sealed(id, id as u8)))
+            .collect();
+        let (table, bitwise) = both(&frames);
+        assert_eq!(table, bitwise);
+        assert!(matches!(classify_log(&table), LogClass::Committed));
+    }
 }

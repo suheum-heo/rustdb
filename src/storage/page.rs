@@ -819,17 +819,144 @@ pub(crate) fn checksum(bytes: &[u8]) -> u32 {
     crc32(bytes)
 }
 
-/// CRC-32/ISO-HDLC, the same polynomial used by PNG and Ethernet.
+/// Reflected CRC-32 polynomial. ISO-HDLC, PNG, and Ethernet use this value.
+const CRC_POLY: u32 = 0xEDB8_8320;
+
+/// Eight slices of reflected CRC-32/ISO-HDLC, generated from [`CRC_POLY`].
+/// Slice 0 is the one-byte table.
+const CRC_SLICE_TABLES: [[u32; 256]; 8] = crc_slice_tables();
+
+const fn crc_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut crc = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            if crc & 1 == 1 {
+                crc = (crc >> 1) ^ CRC_POLY;
+            } else {
+                crc >>= 1;
+            }
+            bit += 1;
+        }
+        table[index] = crc;
+        index += 1;
+    }
+    table
+}
+
+/// CRC-32/ISO-HDLC. The state starts at `0xFFFFFFFF` and the result is inverted.
+///
+/// Eight input bytes are folded through [`CRC_SLICE_TABLES`]. A remainder uses
+/// the one-byte table. ARM CRC32 and SSE4.2 CRC32 instructions use the
+/// Castagnoli polynomial, so they are not this checksum.
 fn crc32(bytes: &[u8]) -> u32 {
+    #[cfg(test)]
+    if bitwise_crc_forced() {
+        return crc32_bitwise(bytes);
+    }
+    crc32_slice8(bytes)
+}
+
+#[cfg(test)]
+fn crc32_table(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        let index = ((crc ^ u32::from(byte)) & 0xFF) as usize;
+        crc = CRC_SLICE_TABLES[0][index] ^ (crc >> 8);
+    }
+    !crc
+}
+
+/// Bit-by-bit CRC-32/ISO-HDLC. Tests use this as the reference implementation.
+#[cfg(test)]
+fn crc32_bitwise(bytes: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in bytes {
         crc ^= u32::from(byte);
         for _ in 0..8 {
             let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            crc = (crc >> 1) ^ (CRC_POLY & mask);
         }
     }
     !crc
+}
+
+fn crc32_slice8(bytes: &[u8]) -> u32 {
+    let tables = &CRC_SLICE_TABLES;
+    let mut crc = 0xFFFF_FFFFu32;
+    let mut rest = bytes;
+    while rest.len() >= 8 {
+        let one = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) ^ crc;
+        let two = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
+        crc = tables[7][(one & 0xFF) as usize]
+            ^ tables[6][((one >> 8) & 0xFF) as usize]
+            ^ tables[5][((one >> 16) & 0xFF) as usize]
+            ^ tables[4][(one >> 24) as usize]
+            ^ tables[3][(two & 0xFF) as usize]
+            ^ tables[2][((two >> 8) & 0xFF) as usize]
+            ^ tables[1][((two >> 16) & 0xFF) as usize]
+            ^ tables[0][(two >> 24) as usize];
+        rest = &rest[8..];
+    }
+    for &byte in rest {
+        let index = ((crc ^ u32::from(byte)) & 0xFF) as usize;
+        crc = tables[0][index] ^ (crc >> 8);
+    }
+    !crc
+}
+
+const fn crc_slice_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0u32; 256]; 8];
+    let base = crc_table();
+    let mut index = 0;
+    while index < 256 {
+        tables[0][index] = base[index];
+        index += 1;
+    }
+    let mut slice = 1;
+    while slice < 8 {
+        let mut index = 0;
+        while index < 256 {
+            let previous = tables[slice - 1][index];
+            tables[slice][index] = (previous >> 8) ^ tables[0][(previous & 0xFF) as usize];
+            index += 1;
+        }
+        slice += 1;
+    }
+    tables
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_BITWISE_CRC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Checksum with the original bit loop.
+///
+/// A commit uses the lookup table. This guard is the reference path.
+#[cfg(test)]
+pub(crate) struct ForceBitwiseCrc;
+
+#[cfg(test)]
+impl ForceBitwiseCrc {
+    pub(crate) fn new() -> Self {
+        FORCE_BITWISE_CRC.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceBitwiseCrc {
+    fn drop(&mut self) {
+        FORCE_BITWISE_CRC.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(test)]
+fn bitwise_crc_forced() -> bool {
+    FORCE_BITWISE_CRC.with(|flag| flag.get())
 }
 
 #[cfg(test)]
@@ -1076,5 +1203,150 @@ mod tests {
         assert!(verify(&page, 4).is_err());
         page.as_mut_slice().copy_from_slice(&sealed);
         verify(&page, 4).unwrap();
+    }
+
+    #[test]
+    fn crc32_matches_published_answers_and_the_bitwise_reference() {
+        assert_eq!(checksum(&[]), 0x0000_0000);
+        assert_eq!(crc32_bitwise(&[]), 0x0000_0000);
+        assert_eq!(checksum(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32_bitwise(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32_slice8(b"123456789"), 0xCBF4_3926);
+        let samples = crc_samples();
+        for sample in &samples {
+            let reference = crc32_bitwise(sample);
+            assert_eq!(checksum(sample), reference, "len {}", sample.len());
+            assert_eq!(crc32_slice8(sample), reference, "slice8 {}", sample.len());
+            for align in 0..8 {
+                let mut storage = vec![0xA5u8; sample.len() + align];
+                storage[align..].copy_from_slice(sample);
+                assert_eq!(checksum(&storage[align..]), reference, "align {align}");
+                assert_eq!(crc32_slice8(&storage[align..]), reference);
+            }
+        }
+    }
+
+    #[test]
+    fn a_sealed_page_keeps_the_bitwise_checksum_bytes() {
+        let mut fast = sealed_heap();
+        let slow = {
+            let _guard = ForceBitwiseCrc::new();
+            sealed_heap()
+        };
+        assert_eq!(fast.as_slice(), slow.as_slice());
+        let stored = u32::from_le_bytes(
+            fast.as_slice()[OFF_CHECKSUM..OFF_CHECKSUM + 4]
+                .try_into()
+                .unwrap(),
+        );
+        fast.as_mut_slice()[OFF_CHECKSUM..OFF_CHECKSUM + 4].fill(0);
+        assert_eq!(crc32_bitwise(fast.as_slice()), stored);
+        fast.as_mut_slice()[PAGE_SIZE - 1] ^= 0xFF;
+        assert!(recheck_checksum(&fast, 4).is_err());
+        assert!(verify(&fast, 4).is_err());
+    }
+
+    fn crc_samples() -> Vec<Vec<u8>> {
+        let mut samples = Vec::new();
+        for length in [
+            0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 31, 32, 63, 64, 4095, 4096, 4097, 4100, 8192, 12_288,
+        ] {
+            samples.push(vec![0u8; length]);
+            samples.push(vec![0xFF; length]);
+        }
+        samples.push(b"123456789".to_vec());
+        samples.push("café — Δ".as_bytes().to_vec());
+        let mut mixed = Vec::new();
+        let mut state = 0xC0FF_EE42u64;
+        for _ in 0..20_000 {
+            state = state
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(0x6A09_E667);
+            mixed.push(state as u8);
+        }
+        samples.push(mixed);
+        let mut frames = Vec::new();
+        for id in 0..3u32 {
+            frames.extend(id.to_le_bytes());
+            frames.extend(std::iter::repeat_n(id as u8, 4096));
+        }
+        samples.push(frames);
+        samples.push({
+            let mut odd = vec![0u8; 4100 * 2 + 17];
+            for (index, byte) in odd.iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_mul(3);
+            }
+            odd
+        });
+        let mut wide = Vec::with_capacity(1 << 20);
+        let mut state = 0x1234_5678_9ABCu64;
+        while wide.len() < (1 << 20) {
+            state = state.wrapping_mul(0x5851_F42D).wrapping_add(1);
+            wide.push((state >> 33) as u8);
+        }
+        samples.push(wide);
+        samples
+    }
+
+    #[test]
+    #[ignore = "release comparison of CRC-32 implementations"]
+    fn profile_crc32_implementations() {
+        let lengths = [24usize, 64, 4096, 64 * 1024, 1024 * 1024, 12 * 1024 * 1024];
+        println!("crc32 cpu=apple-m5 poly=0xEDB88320 init=0xFFFFFFFF final_xor=0xFFFFFFFF");
+        for length in lengths {
+            let mut bytes = vec![0u8; length];
+            let mut state = 0xA5A5_5A5A_0123_4567u64;
+            for byte in &mut bytes {
+                state = state.wrapping_mul(0x9E37_79B9).wrapping_add(0x7F4A_7C15);
+                *byte = (state >> 24) as u8;
+            }
+            let reference = crc32_bitwise(&bytes);
+            assert_eq!(crc32_table(&bytes), reference);
+            assert_eq!(crc32_slice8(&bytes), reference);
+            let repeats = if length <= 64 {
+                200_000
+            } else if length <= 4096 {
+                20_000
+            } else if length <= 64 * 1024 {
+                2_000
+            } else if length <= 1024 * 1024 {
+                80
+            } else {
+                8
+            };
+            for (name, function) in [
+                ("bitwise", crc32_bitwise as fn(&[u8]) -> u32),
+                ("table", crc32_table as fn(&[u8]) -> u32),
+                ("slice8", crc32_slice8 as fn(&[u8]) -> u32),
+            ] {
+                let cold = std::time::Instant::now();
+                let cold_sum = std::hint::black_box(function(std::hint::black_box(&bytes)));
+                let cold_ns = cold.elapsed().as_nanos();
+                let mut warm = Vec::with_capacity(5);
+                let mut total = 0u64;
+                for _ in 0..5 {
+                    let started = std::time::Instant::now();
+                    let mut mixed = 0u32;
+                    for _ in 0..repeats {
+                        mixed ^= function(std::hint::black_box(&bytes));
+                    }
+                    let elapsed = started.elapsed();
+                    total = total.wrapping_add(u64::from(std::hint::black_box(mixed)));
+                    warm.push(elapsed.as_nanos() / repeats as u128);
+                }
+                warm.sort_unstable();
+                let median = warm[warm.len() / 2];
+                let mib = length as f64 / (1024.0 * 1024.0);
+                let per_sec = if median == 0 {
+                    0.0
+                } else {
+                    mib / (median as f64 / 1_000_000_000.0)
+                };
+                println!(
+                    "crc32 impl={name} bytes={length} cold_ns={cold_ns} warm_ns={median} warm_min_ns={} warm_max_ns={} mib_per_s={per_sec:.1} repeats={repeats} checksum={cold_sum:#x} sink={total}",
+                    warm[0], warm[4]
+                );
+            }
+        }
     }
 }
