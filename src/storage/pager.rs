@@ -177,11 +177,13 @@ impl Pager {
             base_commit,
             frames: &pages,
         };
+        let encode_mark = profile::start();
         let bytes = if inject == Some(Inject::BeforeLogSync) {
             wal::encode_uncommitted(&plan).map_err(StepError::BeforeCommit)?
         } else {
             wal::encode_committed(&plan).map_err(StepError::BeforeCommit)?
         };
+        profile::add_wal_encode(encode_mark);
         profile::note_wal_bytes(bytes.len());
         let wal_mark = profile::start();
         let written = write_log(&wal_path, &bytes);
@@ -199,7 +201,22 @@ impl Pager {
             return Err(ambiguous_sync());
         }
         let sync_mark = profile::start();
-        let synced = wal_file.sync_all();
+        // A release benchmark can skip these syncs. That run is not durable.
+        // Production builds have no such path.
+        let synced = {
+            #[cfg(test)]
+            {
+                if profile::sync_suspended() {
+                    Ok(())
+                } else {
+                    wal_file.sync_all()
+                }
+            }
+            #[cfg(not(test))]
+            {
+                wal_file.sync_all()
+            }
+        };
         profile::add_wal_sync(sync_mark);
         if let Err(error) = synced {
             return Err(ambiguous_sync_io(&wal_path, &error));
@@ -224,7 +241,20 @@ impl Pager {
         }
         profile::add_db_write(write_mark);
         let db_sync = profile::start();
-        let synced = self.file.sync_all();
+        let synced = {
+            #[cfg(test)]
+            {
+                if profile::sync_suspended() {
+                    Ok(())
+                } else {
+                    self.file.sync_all()
+                }
+            }
+            #[cfg(not(test))]
+            {
+                self.file.sync_all()
+            }
+        };
         profile::add_db_sync(db_sync);
         synced.map_err(|error| {
             StepError::AfterCommit(DbError::Storage(format!(

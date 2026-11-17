@@ -216,7 +216,9 @@ impl Database {
         if let Some(error) = self.fenced() {
             return Err(error);
         }
+        let parse_mark = crate::storage::phase_start();
         let statements = parser::parse(sql)?;
+        crate::storage::add_parse(parse_mark);
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
             results.push(self.execute_statement(statement)?);
@@ -249,7 +251,10 @@ impl Database {
         }
         let change = durable_change(&statement);
         let undo = self.prepare_durable(&change);
-        let result = match self.apply(statement) {
+        let memory_mark = crate::storage::phase_start();
+        let applied = self.apply(statement);
+        crate::storage::add_memory(memory_mark);
+        let result = match applied {
             Ok(result) => result,
             Err(error) => {
                 self.restore_update_journal(false)?;
@@ -2314,9 +2319,12 @@ impl Database {
         table_name: &str,
         selection: Option<&Expr>,
     ) -> Result<plan::MutationAccess, DbError> {
+        let plan_mark = crate::storage::phase_start();
         let table = self.table(table_name)?;
         let choices = index_choices(table, self.index_images())?;
-        Ok(plan::choose_mutation(table.name(), selection, &choices))
+        let chosen = plan::choose_mutation(table.name(), selection, &choices);
+        crate::storage::add_plan(plan_mark);
+        Ok(chosen)
     }
 
     /// An index lookup is eligible only from the shape of `WHERE`.
@@ -24414,6 +24422,400 @@ mod tests {
             ] {
                 assert_postcommit(&base, &format!("m36-post-{label}-{inject:?}"), sql, inject);
             }
+        }
+    }
+
+    #[test]
+    fn profiled_statement_matches_unprofiled_result_and_injections() {
+        let (_dir, base) = seed_delete_db("m39-agree", 300, 0x3900);
+        let delete_sql = "DELETE FROM users WHERE bucket = 0 OR bucket = 1;";
+        let (_off_dir, off_path, mut off) = open_copy(&base, "m39-off");
+        let (_on_dir, on_path, mut on) = open_copy(&base, "m39-on");
+        let off_count = change_count(&mut off, delete_sql);
+        let on_count = {
+            let _phases = crate::storage::enable_phases();
+            change_count(&mut on, delete_sql)
+        };
+        assert_eq!(off_count, on_count);
+        assert_eq!(db_file(&off_path), db_file(&on_path));
+        assert_eq!(mutation_checksum(&mut off), mutation_checksum(&mut on));
+        assert_eq!(
+            off.table("users").unwrap().row_ids(),
+            on.table("users").unwrap().row_ids()
+        );
+        assert_eq!(
+            off.table("users").unwrap().next_row_id(),
+            on.table("users").unwrap().next_row_id()
+        );
+        assert_eq!(wal_len(&off_path), 0);
+        assert_eq!(wal_len(&on_path), 0);
+        let update_sql = "UPDATE users SET name = 'edited' WHERE id = 2;";
+        assert_eq!(change_count(&mut off, update_sql), {
+            let _phases = crate::storage::enable_phases();
+            change_count(&mut on, update_sql)
+        });
+        assert_eq!(db_file(&off_path), db_file(&on_path));
+        let insert_sql = "INSERT INTO users VALUES (301, 'added', TRUE, 1);";
+        let off_insert = off.execute(insert_sql).unwrap().pop().unwrap();
+        let on_insert = {
+            let _phases = crate::storage::enable_phases();
+            on.execute(insert_sql).unwrap().pop().unwrap()
+        };
+        assert_eq!(off_insert, on_insert);
+        assert_eq!(db_file(&off_path), db_file(&on_path));
+        let select_sql = "SELECT id, name FROM users WHERE id = 3;";
+        let off_rows = off.execute(select_sql).unwrap().pop().unwrap();
+        let on_rows = {
+            let _phases = crate::storage::enable_phases();
+            on.execute(select_sql).unwrap().pop().unwrap()
+        };
+        assert_eq!(off_rows, on_rows);
+        let _phases = crate::storage::enable_phases();
+        assert_precommit(
+            &base,
+            "m39-pre",
+            delete_sql,
+            crate::storage::Inject::BeforeLogSync,
+        );
+        for inject in [
+            crate::storage::Inject::AfterLogSync,
+            crate::storage::Inject::CommitSyncFailed,
+            crate::storage::Inject::DuringCheckpoint(1),
+        ] {
+            assert_postcommit(&base, &format!("m39-post-{inject:?}"), delete_sql, inject);
+        }
+    }
+
+    #[test]
+    #[ignore = "release profile of end-to-end statement stages"]
+    fn profile_milestone39() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let os = profile_command("uname", &["-smr"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone39 cpu={cpu} mem_bytes={mem} os={os} rustc={rustc} build=release-test seed=0x3100 warmup=1"
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            let (_base_dir, base) = seed_delete_db("m39-base", rows, 0x3100);
+            let file_len = std::fs::metadata(&base).unwrap().len();
+            println!(
+                "milestone39 database rows={rows} file_bytes={file_len} indexes=idx_users_id,idx_users_bucket"
+            );
+            let samples = if rows >= 10_000 { 3 } else { 1 };
+            for kind in [
+                "one",
+                "ten",
+                "buckets",
+                "half",
+                "alternating",
+                "consecutive",
+                "sparse",
+                "all",
+                "wide",
+            ] {
+                milestone39_workload(&base, rows, kind, samples, true);
+            }
+            for kind in [
+                "select-index",
+                "select-scan",
+                "update-index",
+                "update-scan",
+                "insert-one",
+                "insert-batch",
+                "join",
+                "group",
+            ] {
+                let repeats = if rows == 100_000 { 1 } else { samples };
+                milestone39_workload(&base, rows, kind, repeats, false);
+            }
+            if rows == 1_000 {
+                milestone39_overhead(&base, rows);
+            }
+            if rows == 100_000 {
+                milestone39_nosync(&base, rows);
+            }
+        }
+    }
+
+    fn milestone39_overhead(base: &std::path::Path, rows: i64) {
+        let sql = milestone39_sql("all", rows);
+        let mut off = Vec::new();
+        let mut on = Vec::new();
+        for sample in 0..5 {
+            let off_first = sample % 2 == 0;
+            let measure = |label: &str, enabled: bool| -> u128 {
+                crate::storage::set_phases_enabled(enabled);
+                let (_dir, _, mut db) = open_copy(base, &format!("m39-{label}-{sample}"));
+                db.execute("SELECT COUNT(*) FROM users;").unwrap();
+                if enabled {
+                    crate::storage::reset_phases();
+                }
+                let started = std::time::Instant::now();
+                change_count(&mut db, &sql);
+                started.elapsed().as_micros()
+            };
+            if off_first {
+                off.push(measure("off", false));
+                on.push(measure("on", true));
+            } else {
+                on.push(measure("on", true));
+                off.push(measure("off", false));
+            }
+        }
+        crate::storage::set_phases_enabled(true);
+        println!(
+            "milestone39 overhead rows={rows} workload=all samples=5 alternate=sample_index off_median_us={} on_median_us={} off_min_us={} off_max_us={} on_min_us={} on_max_us={}",
+            median(&off),
+            median(&on),
+            off.iter().min().copied().unwrap_or(0),
+            off.iter().max().copied().unwrap_or(0),
+            on.iter().min().copied().unwrap_or(0),
+            on.iter().max().copied().unwrap_or(0)
+        );
+    }
+
+    fn milestone39_nosync(base: &std::path::Path, rows: i64) {
+        let sql = milestone39_sql("all", rows);
+        let mut durable = Vec::new();
+        let mut suspended = Vec::new();
+        for sample in 0..3 {
+            let durable_first = sample % 2 == 0;
+            let run = |label: &str, skip_sync: bool| -> u128 {
+                let (_dir, _, mut db) = open_copy(base, &format!("m39-sync-{label}-{sample}"));
+                db.execute("SELECT COUNT(*) FROM users;").unwrap();
+                crate::storage::reset_phases();
+                let started = std::time::Instant::now();
+                let count = if skip_sync {
+                    let _guard = crate::storage::SuspendSync::new();
+                    change_count(&mut db, &sql)
+                } else {
+                    change_count(&mut db, &sql)
+                };
+                let wall = started.elapsed().as_micros();
+                let phases = crate::storage::take_phases();
+                assert_eq!(count, usize::try_from(rows).unwrap());
+                println!(
+                    "milestone39 nosync sample={sample} order_durable_first={durable_first} mode={} wall_us={wall} wal_sync_us={} db_sync_us={} wal_write_us={} wal_encode_us={} NON_DURABLE={skip_sync}",
+                    if skip_sync { "suspended" } else { "durable" },
+                    phases.wal_sync.as_micros(),
+                    phases.db_sync.as_micros(),
+                    phases.wal_write.as_micros(),
+                    phases.wal_encode.as_micros()
+                );
+                wall
+            };
+            if durable_first {
+                durable.push(run("durable", false));
+                suspended.push(run("suspended", true));
+            } else {
+                suspended.push(run("suspended", true));
+                durable.push(run("durable", false));
+            }
+        }
+        println!(
+            "milestone39 nosync median rows={rows} workload=all durable_us={} suspended_us={} NON_DURABLE=true",
+            median(&durable),
+            median(&suspended)
+        );
+    }
+
+    fn milestone39_workload(
+        base: &std::path::Path,
+        rows: i64,
+        kind: &str,
+        samples: usize,
+        mutation_each_copy: bool,
+    ) {
+        let sql = milestone39_sql(kind, rows);
+        let mut walls = Vec::with_capacity(samples);
+        let fresh_each_time =
+            mutation_each_copy || kind.starts_with("insert") || kind.starts_with("update");
+        let copies = if fresh_each_time { samples } else { 1 };
+        for sample in 0..copies {
+            let (_dir, _, mut db) = open_copy(base, &format!("m39-{kind}-{rows}-{sample}"));
+            if kind == "join" {
+                db.execute("CREATE TABLE labels (bucket INT, tag TEXT);")
+                    .unwrap();
+                db.execute("INSERT INTO labels VALUES (0, 'a'), (1, 'b'), (2, 'c'), (3, 'd');")
+                    .unwrap();
+                db.execute("CREATE INDEX idx_labels_bucket ON labels(bucket);")
+                    .unwrap();
+            }
+            let warmup = if fresh_each_time {
+                "SELECT COUNT(*) FROM users;"
+            } else {
+                sql.as_str()
+            };
+            db.execute(warmup).unwrap();
+            let repeats = if fresh_each_time { 1 } else { samples };
+            for repeat in 0..repeats {
+                let sample = if fresh_each_time { sample } else { repeat };
+                crate::storage::reset_phases();
+                let started = std::time::Instant::now();
+                let outcome = db
+                    .execute(&sql)
+                    .unwrap_or_else(|error| panic!("{kind} {rows}: {error}"))
+                    .pop()
+                    .unwrap();
+                let wall = started.elapsed().as_micros();
+                let phases = crate::storage::take_phases();
+                let count = match &outcome {
+                    StatementResult::Delete { count }
+                    | StatementResult::Update { count }
+                    | StatementResult::Insert { count } => *count,
+                    StatementResult::Query(rows) => rows.rows.len(),
+                    StatementResult::Ok => 0,
+                };
+                let (exclusive, gap) = milestone39_gap(wall, &phases);
+                let note = if kind.starts_with("select")
+                    || kind.starts_with("insert")
+                    || kind == "join"
+                    || kind == "group"
+                {
+                    None
+                } else {
+                    Some(mutation_note())
+                };
+                println!(
+                    "milestone39 sample kind={kind} rows={rows} n={sample} count={count} wall_us={wall} exclusive_us={exclusive} gap_us={gap} parse_us={} plan_us={} undo_us={} memory_us={} memory_rest_us={} prepare_us={} validate_us={} decode_us={} heap_us={} index_us={} compare_us={} gather_us={} seal_us={} verify_us={} apply_us={} apply_rest_us={} wal_encode_us={} wal_write_us={} wal_sync_us={} db_write_us={} db_sync_us={} wal_clear_us={} presence_us={} checksum={} wal_bytes={} frames={} heap_pages={} index_pages={} other_pages={} descents={} leaf_decodes={} bulk_spans={} indexes={} allocated={} freed={} ancestor_reads={} ancestor_writes={} probe_us={} validate_rows_us={} filter_us={} discover_us={} candidates={} examined={} heap_rows={} modified={}",
+                    phases.parse.as_micros(),
+                    phases.plan.as_micros(),
+                    phases.undo.as_micros(),
+                    phases.memory.as_micros(),
+                    phases
+                        .memory
+                        .as_micros()
+                        .saturating_sub(phases.plan.as_micros())
+                        .saturating_sub(phases.undo.as_micros()),
+                    phases.prepare.as_micros(),
+                    phases.validate_ids.as_micros(),
+                    phases.decode.as_micros(),
+                    phases.heap_edit.as_micros(),
+                    phases.index_edit.as_micros(),
+                    phases.compare.as_micros(),
+                    phases.page_gather.as_micros(),
+                    phases.page_seal.as_micros(),
+                    phases.page_verify.as_micros(),
+                    phases.apply.as_micros(),
+                    phases.apply.as_micros().saturating_sub(
+                        phases.validate_ids.as_micros()
+                            + phases.decode.as_micros()
+                            + phases.heap_edit.as_micros()
+                            + phases.index_edit.as_micros()
+                            + phases.compare.as_micros()
+                            + phases.page_gather.as_micros()
+                    ),
+                    phases.wal_encode.as_micros(),
+                    phases.wal_write.as_micros(),
+                    phases.wal_sync.as_micros(),
+                    phases.db_write.as_micros(),
+                    phases.db_sync.as_micros(),
+                    phases.wal_clear.as_micros(),
+                    phases.presence_build.as_micros(),
+                    mutation_checksum(&mut db),
+                    phases.wal_bytes,
+                    phases.frames,
+                    phases.heap_pages,
+                    phases.index_pages,
+                    phases.other_pages,
+                    phases.descents,
+                    phases.leaf_decodes,
+                    phases.bulk_spans,
+                    phases.indexes_updated,
+                    phases.pages_allocated,
+                    phases.pages_freed,
+                    phases.ancestor_reads,
+                    phases.ancestor_writes,
+                    note.as_ref().map(|item| item.probe_us).unwrap_or(0),
+                    note.as_ref().map(|item| item.validate_us).unwrap_or(0),
+                    note.as_ref().map(|item| item.filter_us).unwrap_or(0),
+                    note.as_ref().map(|item| item.discover_us).unwrap_or(0),
+                    note.as_ref().map(|item| item.candidates).unwrap_or(0),
+                    note.as_ref().map(|item| item.examined).unwrap_or(0),
+                    note.as_ref().map(|item| item.heap_rows).unwrap_or(0),
+                    note.as_ref().map(|item| item.modified).unwrap_or(0)
+                );
+                walls.push(wall);
+            }
+        }
+        let mut sorted = walls.clone();
+        sorted.sort_unstable();
+        println!(
+            "milestone39 median kind={kind} rows={rows} samples={} median_us={} min_us={} max_us={}",
+            walls.len(),
+            median(&walls),
+            sorted.first().copied().unwrap_or(0),
+            sorted.last().copied().unwrap_or(0)
+        );
+    }
+
+    fn milestone39_gap(wall: u128, phases: &crate::storage::Profile) -> (u128, i128) {
+        let plan = phases.plan.as_micros();
+        let undo = phases.undo.as_micros();
+        let memory_rest = phases
+            .memory
+            .as_micros()
+            .saturating_sub(plan)
+            .saturating_sub(undo);
+        let nested = phases.validate_ids.as_micros()
+            + phases.decode.as_micros()
+            + phases.heap_edit.as_micros()
+            + phases.index_edit.as_micros()
+            + phases.compare.as_micros()
+            + phases.page_gather.as_micros();
+        let apply_rest = phases.apply.as_micros().saturating_sub(nested);
+        let exclusive = phases.parse.as_micros()
+            + plan
+            + undo
+            + memory_rest
+            + phases.prepare.as_micros()
+            + nested
+            + apply_rest
+            + phases.wal_encode.as_micros()
+            + phases.wal_write.as_micros()
+            + phases.wal_sync.as_micros()
+            + phases.db_write.as_micros()
+            + phases.db_sync.as_micros()
+            + phases.wal_clear.as_micros();
+        (exclusive, wall as i128 - exclusive as i128)
+    }
+
+    fn milestone39_sql(kind: &str, rows: i64) -> String {
+        match kind {
+            "one" => "DELETE FROM users WHERE id = 1;".to_string(),
+            "ten" => "DELETE FROM users WHERE id >= 1 AND id <= 10;".to_string(),
+            "buckets" => "DELETE FROM users WHERE bucket = 0 OR bucket = 1;".to_string(),
+            "half" => format!("DELETE FROM users WHERE id < {};", rows / 2),
+            "alternating" => "DELETE FROM users WHERE active = TRUE;".to_string(),
+            "consecutive" => format!(
+                "DELETE FROM users WHERE id >= 1 AND id < {};",
+                (rows / 4).max(1)
+            ),
+            "sparse" => "DELETE FROM users WHERE bucket IS NULL;".to_string(),
+            "all" => "DELETE FROM users WHERE TRUE OR id = 0;".to_string(),
+            "wide" => format!("DELETE FROM users WHERE name = '{}';", "w".repeat(80)),
+            "select-index" => "SELECT id, name FROM users WHERE id = 1;".to_string(),
+            "select-scan" => "SELECT id, name FROM users WHERE active = TRUE;".to_string(),
+            "update-index" => "UPDATE users SET name = 'edited' WHERE id = 1;".to_string(),
+            "update-scan" => "UPDATE users SET name = 'edited' WHERE active = TRUE;".to_string(),
+            "insert-one" => format!("INSERT INTO users VALUES ({}, 'new', TRUE, 1);", rows + 1),
+            "insert-batch" => {
+                let mut sql = String::from("INSERT INTO users VALUES ");
+                for offset in 1..=32 {
+                    if offset > 1 {
+                        sql.push(',');
+                    }
+                    let id = rows + offset;
+                    sql.push_str(&format!("({id}, 'batch', TRUE, 1)"));
+                }
+                sql.push(';');
+                sql
+            }
+            "join" => "SELECT users.id, labels.tag FROM users JOIN labels ON users.bucket = labels.bucket;".to_string(),
+            "group" => "SELECT bucket, COUNT(*) FROM users GROUP BY bucket;".to_string(),
+            _ => unreachable!(),
         }
     }
 

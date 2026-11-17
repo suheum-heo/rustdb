@@ -309,6 +309,12 @@ rustdb> exit
 - The REPL is single-threaded. Prompts are always printed, including when input is piped.
 - Result cells are printed raw, so a newline inside a text value breaks the ASCII table.
 
+## Statement profiling
+
+File mode can record stage times when a test turns the recorder on. Ordinary `cargo run` and `cargo test` leave it off, and `start` does not sample the clock in that state. The recorder is test-only. It does not change the page format or the WAL record. Nested stages are stored separately: page sealing and page verification sit inside page gathering, and page gathering sits inside publish. Summing those fields counts the inner work twice.
+
+The release profile is `cargo test --release --locked --lib profile_milestone39 -- --ignored --nocapture`. The 16 Nov 2026 run is in [docs/benchmarks.md](docs/benchmarks.md). On a 100,000-row delete of every row, sealing the dirty pages, verifying those seals, and encoding the redo log were each about 68 ms of a 306 ms statement. The log sync and the database sync together were about 11 ms. Skipping sync in the isolated non-durable arm moved that statement by about 10 ms and is not a production setting.
+
 ## Next milestone
 
-Milestone 30 should reduce the per-row cost of unlinking a deleted record and dropping its index postings. At 100,000 rows, deleting every row still spends about 1.3 seconds in that work on both the selective path and the full-image path, and the log is the same 12,275,496 bytes. A no-match `DELETE` still decodes every stored row. `INSERT` still snapshots the table. A range, `OR`, or `IS NULL` still scans. A third table, `RIGHT JOIN`, `FULL JOIN`, window functions, arithmetic, and subqueries stay out of scope.
+Milestone 40 should drop the second full-page checksum in `Editor::finish`. `page::seal` already writes the checksum, and `page::verify` copies the page and checksums it again before the structural checks. On the measured 100,000-row delete-all those two calls took the same time, about 68 ms each. The structural checks stay. `page::verify` stays on open, recovery, and migration. The check is the same `profile_milestone39` delete-all, with the same WAL bytes and the same page checksums. The expected saving is about 60–68 ms on that 306 ms statement. That range is an estimate from the existing verify timer, not a result of removing the call.
