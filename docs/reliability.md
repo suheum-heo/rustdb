@@ -5,7 +5,7 @@ This document describes the durability contract the current file engine implemen
 ## Storage invariants
 
 - A database page is 4096 bytes. Heap, catalog, and index-catalog pages are slotted. A cell offset and length are checked before the bytes are read. A free slot is offset 0 and length 0.
-- The page checksum is CRC-32 over the page with the checksum field cleared. `verify` rejects a mismatch, an unexpected page id, an unknown page type, and a slot directory that overlaps or runs past the page.
+- The page checksum is CRC-32/ISO-HDLC over all 4096 bytes, with bytes 8..12 treated as zero. The stored value occupies those four bytes. `verify` rejects a mismatch, then checks the page id, flags, the reserved halfword, the page type, a slotted directory that overlaps or runs past the page, and the index-node header. Heap cell bytes, free-list ids, and separator keys are covered by that checksum. They are not walked again as structure. A page the editor just sealed skips the second checksum and still runs those structural checks. File reads, open, recovery, and migration keep the checksum. A bit flipped after the seal is not treated as a fresh seal.
 - A stored value is `NULL`, `INTEGER`, `TEXT`, or `BOOLEAN`. A ratio is a query result and is not encoded. Text is a length plus UTF-8. A bad tag, a truncated buffer, or a length that does not land on the end of the record is an error.
 - A row must fit in one cell, at most 4068 bytes. The encoder returns that error instead of writing a partial cell.
 - An integer B+ tree stores `(key, row id)` pairs in strictly increasing order. Duplicate keys keep every row id. `validate` checks leaf sibling links in both directions. A zero page written over a node fails that check.

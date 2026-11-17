@@ -24487,6 +24487,129 @@ mod tests {
     }
 
     #[test]
+    fn fresh_seal_matches_full_recheck_and_keeps_recovery() {
+        let (_dir, base) = seed_delete_db("m40-agree", 400, 0x4000);
+        for sql in [
+            "DELETE FROM users WHERE id = 1;",
+            "DELETE FROM users WHERE id >= 1 AND id <= 10;",
+            "DELETE FROM users WHERE bucket = 0 OR bucket = 1;",
+            "DELETE FROM users WHERE TRUE OR id = 0;",
+            "UPDATE users SET name = 'edited' WHERE id = 2;",
+            "UPDATE users SET name = 'edited' WHERE active = TRUE;",
+            "INSERT INTO users VALUES (401, 'added', TRUE, 1);",
+        ] {
+            let (_fresh_dir, fresh_path, mut fresh) = open_copy(&base, "m40-fresh");
+            let (_full_dir, full_path, mut full) = open_copy(&base, "m40-full");
+            let _phases = crate::storage::enable_phases();
+            crate::storage::reset_phases();
+            let fresh_result = fresh.execute(sql).unwrap();
+            let fresh_phases = crate::storage::take_phases();
+            crate::storage::reset_phases();
+            let full_result = {
+                let _recheck = crate::storage::ForceChecksumRecheck::new();
+                full.execute(sql).unwrap()
+            };
+            let full_phases = crate::storage::take_phases();
+            assert_eq!(fresh_result, full_result, "{sql}");
+            assert_eq!(db_file(&fresh_path), db_file(&full_path), "{sql}");
+            assert_eq!(
+                mutation_checksum(&mut fresh),
+                mutation_checksum(&mut full),
+                "{sql}"
+            );
+            assert_eq!(
+                fresh.table("users").unwrap().row_ids(),
+                full.table("users").unwrap().row_ids(),
+                "{sql}"
+            );
+            assert_eq!(
+                fresh.table("users").unwrap().next_row_id(),
+                full.table("users").unwrap().next_row_id(),
+                "{sql}"
+            );
+            assert_eq!(table_rows(&mut fresh), table_rows(&mut full), "{sql}");
+            assert_eq!(
+                index_postings(&mut fresh, "idx_users_id"),
+                index_postings(&mut full, "idx_users_id"),
+                "{sql}"
+            );
+            assert_eq!(
+                index_postings(&mut fresh, "idx_users_bucket"),
+                index_postings(&mut full, "idx_users_bucket"),
+                "{sql}"
+            );
+            assert_eq!(fresh_phases.wal_bytes, full_phases.wal_bytes, "{sql}");
+            assert_eq!(fresh_phases.frames, full_phases.frames, "{sql}");
+            assert_eq!(fresh_phases.heap_pages, full_phases.heap_pages, "{sql}");
+            assert_eq!(fresh_phases.index_pages, full_phases.index_pages, "{sql}");
+            assert_eq!(fresh_phases.other_pages, full_phases.other_pages, "{sql}");
+            assert_eq!(
+                fresh_phases.page_recheck,
+                std::time::Duration::ZERO,
+                "{sql}"
+            );
+            assert!(
+                full_phases.page_recheck > std::time::Duration::ZERO,
+                "{sql}"
+            );
+            assert_eq!(wal_len(&fresh_path), 0, "{sql}");
+            assert_eq!(wal_len(&full_path), 0, "{sql}");
+            drop(fresh);
+            drop(full);
+            let mut reopened = Database::open(&fresh_path).unwrap();
+            let mut full_open = Database::open(&full_path).unwrap();
+            assert_eq!(
+                mutation_checksum(&mut reopened),
+                mutation_checksum(&mut full_open),
+                "{sql}"
+            );
+            drop(reopened);
+            let again = Database::open(&fresh_path).unwrap();
+            assert_eq!(db_file(&fresh_path), db_file(&full_path), "{sql}");
+            drop(again);
+        }
+        let delete_sql = "DELETE FROM users WHERE bucket = 0 OR bucket = 1;";
+        let wal_of = |label: &str, recheck: bool| -> Vec<u8> {
+            let (_dir, path, mut db) = open_copy(&base, label);
+            db.set_inject(crate::storage::Inject::AfterLogSync);
+            let error = if recheck {
+                let _recheck = crate::storage::ForceChecksumRecheck::new();
+                db.execute(delete_sql)
+            } else {
+                db.execute(delete_sql)
+            };
+            assert!(error.is_err(), "{label}");
+            let bytes = wal_bytes(&path);
+            assert!(bytes.len() > 32, "{label} {}", bytes.len());
+            bytes
+        };
+        assert_eq!(wal_of("m40-wal-fresh", false), wal_of("m40-wal-full", true));
+        assert_precommit(
+            &base,
+            "m40-pre",
+            delete_sql,
+            crate::storage::Inject::BeforeLogSync,
+        );
+        for inject in [
+            crate::storage::Inject::AfterLogSync,
+            crate::storage::Inject::CommitSyncFailed,
+            crate::storage::Inject::DuringCheckpoint(1),
+        ] {
+            assert_postcommit(&base, &format!("m40-post-{inject:?}"), delete_sql, inject);
+        }
+        let (_disk_dir, disk_path) = seed_delete_db("m40-disk", 40, 0x4001);
+        let mut bytes = std::fs::read(&disk_path).unwrap();
+        assert!(bytes.len() > 5_000, "{}", bytes.len());
+        bytes[5_000] ^= 0xff;
+        std::fs::write(&disk_path, &bytes).unwrap();
+        let error = match Database::open(&disk_path) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a flipped database byte opened"),
+        };
+        assert!(error.contains("corrupt"), "{error}");
+    }
+
+    #[test]
     #[ignore = "release profile of end-to-end statement stages"]
     fn profile_milestone39() {
         let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
@@ -24817,6 +24940,104 @@ mod tests {
             "group" => "SELECT bucket, COUNT(*) FROM users GROUP BY bucket;".to_string(),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    #[ignore = "release profile of fresh-seal validation"]
+    fn profile_milestone40() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let os = profile_command("uname", &["-smr"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone40 cpu={cpu} mem_bytes={mem} os={os} rustc={rustc} build=release-test seed=0x3100 warmup=1"
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [100_i64, 1_000, 10_000, 100_000] {
+            let (_base_dir, base) = seed_delete_db("m40-base", rows, 0x3100);
+            let samples = if rows >= 10_000 { 3 } else { 1 };
+            for kind in [
+                "one",
+                "ten",
+                "buckets",
+                "half",
+                "alternating",
+                "consecutive",
+                "sparse",
+                "all",
+                "wide",
+                "update-index",
+                "update-scan",
+                "insert-one",
+            ] {
+                milestone40_pair(&base, rows, kind, samples);
+            }
+        }
+    }
+
+    fn milestone40_pair(base: &std::path::Path, rows: i64, kind: &str, samples: usize) {
+        let sql = milestone39_sql(kind, rows);
+        let mut fresh_walls = Vec::new();
+        let mut full_walls = Vec::new();
+        for sample in 0..samples {
+            let fresh_first = sample % 2 == 0;
+            let run = |label: &str, recheck: bool| -> (u128, u64, u32, i64) {
+                let (_dir, _, mut db) = open_copy(base, &format!("m40-{label}-{sample}"));
+                db.execute("SELECT COUNT(*) FROM users;").unwrap();
+                crate::storage::reset_phases();
+                let started = std::time::Instant::now();
+                let count = if recheck {
+                    let _guard = crate::storage::ForceChecksumRecheck::new();
+                    db.execute(&sql).unwrap().pop().unwrap()
+                } else {
+                    db.execute(&sql).unwrap().pop().unwrap()
+                };
+                let wall = started.elapsed().as_micros();
+                let phases = crate::storage::take_phases();
+                let checksum = mutation_checksum(&mut db);
+                println!(
+                    "milestone40 sample kind={kind} rows={rows} n={sample} mode={} wall_us={wall} gather_us={} seal_us={} structure_us={} recheck_us={} wal_encode_us={} wal_write_us={} wal_sync_us={} db_sync_us={} wal_bytes={} frames={} scratch_bytes={} checksum={checksum} count={count:?}",
+                    if recheck { "full" } else { "fresh" },
+                    phases.page_gather.as_micros(),
+                    phases.page_seal.as_micros(),
+                    phases.page_verify.as_micros(),
+                    phases.page_recheck.as_micros(),
+                    phases.wal_encode.as_micros(),
+                    phases.wal_write.as_micros(),
+                    phases.wal_sync.as_micros(),
+                    phases.db_sync.as_micros(),
+                    phases.wal_bytes,
+                    phases.frames,
+                    phases.scratch_bytes
+                );
+                if recheck {
+                    assert!(phases.page_recheck > std::time::Duration::ZERO);
+                } else {
+                    assert_eq!(phases.page_recheck, std::time::Duration::ZERO);
+                }
+                (wall, phases.wal_bytes, phases.frames, checksum)
+            };
+            let (fresh, full) = if fresh_first {
+                (run("fresh", false), run("full", true))
+            } else {
+                let full = run("full", true);
+                (run("fresh", false), full)
+            };
+            assert_eq!(fresh.1, full.1, "{kind} rows={rows} wal");
+            assert_eq!(fresh.2, full.2, "{kind} rows={rows} frames");
+            assert_eq!(fresh.3, full.3, "{kind} rows={rows} checksum");
+            fresh_walls.push(fresh.0);
+            full_walls.push(full.0);
+        }
+        println!(
+            "milestone40 median kind={kind} rows={rows} samples={samples} fresh_us={} full_us={} fresh_min_us={} fresh_max_us={} full_min_us={} full_max_us={}",
+            median(&fresh_walls),
+            median(&full_walls),
+            fresh_walls.iter().min().copied().unwrap_or(0),
+            fresh_walls.iter().max().copied().unwrap_or(0),
+            full_walls.iter().min().copied().unwrap_or(0),
+            full_walls.iter().max().copied().unwrap_or(0)
+        );
     }
 
     #[test]

@@ -299,6 +299,28 @@ fn a_partial_wal_frame_is_not_committed_and_a_bad_length_is_damaged() {
 }
 
 #[test]
+fn a_wal_frame_payload_is_not_trusted_when_its_page_checksum_is_wrong() {
+    let mut page = Page::new();
+    page::init_slotted(&mut page, page::TYPE_HEAP, 2);
+    page::insert_cell(&mut page, b"row").unwrap();
+    page::seal(&mut page);
+    page.as_mut_slice()[page::PAGE_SIZE - 1] ^= 0xff;
+    let bytes = wal::encode_committed(&wal::Plan {
+        nonce: 1,
+        base_commit: 0,
+        frames: &[(2, page)],
+    })
+    .unwrap();
+    assert!(matches!(wal::classify_log(&bytes), LogClass::Damaged));
+    let mut recovered = Page::new();
+    recovered
+        .as_mut_slice()
+        .copy_from_slice(&bytes[68..68 + PAGE_SIZE]);
+    assert!(page::verify(&recovered, 2).is_err());
+    assert!(page::validate_fresh_seal(&recovered, 2).is_ok());
+}
+
+#[test]
 fn a_reduced_fanout_tree_splits_an_internal_node_and_keeps_duplicate_keys() {
     // leaf_max 4 is not the on-disk fanout. Production leaf splits are covered
     // by the store tests that insert 255 keys.

@@ -989,9 +989,16 @@ impl Editor {
                 let _seal = profile::Timer::new(|profile| &mut profile.page_seal);
                 page::seal(page);
             }
+            // `page` is the only reference to this image. `seal` just stored
+            // the checksum of these bytes. The structural checks below still
+            // run. A test can force the old checksum between the two.
+            if page::checksum_recheck_forced() {
+                let _recheck = profile::Timer::new(|profile| &mut profile.page_recheck);
+                page::recheck_checksum(page, id)?;
+            }
             {
                 let _verify = profile::Timer::new(|profile| &mut profile.page_verify);
-                page::verify(page, id)?;
+                page::validate_fresh_seal(page, id)?;
             }
         }
         Ok(())

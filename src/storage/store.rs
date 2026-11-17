@@ -1718,6 +1718,32 @@ mod tests {
     }
 
     #[test]
+    fn a_recovered_page_with_corrupt_bytes_is_not_installed() {
+        let file = TempPath::new();
+        {
+            let (store, _) = Store::open(file.path()).unwrap();
+            drop(store);
+        }
+        let before = fs::read(file.path()).unwrap();
+        let meta = read_meta(file.path());
+        let mut page = Page::new();
+        page.as_mut_slice().copy_from_slice(&before[..PAGE_SIZE]);
+        page.as_mut_slice()[PAGE_SIZE - 1] ^= 0xff;
+        let log = wal::encode_committed(&wal::Plan {
+            nonce: meta.nonce,
+            base_commit: meta.commit_id,
+            frames: &[(0, page)],
+        })
+        .unwrap();
+        let wal_path = wal::path_for(file.path());
+        fs::write(&wal_path, &log).unwrap();
+        let error = Store::open(file.path()).unwrap_err();
+        assert!(error.to_string().contains("corrupt"), "{error}");
+        assert_eq!(fs::read(file.path()).unwrap(), before);
+        assert!(fs::metadata(&wal_path).unwrap().len() > 0);
+    }
+
+    #[test]
     fn a_recovered_heap_insert_keeps_the_matching_index_entry() {
         let visible = [
             Inject::CommitSyncFailed,
