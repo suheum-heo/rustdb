@@ -2027,3 +2027,68 @@ is not a physical power-loss test.
 Decision: merge. Page/WAL formats are unchanged, as are the rejected experiments.
 The next small candidate is the temporary raw-byte copy before heap decoding;
 its statement-level benefit has not yet been established.
+
+## Milestone 47: borrowed heap-record bytes — not adopted
+
+17 Nov 2026, Apple M5, starting at M46 merge `0ac7115`. A fresh M39 profile
+measured delete-all at 80,022 µs, including 9,422 µs of record decoding and
+22,283 µs of index editing. The experiment removed the temporary raw-cell
+`Vec<u8>` before the existing owned record decoder in comparison, old-value,
+and link reads. The same decoder and error mapping ran; no borrowed value
+survived a page edit. Test-only `ForceRecordCopy` restored the byte copy.
+
+`profile_milestone47` compared fresh database copies, alternating arm order,
+one read warmup, seed `0x3100`, with all durable syncs enabled. Two passes used
+five samples per arm at 10,000 and 100,000 rows. A third pass used fifteen via
+`RUSTDB_PROFILE_SAMPLES=15` to investigate the smaller-workload timing concern.
+Each pass also covered indexed update, insert, half delete, and bucket delete.
+The profile labels `single` and `repeated` mean borrowed and copied bytes here.
+
+Statement medians in microseconds:
+
+| workload | pass | borrowed | copied | observation |
+| --- | --- | ---: | ---: | --- |
+| 100,000-row delete-all | 1 | 79,878 | 81,958 | ranges overlap |
+| 100,000-row delete-all | 2 | 79,746 | 81,937 | ranges overlap |
+| 100,000-row delete-all | 3 | 79,124 | 81,389 | 14/15 pairs faster; ranges overlap |
+| 100,000-row bucket delete | 1 | 70,553 | 72,889 | ranges disjoint |
+| 100,000-row bucket delete | 2 | 71,351 | 73,548 | ranges overlap narrowly |
+| 100,000-row bucket delete | 3 | 71,609 | 73,408 | 15/15 pairs faster |
+| update 5,000 of 10,000 rows | 1 | 24,313 | 23,564 | borrowed median slower |
+| update 5,000 of 10,000 rows | 2 | 24,147 | 24,156 | effectively equal |
+| update 5,000 of 10,000 rows | 3 | 23,582 | 22,614 | borrowed slower in 13/15 pairs |
+
+The large-delete benefit is real evidence, not simply fewer allocations:
+pass 3 paired median savings were 2,224 µs for all and 2,096 µs for buckets.
+However, the smaller update's pass 3 paired median difference was -972 µs.
+Its median WAL sync was 4,165 versus 3,559 µs; apply-rest was 9,041 versus
+9,128 µs. Much of the wall-time difference therefore appears in sync timing,
+not extra decode CPU. These measurements cannot establish that borrowing itself
+causes the slowdown, but neither do they justify dismissing the tradeoff.
+No improvement is claimed for small statements. Delete-all retained
+12,168,896 WAL bytes / 2,968 frames / checksum 0 throughout.
+
+Experimental formatting, strict Clippy, all-target build, full suite
+(610 passed, 0 failed, 41 ignored, including one doctest), and all 17 storage
+reliability tests with `PROPTEST_CASES=256` passed. Update and delete comparisons
+covered database/WAL bytes, IDs, indexes, relocation, no-op/no-match, NULL and
+duplicate keys, rollback, recovery, sync ambiguity, partial checkpoint, fencing,
+and repeated reopen. The final change after that full suite only made the
+ignored benchmark sample count configurable; Clippy and the release profile
+passed again. These are injected faults, not physical power-loss tests.
+
+Decision: do not adopt this experiment in production. Its modest large-workload
+benefit comes with an unresolved smaller-update wall-time concern. This is not
+a claim that the optimization is incorrect or never worthwhile. Production
+remains M46; this milestone commits only this report. The full implementation
+and tests are preserved locally on `experiment/milestone-47-borrowed-records`,
+commit `aa58aa32ecbe7bfc782f57ac96891149f5a54b8e`, not pushed or merged.
+Patch and raw logs are archived at
+`/private/tmp/rustdb-milestone-47-backup-20261117-uGmx6T`.
+Patch SHA-256: `56be13c59eef3164d683a8b0883da86a0c7c29a923ebcc17088fc5c4540b0024`.
+
+This engineering pass stops after the two accepted improvements and this
+measured tradeoff. Further work should resolve the small-update sync interaction
+or independently profile the remaining index-edit/full-image INSERT costs
+before introducing another optimization. Existing M37/M38/M41/M44 archives and
+rejections remain intact; no page/WAL format or recovery guarantee changed.
