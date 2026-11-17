@@ -1977,3 +1977,53 @@ corrected to supported constant assignment before the targeted tests passed.
 Decision: merge. The next candidate is repeated whole-vector free-list sorting
 on page release; it has not been optimized in this milestone. Rejected M37,
 M38, M41, and M44 implementations remain absent.
+
+## Milestone 46: maintain sorted free-page IDs by insertion
+
+17 Nov 2026, Apple M5, starting at M45 merge `2104d04`. The M43-style
+profile attributed about 6 ms of delete-all to heap edits and 30 ms to index
+edits. Both paths release pages through `free_page`, which appended an ID,
+sorted the whole free vector, and deduplicated it on every release.
+
+Open already validates unique free IDs and sorts them; relayout sorts and
+deduplicates its output; allocation pops the largest ID. Binary search and
+insertion therefore preserve the exact list after every release, including
+repeated IDs, without sorting the existing prefix again. The free-page image,
+dirty-page check, relayout, allocation order, and durability path are unchanged.
+Insertion can still move O(n) IDs; this is not a claim of constant-time release.
+There is no additional persistent or temporary index of free IDs.
+
+`profile_milestone46` compares this path with test-only `ForceFreeListSort`.
+Fresh copies, read warmup, alternating arm order, five durable samples per arm
+at 10,000/100,000 rows and one at 1,000, nine deletion patterns, seed `0x3100`.
+Two isolated release passes measured 100,000-row delete-all in microseconds:
+
+| pass | insertion median | range | whole sort median | range |
+| --- | ---: | --- | ---: | --- |
+| 1 | 82,292 | 80,953–85,406 | 94,451 | 93,724–95,807 |
+| 2 | 82,221 | 81,797–82,794 | 94,134 | 89,577–95,375 |
+
+Delete-all improves 12.7–12.9%, with non-overlapping ranges in both passes.
+Pass 1 median heap editing is 1,286 versus 5,952 µs, and index editing is
+22,875 versus 29,692 µs. Decode, seal, and WAL CRC are essentially unchanged.
+The log stays 12,168,896 bytes / 2,968 frames, result checksum 0. Half-table
+medians improve from 70,761 to 67,079 µs and 70,289 to 67,022 µs, but pass 1
+ranges overlap. Other workloads generally overlap; no broad improvement claim
+is based on those. The measured benefit is not a WAL-size reduction.
+
+Validation: formatting, strict Clippy, all-target build, full suite 607 passed,
+0 failed, 40 ignored, including one doctest. All 17 storage reliability tests
+pass with `PROPTEST_CASES=256`; both new free-list tests pass separately with
+`PROPTEST_CASES=512`. A BTreeSet reference checks randomized release/reallocate
+sequences; descending and duplicate releases cover 8,192 IDs. Differential SQL
+checks exact database/WAL bytes, results, IDs, indexes, and delete/insert/relocate
+reuse sequences. A 1,100-row fixture with 3,000-byte values crosses inline
+free-list capacity, deletes, reinserts 1,050 wide rows, deletes again, and
+reopens each step. Partial-checkpoint recovery also matches across the overflow
+case. The four-workload two-mode matrix retains pre-sync rollback, post-sync
+recovery, commit-sync ambiguity, fencing, and repeated reopen. Fault injection
+is not a physical power-loss test.
+
+Decision: merge. Page/WAL formats are unchanged, as are the rejected experiments.
+The next small candidate is the temporary raw-byte copy before heap decoding;
+its statement-level benefit has not yet been established.
