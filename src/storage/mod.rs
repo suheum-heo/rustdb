@@ -29,7 +29,7 @@ pub(crate) use btree::ForceLatePresence;
 #[cfg(test)]
 pub(crate) use btree::ForcePriorPlan;
 #[cfg(test)]
-pub(crate) use edit::ForcePerRowUnlink;
+pub(crate) use edit::{ForceDoomedHeapPatches, ForcePerRowUnlink};
 #[cfg(test)]
 pub(crate) use page::{
     ForceBitwiseCrc, ForceChecksumRecheck, TYPE_HEAP, init_slotted, insert_cell, seal,

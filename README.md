@@ -313,7 +313,7 @@ rustdb> exit
 
 File mode can record stage times when a test turns the recorder on. Ordinary `cargo run` and `cargo test` leave it off, and `start` does not sample the clock in that state. The recorder is test-only. It does not change the page format or the WAL record. Nested stages are stored separately: page sealing and page structure checks sit inside page gathering, and page gathering sits inside publish. Summing those fields counts the inner work twice. The second checksum of a page the editor just sealed is recorded only when a test forces that recheck. A production commit leaves that timer at zero.
 
-The release profiles are `profile_milestone39`, `profile_milestone40`, and `profile_milestone42`: `cargo test --release --locked --lib profile_milestone42 -- --ignored --nocapture`. The 16 Nov 2026 runs are in [docs/benchmarks.md](docs/benchmarks.md). On a 100,000-row delete of every row, sealing the dirty pages and the redo-log trailer checksum are about 5 ms each with the slicing-by-8 checksum. The bitwise reference still takes about 67 ms for each of those stages. The structural check of those pages is under a tenth of a millisecond. The log sync and the database sync together are about 11 ms. Skipping sync in the isolated non-durable arm moved that statement by about 10 ms and is not a production setting.
+The release profiles are `profile_milestone39`, `profile_milestone40`, `profile_milestone42`, and `profile_milestone43`: `cargo test --release --locked --lib profile_milestone43 -- --ignored --nocapture`. The 16 Nov 2026 runs are in [docs/benchmarks.md](docs/benchmarks.md). On a 100,000-row delete of every row, sealing and the trailer checksum are about 5 ms each. Index maintenance is about 30 ms. Heap unlinking of pages that are then freed is about 6 ms. The log sync and the database sync together are about 11 ms.
 
 ## Commit-time page checks
 
@@ -325,6 +325,10 @@ Page seals and the redo-log trailer use CRC-32/ISO-HDLC. The reflected polynomia
 
 The implementation folds eight input bytes through tables generated from that polynomial, then finishes a short tail one byte at a time. A test can force the original bit loop. The two paths produce the same checksum on the known answers, on deterministic buffers, and on the sealed pages and logs in the benchmark notes. Recovery recomputes the checksum from the bytes on disk. ARM CRC32 and SSE4.2 CRC32 instructions use a different polynomial and are not used. There is no migration and no new page or log field.
 
+## Heap unlink
+
+A delete removes the matched rows in one pass. A page that still holds a surviving row is patched so that row's heap links skip the deleted cells. A page that loses every row is not patched. The commit replaces that page with the free-page image, which is the same image the old per-cell patches produced after the page was freed. A test can force those discarded patches. The redo-log record is still the dirty page images. `sync_all` is unchanged.
+
 ## Next milestone
 
-Milestone 43 should name the remaining time in a large delete now that the checksum is about 5 ms. On the 100,000-row delete-all the statement median fell from about 235–249 ms to about 114–120 ms. Seal and the trailer CRC are no longer the large terms. Milestone 39 put index maintenance near 31 ms and the heap unlink near 19 ms on that statement. Accept a change there only when the log bytes stay identical and the statement time falls outside the spread of the current copies. Leave `sync_all` in place. Delete-all still logs 2,967 freed non-index pages, and sealing that set is now about 5 ms.
+Milestone 44 should look at the index rebuild on a large delete. After the checksum and the discarded heap patches, a 100,000-row delete-all is about 97–104 ms. Index maintenance is still about 30 ms, and most of that is decoding the same leaves again while the bulk rebuild checks and rewrites the tree. Accept a change only when the log bytes stay identical and the statement time falls outside the spread of the current copies. Leave `sync_all` in place.

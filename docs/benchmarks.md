@@ -1818,3 +1818,65 @@ The delete-all median gap is 128.9 ms. The slowest slicing-by-8 copy, 133,784 µ
 At 10,000 rows the delete-all medians were 19,207 µs versus 32,026 µs on pass 1 and 20,087 µs versus 33,192 µs on pass 2. Those ranges do not overlap. At 100 and 1,000 rows the statement is still mostly `sync_all`, and the two arms differ by about 1–2 ms.
 
 The persisted checksum matches the bit loop. The large deletes move by about the old checksum time, outside the spread of the copies. Small statements stay in the sync-dominated band. Milestone 41's folded checksum remains rejected. The Milestone 40 rule still applies: a page the editor just sealed is not checksummed a second time, and open, recovery, and migration still recompute the CRC.
+
+## Milestone 43 doomed-page heap patches
+
+16 Nov 2026, 11:52–11:57 PM CST, Apple M5, 17,179,869,184 bytes of memory, Darwin 25.2.0 arm64, rustc 1.100.0 (`0ef1bc386 2026-11-09`). The checksum is the Milestone 42 slicing-by-8 CRC. `profile_milestone43` uses seed `0x3100` and fresh copies. `freed` skips link patches on a heap page that this batch replaces with a free-page image. `patched` is the Milestone 42 batch, which still writes those links and then frees the page. Sample index alternates which arm runs first. At 10,000 and 100,000 rows each statement is three copies. At 1,000 rows it is one copy. This is not a power-loss test.
+
+### Stage split before the heap change
+
+One 100,000-row delete-all on the Milestone 42 path, wall 106,067 µs. Nested stages are not added to their parents. The exclusive sum leaves a 4,526 µs gap.
+
+| stage | µs |
+| --- | ---: |
+| index mutation after the presence check | 26,447 |
+| heap unlink | 18,411 |
+| decode of removed rows | 9,650 |
+| undo journal | 6,380 |
+| trailer CRC | 5,038 |
+| page seal | 4,786 |
+| log sync | 5,357 |
+| database write | 4,731 |
+| deleted-id check | 4,381 |
+| log truncate | 3,916 |
+| database sync | 3,278 |
+| presence-map build | 1,867 |
+| presence-map lookup | 1,941 |
+| candidate filter | 1,112 |
+
+Index maintenance is the largest named stage, about 30 ms including the presence map. The heap unlink is the next CPU stage that the free-page rewrite can avoid. Leaf decodes were 8,440, bulk spans 2, and the log was 12,168,896 bytes with 2,968 frames. The result checksum was 0. Dirty pages were 0 heap, 1 index, and 2,967 other.
+
+### Comparison
+
+Both arms of every copy wrote the same log length, frame count, dirty-page counts, and result checksum. The 100,000-row delete-all stayed at 12,168,896 bytes, 2,968 frames, and checksum 0.
+
+| pass | kind | freed | freed range | patched | patched range |
+| --- | --- | ---: | --- | ---: | --- |
+| 1 | all | 96,817 | 93,744–101,293 | 105,770 | 105,291–114,764 |
+| 2 | all | 103,732 | 100,196–108,180 | 116,474 | 114,604–117,946 |
+| 1 | half | 72,032 | 70,511–75,113 | 76,674 | 76,234–79,194 |
+| 2 | half | 72,938 | 70,684–73,811 | 78,354 | 77,660–82,005 |
+
+Those four ranges do not overlap. On the first delete-all copy the heap stage was 5,944 µs versus 18,555 µs. On the second pass it was 6,518 µs versus 19,437 µs. Index maintenance stayed near 30 ms on both arms. Half-table heap time on the second pass was 10,969 µs versus 16,913 µs, with the same 7,101,296-byte log.
+
+Buckets, alternating, sparse, and the one-row delete stay inside overlapping ranges. A ten-row delete is about 1 ms apart and is still dominated by `sync_all`. The page format and the WAL record are unchanged.
+
+### Independent M43 closeout, 17 Nov 2026
+
+The final isolated release rerun used the same profile and alternating arm order.
+At 100,000 rows, delete-all was 94,964 µs (94,664–96,401) versus
+107,680 µs (106,388–108,242); half-table was 71,049 µs
+(70,125–71,322) versus 79,051 µs (77,251–79,761). The ranges do not
+ overlap. One-row, bucket, alternating, sparse, and wide-delete ranges overlap.
+An earlier rerun overlapped concurrent validation and had noisy storage times;
+it is not used as the acceptance measurement. The isolated delete-all kept
+12,168,896 WAL bytes, 2,968 frames, and result checksum 0.
+
+Review added a four-workload, two-implementation recovery matrix: half-table,
+alternating rows, buckets, and delete-all. WAL bytes match exactly. Before-log-sync
+rollback, after-log-sync recovery, failed commit sync, and partial checkpoint
+recovery pass, including fencing, both indexes, page checksums, and repeated open.
+Formatting, strict Clippy, all-target build, and the full test suite passed:
+600 passed, 0 failed, 38 ignored, including one doctest. A separate
+PROPTEST_CASES=256 storage reliability run passed all 17 tests. These injected
+faults are not a physical power-loss test.
