@@ -135,6 +135,16 @@ pub(crate) struct Profile {
     /// Plans discarded because a rebuild, merge, or root change moved pages.
     #[cfg_attr(not(test), allow(dead_code))]
     pub path_invalidations: u64,
+    /// Ancestor pages decoded while a non-underflow rewrite checks the path.
+    /// This includes the leftmost spine of each ancestor. It is not WAL I/O.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub ancestor_reads: u64,
+    /// Ancestor pages sealed by a non-underflow rewrite.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub ancestor_writes: u64,
+    /// Separator keys changed by that rewrite.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub separator_updates: u64,
 }
 
 #[cfg(test)]
@@ -191,6 +201,9 @@ thread_local! {
         path_record: Duration::ZERO,
         reused_paths: 0,
         path_invalidations: 0,
+        ancestor_reads: 0,
+        ancestor_writes: 0,
+        separator_updates: 0,
     }) };
 }
 
@@ -265,6 +278,18 @@ pub(crate) fn note_reused_path() {
 
 pub(crate) fn note_path_invalidation() {
     note_u64(|profile| &mut profile.path_invalidations, 1);
+}
+
+pub(crate) fn note_ancestor_read() {
+    note_u64(|profile| &mut profile.ancestor_reads, 1);
+}
+
+pub(crate) fn note_ancestor_write() {
+    note_u64(|profile| &mut profile.ancestor_writes, 1);
+}
+
+pub(crate) fn note_separator_update() {
+    note_u64(|profile| &mut profile.separator_updates, 1);
 }
 
 pub(crate) fn note_descent() {
