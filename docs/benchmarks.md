@@ -1880,3 +1880,53 @@ Formatting, strict Clippy, all-target build, and the full test suite passed:
 600 passed, 0 failed, 38 ignored, including one doctest. A separate
 PROPTEST_CASES=256 storage reliability run passed all 17 tests. These injected
 faults are not a physical power-loss test.
+
+## Milestone 44: retained validation leaves — rejected
+
+17 Nov 2026, same Apple M5 environment as the M43 closeout. The production
+baseline is the M43 merge `2514ff6`. Structural validation decoded each leaf
+in its recursive walk and again in its sibling-link pass. The experiment
+retained the first decoded leaf until the link pass, with no cache surviving
+validation and no writes during that interval. All occupancy, separator,
+ordering, ownership, and sibling-link checks remained. A test-only guard
+restored the second read and decode.
+
+Two sequential release runs compared fresh database copies with alternating
+arm order: five samples per arm at 10,000 and 100,000 rows, one at 1,000.
+The workload matrix covered one row, ten rows, buckets, half, alternating,
+consecutive, sparse, all, and wide deletes. All syncs remained enabled.
+
+100,000-row statement times in microseconds:
+
+| pass | workload | retained median | retained range | M43 median | M43 range |
+| --- | --- | ---: | --- | ---: | --- |
+| 1 | all | 94,213 | 92,849–95,845 | 93,751 | 92,198–95,233 |
+| 2 | all | 95,533 | 92,937–100,940 | 97,144 | 95,631–98,425 |
+| 1 | half | 70,475 | 68,747–74,903 | 70,525 | 70,106–72,725 |
+| 2 | half | 70,524 | 69,755–72,644 | 72,835 | 69,133–76,342 |
+
+All nine 100,000-row workload ranges overlap in both passes. Delete-all leaf
+decodes fall from 8,440 to 6,399, but median index time moves only from
+29,520 to 29,135 µs in pass 1 and 30,376 to 30,190 µs in pass 2.
+Delete-all WAL stays 12,168,896 bytes, 2,968 frames, result checksum 0.
+The existing scratch counter does not include the new retained leaf vectors;
+this experiment adds temporary memory and allocation lifetime, so its unchanged
+scratch counter is not evidence of unchanged peak memory.
+
+Formatting, strict Clippy, all-target build, and the full experimental suite
+passed: 603 passed, 0 failed, 39 ignored, including one doctest. All 17 storage
+reliability tests passed separately with PROPTEST_CASES=256. Differential tests
+compared database bytes, WAL bytes, row IDs, both indexes, and reopening. Both
+arms passed pre-sync rollback, post-sync recovery, failed commit sync, partial
+checkpoint recovery, fencing, repeated reopening, preexisting B+ tree corruption,
+and reconstruction allocation/write/free fault tests. These are injected faults,
+not physical power-loss tests.
+
+Decision: do not merge the implementation. Fewer decodes did not demonstrate a
+repeatable end-to-end benefit. This rejects this validation-retention variant,
+not every possible bulk-tree optimization. Production remains M43. The full
+experiment is preserved locally on `experiment/milestone-44-leaf-retention`,
+commit `e3ab50b09dc21f84541b156a4e2c37e17d6af161`; it is not pushed or merged.
+The archived patch SHA-256 is
+`a30df9bd4a7e6442dbd3bb5cead2bb3bc8d3491893dc1490cf96782185887846`.
+Only this measurement and rejection note belongs in the M44 pull request.
