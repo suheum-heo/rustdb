@@ -285,13 +285,23 @@ impl Store {
         ordered.sort_by(|left, right| left.name.cmp(&right.name));
         validate(&ordered).map_err(StepError::BeforeCommit)?;
         let prepare = profile::start();
-        let owned: Vec<TableImage> = ordered.into_iter().cloned().collect();
+        // The editor reads these images synchronously and retains no references
+        // in Prepared. Validation and table ordering already happened above.
+        // Keep the former deep copy only for differential tests.
+        let owned;
+        if copy_publish_images_forced() {
+            owned = ordered
+                .iter()
+                .map(|image| (**image).clone())
+                .collect::<Vec<_>>();
+            ordered = owned.iter().collect();
+        }
         profile::add_prepare(prepare);
         let base_commit = self.state.commit_id;
         let nonce = self.state.nonce;
         let apply_mark = profile::start();
         let prepared = Editor::new(self.state.clone())
-            .apply(&mut self.pager, &owned, indexes)
+            .apply(&mut self.pager, &ordered, indexes)
             .map_err(StepError::BeforeCommit)?;
         profile::add_apply(apply_mark);
         self.commit_prepared(prepared, nonce, base_commit)
@@ -1244,6 +1254,35 @@ fn definition_too_big() -> DbError {
         "table definition exceeds the maximum record size of {} bytes",
         page::MAX_RECORD_LEN
     ))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_PUBLISH_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) struct ForcePublishImageCopy(bool);
+#[cfg(test)]
+impl ForcePublishImageCopy {
+    pub(crate) fn new() -> Self {
+        Self(FORCE_PUBLISH_COPY.with(|flag| flag.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for ForcePublishImageCopy {
+    fn drop(&mut self) {
+        FORCE_PUBLISH_COPY.with(|flag| flag.set(self.0));
+    }
+}
+fn copy_publish_images_forced() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_PUBLISH_COPY.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]

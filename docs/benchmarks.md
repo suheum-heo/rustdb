@@ -2157,3 +2157,64 @@ final passing suite. Fault injection is not a physical power-loss test.
 Decision: merge. M47's borrowed-record experiment remains archived. A separate
 INSERT candidate is the redundant full-table image clone in `publish_indexes`;
 this milestone does not change that path.
+
+## Milestone 49: borrow validated publish images
+
+17 Nov 2026, Apple M5, baseline M48 merge `44c2dc8`. A fresh M39 profile
+measured one INSERT into a 100,000-row table at 26,424 µs and a 32-row INSERT
+at 26,023 µs. Their preparation timers were 5,524 and 4,860 µs. This timer
+combines `Table::image` construction in `Database::publish` with the second deep
+copy in `Store::publish_indexes`; it is not a measurement of the second copy
+alone. The implementation review found that the editor only reads the supplied
+images and returns owned pages/snapshot, so the second copy is unnecessary.
+
+`Editor::apply` now accepts ordered references to the validated table images.
+The original image construction, full validation, ordering, incremental editing,
+WAL serialization, syncs, and recovery path are unchanged. Rust keeps the input
+images borrowed for the synchronous call; no reference is stored in `Prepared`.
+A test-only `ForcePublishImageCopy` restores deep copies before editing.
+This removes one full image copy, not all cloning or all O(n) INSERT work.
+Peak RSS was not measured.
+
+`profile_milestone49` uses fresh database copies, one read warmup, alternating
+arm order, durable syncs, seed `0x3100`, five samples per arm at 10,000 and
+100,000 rows, three at 1,000. Two isolated release passes measured microseconds
+for inserting into 100,000 existing rows:
+
+| workload | pass | borrowed median | copied median | borrowed range | copied range |
+| --- | --- | ---: | ---: | --- | --- |
+| one row | 1 | 21,366 | 24,886 | 20,218–22,567 | 23,559–26,465 |
+| one row | 2 | 22,037 | 27,025 | 20,907–24,613 | 24,994–29,721 |
+| 32 rows | 1 | 20,614 | 25,070 | 19,597–22,065 | 24,686–26,299 |
+| 32 rows | 2 | 20,957 | 26,117 | 20,384–27,948 | 24,016–37,497 |
+
+One-row INSERT improves 14.1–18.5%; 32-row INSERT improves 17.8–19.8% by median.
+Each workload is faster in all 10 paired copies across the two passes. Paired
+median savings are 4,208.5 and 4,144.5 µs. The second batch run has overlapping
+ranges and a large outlier; paired results are reported rather than claiming
+all ranges are disjoint. Pass 1 preparation falls from 4,830 to 2,472 µs for
+one row and 4,773 to 2,443 µs for a batch. Initial image creation remains.
+Indexed-update and delete-all controls overlap; no speedup is claimed for them.
+The runs differ in absolute control times, so comparisons are within each run.
+Pass 1's inherited labels `ordered`/`mapped` mean borrowed/copied images; pass 2
+and the committed benchmark use explicit `borrowed`/`copied` and `copy` labels.
+
+One row retains WAL 36,996 bytes / 9 frames / checksum 5,001,582,569. The batch
+retains 41,096 bytes / 10 frames / checksum 5,004,683,315. Page/WAL formats,
+checksums, full-image validation, and durability guarantees are unchanged.
+
+Validation: formatting, strict Clippy, all-target build, 617 tests passed,
+0 failed, 42 ignored, including a doctest; all 17 storage reliability tests pass
+with `PROPTEST_CASES=256`. New differential tests compare results, IDs/counters,
+exact database/WAL bytes, and reopened tables for one/batch/other-table inserts,
+CREATE/DROP TABLE, CREATE/DROP INDEX, and an update control. Both modes pass
+single/batch/wide/other-table insert rollback, after-log-sync recovery,
+commit-sync ambiguity, partial checkpoint, fencing, and repeated reopen.
+The final benchmark-label cleanup was checked with formatting and strict Clippy;
+it changes no production or correctness-test behavior. These injected faults
+are not physical power-loss tests.
+
+Decision: merge. M37/M38/M41/M44/M47 experiments remain absent. This completes
+the targeted row-lookup and duplicate-image-copy improvements. Further INSERT
+work would need to address the first image construction and full-image validation
+with their correctness boundaries explicitly preserved; neither is bypassed here.

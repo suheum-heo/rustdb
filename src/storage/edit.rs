@@ -90,7 +90,7 @@ impl Editor {
     pub(crate) fn apply(
         mut self,
         pager: &mut Pager,
-        desired: &[TableImage],
+        desired: &[&TableImage],
         indexes: &[IndexImage],
     ) -> Result<Option<Prepared>, DbError> {
         let desired_names: HashSet<&str> =
