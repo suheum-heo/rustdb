@@ -1584,3 +1584,116 @@ Fewer ancestor seals do not reduce the log on these statements, and they do not 
 ## Milestone 38 deferred leaf rewrites
 
 16 Nov 2026, 7:01 PM to 7:03 PM CST, Apple M5. A local experiment skipped a non-underflow leaf rewrite when a later span rebuild in the same deletion covered that leaf. Correctness and recovery checks passed, including the comparison with the Milestone 36 path and the existing WAL injection points. On the 100,000-row delete-all, intermediate leaf encodes fell from 247 to 0. Two release passes of `profile_milestone38`, seed `0x3100`, three samples at 100,000 rows, showed a slower index timer. Delete-all index time rose from about 30.2 ms to about 35.0 ms: 30,308 µs to 35,438 µs, then 30,095 µs to 34,503 µs. Half and consecutive eliminated no rewrites and still paid the planning walk. WAL lengths and dirty index-page counts matched Milestone 36. The implementation was reverted. It was not committed and it has no pull request. Milestone 36 remains the production baseline.
+
+## Milestone 39 end-to-end statement profile
+
+16 Nov 2026, 7:49–7:50 PM CST, Apple M5, 17,179,869,184 bytes of memory, Darwin 25.2.0 arm64, rustc 1.100.0 (`0ef1bc386 2026-11-09`). The ignored test is `profile_milestone39`. Build mode is `cargo test --release --locked`. The binary is a `cfg(test)` release build, so the recorder exists. Production `cargo build --release` has no recorder and does not sample the clock. Seed `0x3100`. One warm-up per copy. At 10,000 and 100,000 rows each delete is the median of three fresh copies. At 100 and 1,000 rows each delete is one copy, so those sizes have no dispersion. Reads at 100,000 rows are one measured repeat after one discarded run of the same statement. Smaller reads use the same sample count as the deletes. Mutation copies warm up with `SELECT COUNT(*) FROM users`, so the measured statement is the first mutation. The workload order is fixed. The durable and non-durable arms, and the recorder-off and recorder-on arms, alternate with the sample index. This is not a power-loss test. The whole process, including every copy, had a maximum resident set of 1,098,792,960 bytes from `/usr/bin/time -l`. That figure is not a per-statement peak.
+
+The table is `users(id INT, name TEXT, active BOOLEAN, bucket INT)` with `idx_users_id` and `idx_users_bucket`. `active` is true for even ids. `bucket` is NULL when `(seed + id)` is divisible by 5, and `(seed + id) % 4` otherwise. Every 11th name is 80 `w` characters. File sizes were 28,672, 131,072, 1,212,416, and 12,156,928 bytes at 100, 1,000, 10,000, and 100,000 rows.
+
+| kind | SQL |
+| --- | --- |
+| one | `DELETE FROM users WHERE id = 1` |
+| ten | `DELETE FROM users WHERE id >= 1 AND id <= 10` |
+| buckets | `DELETE FROM users WHERE bucket = 0 OR bucket = 1` |
+| half | `DELETE FROM users WHERE id < rows/2` |
+| alternating | `DELETE FROM users WHERE active = TRUE` |
+| consecutive | `DELETE FROM users WHERE id >= 1 AND id < rows/4` |
+| sparse | `DELETE FROM users WHERE bucket IS NULL` |
+| all | `DELETE FROM users WHERE TRUE OR id = 0` |
+| wide | `DELETE FROM users WHERE name =` 80 `w` characters |
+| select-index | `SELECT id, name FROM users WHERE id = 1` |
+| select-scan | `SELECT id, name FROM users WHERE active = TRUE` |
+| update-index | `UPDATE users SET name = 'edited' WHERE id = 1` |
+| update-scan | `UPDATE users SET name = 'edited' WHERE active = TRUE` |
+| insert-one | one row at `id = rows + 1` |
+| insert-batch | 32 rows at `id = rows + 1` through `rows + 32` |
+| join | `SELECT users.id, labels.tag FROM users JOIN labels ON users.bucket = labels.bucket` after four label rows |
+| group | `SELECT bucket, COUNT(*) FROM users GROUP BY bucket` |
+
+`wall` is the statement. `gather` seals dirty pages and collects them, and it sits inside `apply`. `seal` and `verify` sit inside `gather` and are not added again. `plan` and `undo` sit inside `memory`. `index` is index maintenance on the delete path. `encode` builds the redo-log bytes, including the trailer checksum, and is outside the log write. `sync` is the log `sync_all` plus the database `sync_all`. `clear` truncates the log. `gap` is wall time minus the exclusive sum. The exclusive sum is parse, plan, undo, the rest of memory, prepare, the delete sub-stages, the rest of apply, encode, log write, log sync, database write, database sync, and log truncate. A few hundred microseconds of gap is clock-boundary noise. A large gap is work this recorder does not name. `SELECT` planning and expression evaluation stay inside `memory`. Recovery is not on the measured statement. There is no asynchronous checkpoint: the statement returns after the log is cleared.
+
+### Recorder overhead
+
+At 1,000 rows, delete-all, five fresh copies with the recorder off and five with it on. Sample index alternates which arm runs first. Off median 14,927 µs (14,287–15,764). On median 14,838 µs (13,281–16,029). The ranges overlap, so this comparison does not resolve an overhead above the spread of a 15 ms statement. The 100,000-row figures below are from the enabled recorder. An earlier pass of the same test, before the per-page seal and verify samples, measured delete-all at 303,344 µs (300,626–305,914). The pass below is 306,447 µs (305,198–309,751). That difference sits inside the spread of the two passes.
+
+### 100,000-row medians
+
+Times are microseconds. Counts are from the median-wall copy. `pages` is heap + index + other dirty pages. `gap` is unattributed.
+
+| kind | wall | min | max | gather | seal | verify | encode | index | heap | sync | clear | gap | WAL | pages | deleted |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| one | 20,626 | 20,249 | 21,614 | 444 | 205 | 234 | 214 | 16 | 28 | 6,528 | 4,015 | 706 | 36,996 | 9 | 1 |
+| ten | 65,628 | 60,517 | 65,951 | 23,212 | 11,530 | 11,483 | 13,977 | 4,145 | 643 | 8,411 | 3,975 | 1,122 | 2,045,996 | 499 | 10 |
+| buckets | 253,014 | 249,066 | 253,572 | 122,480 | 60,657 | 61,056 | 61,772 | 17,270 | 10,387 | 8,517 | 4,060 | 2,506 | 10,906,096 | 2,660 | 40,000 |
+| half | 194,515 | 194,126 | 195,029 | 79,776 | 39,616 | 39,617 | 40,437 | 17,900 | 17,584 | 12,273 | 4,060 | 3,062 | 7,101,296 | 1,732 | 49,999 |
+| alternating | 268,248 | 264,284 | 268,744 | 129,412 | 64,167 | 64,482 | 65,135 | 17,248 | 12,619 | 10,707 | 3,103 | 3,010 | 11,537,496 | 2,814 | 50,000 |
+| consecutive | 131,156 | 127,263 | 131,716 | 51,104 | 25,429 | 25,342 | 25,789 | 10,860 | 9,868 | 13,047 | 4,060 | 2,151 | 4,555,196 | 1,111 | 24,999 |
+| sparse | 209,516 | 207,265 | 209,585 | 109,530 | 54,079 | 54,780 | 54,521 | 6,096 | 5,565 | 10,210 | 3,937 | 1,679 | 9,581,796 | 2,337 | 20,000 |
+| all | 306,447 | 305,198 | 309,751 | 136,039 | 67,551 | 67,699 | 68,709 | 31,127 | 19,264 | 11,199 | 3,993 | 4,932 | 12,168,896 | 2,968 | 100,000 |
+| wide | 255,824 | 252,966 | 258,813 | 136,699 | 67,801 | 68,082 | 69,044 | 10,750 | 3,150 | 8,997 | 4,046 | 1,152 | 12,181,196 | 2,971 | 9,090 |
+
+Delete-all's median copy also spent 10,033 µs decoding removed records, 7,192 µs copying the undo journal, 4,550 µs checking deleted ids, 5,145 µs writing pages into the database, and 1,192 µs writing the log. Parse was 17 µs. The mutation planner was 0 µs. `compare` was 0 because the deleted table is not decoded again when the id list matches. Candidate filtering inside memory was 1,312 µs. Root descents were 2, leaf decodes 8,440, span rebuilds 2, indexes touched 2, ancestor reads 1,235, ancestor writes 0, dirty heap pages 0, dirty index pages 1, and other dirty pages 2,967. The checksum was 0. Those counters match the Milestone 36 delete-all log of 12,168,896 bytes and its 1 dirty index page.
+
+`seal` and `verify` match on every large delete. `verify` copies each page `seal` just checksummed and checksums it again, then runs the structural checks. The equal times are the evidence that the second checksum, not the structural walk, fills `verify`. The log encoder then checksums the concatenated frames. Those three passes are 67.6 ms, 67.7 ms, and 68.7 ms, about two thirds of the 306 ms statement. Index maintenance is 31.1 ms, about 10%. The two syncs plus the log truncate are 15.2 ms, about 5%.
+
+### Other statements at 100,000 rows
+
+One sample each. Times are microseconds.
+
+| kind | wall | memory | prepare | gather | encode | sync | clear | gap | WAL | rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| select-index | 11 | 3 | 0 | 0 | 0 | 0 | 0 | 1 | 0 | 1 |
+| select-scan | 2,208 | 2,181 | 0 | 0 | 0 | 0 | 0 | 2 | 0 | 50,000 |
+| update-index | 16,216 | 769 | 0 | 136 | 71 | 7,597 | 3,978 | 1,784 | 12,396 | 1 |
+| update-scan | 184,219 | 10,684 | 0 | 71,588 | 36,073 | 15,276 | 3,295 | 5,941 | 6,309,996 | 50,000 |
+| insert-one | 27,263 | 51 | 5,826 | 405 | 222 | 6,613 | 3,935 | 9,349 | 36,996 | 1 |
+| insert-batch | 26,580 | 103 | 5,215 | 467 | 247 | 7,501 | 2,973 | 9,131 | 41,096 | 32 |
+| join | 4,417 | 4,378 | 0 | 0 | 0 | 0 | 0 | 3 | 0 | 80,000 |
+| group | 4,604 | 4,575 | 0 | 0 | 0 | 0 | 0 | 2 | 0 | 5 |
+
+`SELECT`, the join, and `GROUP BY` do not publish. Their time is in-memory execution, which includes planning and expression evaluation. The indexed point select is one leaf decode and is 11 µs. The heap scan of 50,000 rows is 2.2 ms. The join returns 80,000 pairs in 4.4 ms. `GROUP BY` returns 5 groups in 4.6 ms.
+
+The indexed update is one row and is mostly the two syncs and the log truncate. The scan update rewrites 1,538 heap pages and no index page. `heap` and `index` stay 0 because those timers belong to the delete unlink. The rewrite itself is inside `apply`: 71,588 µs gathering pages, of which seal and verify are 35,258 and 35,922, plus 32,990 µs of apply time that this recorder does not split. That unnamed remainder is a limitation of the update path.
+
+`INSERT` publishes a full table image. `prepare` clones that image: 5.8 ms for one row into a 100,000-row table. The 9.3 ms gap is not a named stage. The full-image path validates every row id before the store timer starts. That walk is the likely contents of the gap. It was not timed on its own, so this is a hypothesis. The same gap is 50 µs at 100 rows, 137 µs at 1,000, and 878 µs at 10,000 on the earlier pass. `indexes` on the 32-row insert reads 64 because the per-row index path counts one touch per row per tree. Two indexes were updated. The bulk delete path counts a tree once.
+
+### Delete-all scaling
+
+| rows | wall | gather | seal | verify | encode | index | sync | frames | WAL |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 10,756 | 614 | 305 | 305 | 310 | 75 | 6,482 | 7 | 28,796 |
+| 1,000 | 15,862 | 2,022 | 1,008 | 1,004 | 954 | 416 | 7,552 | 32 | 131,296 |
+| 10,000 | 37,580 | 13,624 | 6,753 | 6,814 | 6,882 | 2,506 | 6,696 | 296 | 1,213,696 |
+| 100,000 | 306,447 | 136,039 | 67,551 | 67,699 | 68,709 | 31,127 | 11,199 | 2,968 | 12,168,896 |
+
+At 100 rows the statement is the syncs. From 10,000 to 100,000 rows the frame count, the gather time, and the encode time each grow by about ten. The sync pair grows from 6.7 ms to 11.2 ms. A one-row delete at 100,000 rows is still sync-heavy: 6.5 ms of sync and 4.0 ms of log truncate inside a 20.6 ms statement, with 4.6 ms of in-memory work before publish.
+
+### WAL sync, isolated and non-durable
+
+Three fresh 100,000-row delete-all copies, alternating which arm runs first. The suspended arm skips `sync_all` on the log and on the database. It still writes both files and still truncates the log. Production builds have no such branch. These numbers are not a safe setting.
+
+| arm | samples (µs) | median |
+| --- | --- | ---: |
+| durable | 306,447, 312,563, 308,416 | 308,416 |
+| suspended, `NON_DURABLE` | 296,752, 297,870, 302,648 | 297,870 |
+
+The median gap is about 10 ms. That matches the log sync plus the database sync on the durable copies, and it is much smaller than the checksum work. The suspended copies were not reopened and are not a durability result.
+
+### Ranked bottlenecks
+
+Ranked for the 100,000-row deletes, by share of wall time, then by how many of those deletes show it, then by growth from 10,000 to 100,000 rows. Instruction counts are not the ranking.
+
+1. **Second page checksum inside page gathering.** `verify` is 67.7 ms, 22% of delete-all, and it matches `seal` on every large delete. It grows with the dirty-page count. The likely cause is `page::verify` copying a page `page::seal` just checksummed and checksumming it again. Estimated saving if that second checksum goes away and the structural checks remain: about 60–68 ms on this statement, roughly 20%. That range is an estimate. Risk: a bad seal would no longer be caught before the log write. Open and recovery still verify pages. Validation: same WAL bytes, same page checksum, same recovery tests, and a repeat of this profile.
+2. **Redo-log checksum and byte assembly.** `encode` is 68.7 ms, 22% of delete-all, and it tracks the frame count the same way `seal` does. The likely cause is a third checksum, over the concatenated frames, plus building that buffer. Estimated saving from reusing the seal checksums: up to about 69 ms. That is an estimate, and it changes the commit-checksum construction, so the risk is higher than item 1. The bytes on disk would still have to match.
+3. **First page checksum.** `seal` is 67.6 ms. Some checksum of the dirty image has to exist for the current format. Removing it would weaken durability. Fewer dirty pages would shrink it. Delete-all dirties 2,967 non-index pages because freed pages are part of the commit. Changing that set is a storage change, not a timer change.
+4. **Index maintenance.** 31.1 ms on delete-all, about 10%, and 6–11 ms on the other large deletes except the one-row and ten-row cases. Milestones 37 and 38 cut internal index work and did not move the statement. Another index micro-optimization is not the next target.
+5. **Heap unlink and row decode.** 19.3 ms and 10.0 ms on delete-all. Real, smaller than the checksum passes, and specific to the delete editor.
+6. **Log sync, database sync, and log truncate.** 5.5 ms, 5.7 ms, and 4.0 ms on delete-all. Together about 5%. They dominate the 100-row deletes and the one-row delete. They do not dominate a large delete. The non-durable arm confirms the large-delete gap is about 10 ms.
+7. **Full-image insert validation and image clone.** On one insert into 100,000 rows, 9.3 ms is unattributed and 5.8 ms clones the image, out of 27.3 ms. The unattributed part is a hypothesis, named above. It matters for insert and not for the selective delete path.
+
+Parsing, mutation planning, candidate filtering, and the in-memory scan of a `SELECT` are under a few milliseconds at this size. They are not the mutation bottleneck.
+
+### Milestone 40
+
+Drop the redundant full-page checksum in `Editor::finish` only. Keep the structural checks there. Keep `page::verify` on open, recovery, and migration. Do not change the page format or the WAL record. Do not disable `sync_all`. The reference is this profile's 100,000-row delete-all: `verify` should fall, WAL length should stay 12,168,896, the checksum should stay 0, and the statement median should fall by about the old `verify` time. Accept the change only if a repeat of this profile shows that fall outside the few-millisecond spread, and the existing recovery injections still match.

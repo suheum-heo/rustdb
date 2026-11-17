@@ -262,6 +262,7 @@ impl Database {
         proposals: &[(u64, Vec<Value>)],
         snapshot: bool,
     ) -> Result<CapturedUndo, DbError> {
+        let _undo = crate::storage::Timer::new(|profile| &mut profile.undo);
         let table = self
             .tables
             .get(table_name)
@@ -338,6 +339,7 @@ impl Database {
         targets: &[u64],
         snapshot: bool,
     ) -> Result<CapturedUndo, DbError> {
+        let _undo = crate::storage::Timer::new(|profile| &mut profile.undo);
         let table = self
             .tables
             .get(table_name)

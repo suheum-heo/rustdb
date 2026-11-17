@@ -257,6 +257,7 @@ impl Editor {
         if self.dirty.is_empty() && !self.freelist_dirty {
             return Ok(None);
         }
+        let gather_mark = profile::start();
         self.finish(pager)?;
         let dirty = std::mem::take(&mut self.dirty);
         let mut pages: Vec<(u32, Page)> = self
@@ -265,6 +266,7 @@ impl Editor {
             .filter(|(id, _)| dirty.contains(id))
             .collect();
         pages.sort_by_key(|(id, _)| *id);
+        profile::add_page_gather(gather_mark);
         Ok(Some(Prepared {
             page_count: self.snapshot.page_count,
             snapshot: self.snapshot,
@@ -718,6 +720,7 @@ impl Editor {
         if entries.is_empty() {
             return Ok(());
         }
+        profile::note_index_updated();
         let root = self.snapshot.indexes[position].root;
         let new_root = {
             let mut nodes = EditNodes {
@@ -982,8 +985,14 @@ impl Editor {
                 }
                 _ => profile::note_other_page(),
             }
-            page::seal(page);
-            page::verify(page, id)?;
+            {
+                let _seal = profile::Timer::new(|profile| &mut profile.page_seal);
+                page::seal(page);
+            }
+            {
+                let _verify = profile::Timer::new(|profile| &mut profile.page_verify);
+                page::verify(page, id)?;
+            }
         }
         Ok(())
     }
@@ -1257,6 +1266,7 @@ impl Editor {
             if old_key == new_key {
                 continue;
             }
+            profile::note_index_updated();
             if let Some(key) = old_key {
                 self.mutate_index(pager, position, IndexChange::Delete(key, row_id))?;
             }

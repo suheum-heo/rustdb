@@ -1,7 +1,9 @@
-//! Optional phase timer for the update investigation.
+//! Optional phase timer for statement measurements.
 //!
 //! `start` returns `None` unless a test has enabled recording, so the commit
-//! path does not sample the clock in ordinary runs.
+//! path does not sample the clock in ordinary runs. Nested stages are recorded
+//! separately and are not subtracted here. A caller that sums them has to
+//! treat an inner stage as included in its outer stage.
 
 use std::time::{Duration, Instant};
 
@@ -145,6 +147,36 @@ pub(crate) struct Profile {
     /// Separator keys changed by that rewrite.
     #[cfg_attr(not(test), allow(dead_code))]
     pub separator_updates: u64,
+    /// Parsing the SQL text. This is outside planning and execution.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub parse: Duration,
+    /// Choosing an index or a heap scan for one mutation. Select planning
+    /// stays inside `memory` because it is not a separate pass.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub plan: Duration,
+    /// In-memory statement work after parsing and before publish. This includes
+    /// `plan` and `undo`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub memory: Duration,
+    /// Copying the undo journal. This sits inside `memory`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub undo: Duration,
+    /// Sealing dirty pages and collecting them for the commit. This sits
+    /// inside `apply`. `page_seal` and `page_verify` sit inside this stage.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub page_gather: Duration,
+    /// Checksumming a dirty page during `page_gather`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub page_seal: Duration,
+    /// Re-checking a page just sealed during `page_gather`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub page_verify: Duration,
+    /// Encoding the redo-log bytes. This is outside `wal_write`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub wal_encode: Duration,
+    /// Index trees that received a posting change.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub indexes_updated: u64,
 }
 
 #[cfg(test)]
@@ -204,7 +236,17 @@ thread_local! {
         ancestor_reads: 0,
         ancestor_writes: 0,
         separator_updates: 0,
+        parse: Duration::ZERO,
+        plan: Duration::ZERO,
+        memory: Duration::ZERO,
+        undo: Duration::ZERO,
+        page_gather: Duration::ZERO,
+        page_seal: Duration::ZERO,
+        page_verify: Duration::ZERO,
+        wal_encode: Duration::ZERO,
+        indexes_updated: 0,
     }) };
+    static SUSPEND_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[inline]
@@ -440,6 +482,76 @@ pub(crate) fn add_wal_clear(mark: Option<Instant>) {
     add(|profile| &mut profile.wal_clear, mark);
 }
 
+pub(crate) fn add_parse(mark: Option<Instant>) {
+    add(|profile| &mut profile.parse, mark);
+}
+
+pub(crate) fn add_plan(mark: Option<Instant>) {
+    add(|profile| &mut profile.plan, mark);
+}
+
+pub(crate) fn add_memory(mark: Option<Instant>) {
+    add(|profile| &mut profile.memory, mark);
+}
+
+pub(crate) fn add_page_gather(mark: Option<Instant>) {
+    add(|profile| &mut profile.page_gather, mark);
+}
+
+pub(crate) fn add_wal_encode(mark: Option<Instant>) {
+    add(|profile| &mut profile.wal_encode, mark);
+}
+
+pub(crate) fn note_index_updated() {
+    note_u64(|profile| &mut profile.indexes_updated, 1);
+}
+
+/// Records `slot` when dropped, including on an early return.
+pub(crate) struct Timer {
+    slot: fn(&mut Profile) -> &mut Duration,
+    mark: Option<Instant>,
+}
+
+impl Timer {
+    pub(crate) fn new(slot: fn(&mut Profile) -> &mut Duration) -> Self {
+        Self {
+            slot,
+            mark: start(),
+        }
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        add(self.slot, self.mark.take());
+    }
+}
+
+/// Benchmark-only suspension of file sync. Production builds cannot set it.
+/// A run that uses it is not a durability result.
+#[cfg(test)]
+pub(crate) struct SuspendSync;
+
+#[cfg(test)]
+impl SuspendSync {
+    pub(crate) fn new() -> Self {
+        SUSPEND_SYNC.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for SuspendSync {
+    fn drop(&mut self) {
+        SUSPEND_SYNC.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn sync_suspended() -> bool {
+    SUSPEND_SYNC.with(|flag| flag.get())
+}
+
 pub(crate) fn note_frames(count: u32) {
     #[cfg(test)]
     {
@@ -526,9 +638,14 @@ impl Drop for Guard {
 
 #[cfg(test)]
 pub(crate) fn enable() -> Guard {
-    ENABLED.with(|flag| flag.set(true));
+    set_enabled(true);
     reset();
     Guard
+}
+
+#[cfg(test)]
+pub(crate) fn set_enabled(enabled: bool) {
+    ENABLED.with(|flag| flag.set(enabled));
 }
 
 #[cfg(test)]
