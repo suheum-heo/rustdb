@@ -649,6 +649,24 @@ impl Editor {
         profile::add_decode(decode_mark);
 
         let heap_mark = profile::start();
+        // A page that loses every row is replaced by a free-page image. Link
+        // patches on that page do not survive the replacement. Pages that keep
+        // a row, including a row of another table, still get every patch.
+        let mut surviving_pages = HashSet::new();
+        for (index, link) in links.iter().copied().enumerate() {
+            if !doomed[index] {
+                surviving_pages.insert(link.page);
+            }
+        }
+        for (other, table) in &self.snapshot.tables {
+            if other == name {
+                continue;
+            }
+            for link in &table.links {
+                surviving_pages.insert(link.page);
+            }
+        }
+        let patch_doomed = patch_doomed_pages();
         for &index in positions {
             let prev = if index == 0 {
                 NULL_LINK
@@ -660,28 +678,28 @@ impl Editor {
             } else {
                 links[next_alive[index]]
             };
-            if prev != NULL_LINK {
+            if prev != NULL_LINK && (patch_doomed || surviving_pages.contains(&prev.page)) {
                 self.ensure(pager, prev.page)?;
                 let (prev_prev, _) = self.read_links(prev)?;
                 self.patch(pager, prev, prev_prev, next)?;
             }
-            if next != NULL_LINK {
+            if next != NULL_LINK && (patch_doomed || surviving_pages.contains(&next.page)) {
                 self.ensure(pager, next.page)?;
                 let (_, next_next) = self.read_links(next)?;
                 self.patch(pager, next, prev, next_next)?;
             }
-            self.delete_cell(pager, links[index])?;
+            if patch_doomed || surviving_pages.contains(&links[index].page) {
+                self.delete_cell(pager, links[index])?;
+            }
         }
         let mut kept_ids = Vec::with_capacity(links.len() - positions.len());
         let mut kept_links = Vec::with_capacity(links.len() - positions.len());
-        let mut used_pages = HashSet::new();
         for (index, link) in links.iter().copied().enumerate() {
             if doomed[index] {
                 continue;
             }
             kept_ids.push(row_ids[index]);
             kept_links.push(link);
-            used_pages.insert(link.page);
         }
         let head = kept_links.first().copied().unwrap_or(NULL_LINK);
         let tail = kept_links.last().copied().unwrap_or(NULL_LINK);
@@ -696,9 +714,12 @@ impl Editor {
         let mut released = HashSet::new();
         for &index in positions {
             let page_id = links[index].page;
-            if used_pages.contains(&page_id) || !released.insert(page_id) {
+            if surviving_pages.contains(&page_id) || !released.insert(page_id) {
                 continue;
             }
+            // The free image does not depend on the deleted cells. Load the
+            // page once so a non-heap page is left alone, then replace it.
+            self.ensure(pager, page_id)?;
             self.maybe_free_heap(page_id)?;
         }
         profile::add_heap_edit(heap_mark);
@@ -1550,6 +1571,44 @@ fn per_row_unlink() -> bool {
     #[cfg(test)]
     {
         FORCE_PER_ROW_UNLINK.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_DOOMED_PATCHES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Patch every deleted neighbor, including a page that this batch frees.
+///
+/// The default batch skips those patches. The free-page image replaces them.
+/// This guard is the Milestone 42 comparison.
+#[cfg(test)]
+pub(crate) struct ForceDoomedHeapPatches;
+
+#[cfg(test)]
+impl ForceDoomedHeapPatches {
+    pub(crate) fn new() -> Self {
+        FORCE_DOOMED_PATCHES.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceDoomedHeapPatches {
+    fn drop(&mut self) {
+        FORCE_DOOMED_PATCHES.with(|flag| flag.set(false));
+    }
+}
+
+fn patch_doomed_pages() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_DOOMED_PATCHES.with(|flag| flag.get())
     }
     #[cfg(not(test))]
     {
