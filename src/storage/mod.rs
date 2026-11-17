@@ -31,6 +31,7 @@ pub(crate) use btree::ForcePriorPlan;
 #[cfg(test)]
 pub(crate) use edit::{
     ForceDoomedHeapPatches, ForceFreeListSort, ForcePerRowUnlink, ForceRepeatedUpdateDecode,
+    ForceRowMap,
 };
 #[cfg(test)]
 pub(crate) use page::{
