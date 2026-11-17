@@ -896,9 +896,13 @@ impl Editor {
         page::write_free_data(&mut page, page_id);
         self.pages.insert(page_id, page);
         self.touch(page_id)?;
-        self.snapshot.free_ids.push(page_id);
-        self.snapshot.free_ids.sort_unstable();
-        self.snapshot.free_ids.dedup();
+        if sort_free_list_forced() {
+            self.snapshot.free_ids.push(page_id);
+            self.snapshot.free_ids.sort_unstable();
+            self.snapshot.free_ids.dedup();
+        } else {
+            insert_free_id(&mut self.snapshot.free_ids, page_id);
+        }
         self.freelist_dirty = true;
         Ok(())
     }
@@ -1690,4 +1694,87 @@ fn deleted_positions(
 fn is_subsequence(needle: &[u64], haystack: &[u64]) -> bool {
     let mut hay = haystack.iter();
     needle.iter().all(|id| hay.any(|candidate| candidate == id))
+}
+
+// Open validates uniqueness and sorts this list; relayout sorts and deduplicates
+// it, and allocation only pops its largest id. Preserve that invariant without
+// re-sorting the entire vector for every page released by a bulk operation.
+fn insert_free_id(ids: &mut Vec<u32>, id: u32) {
+    if let Err(at) = ids.binary_search(&id) {
+        ids.insert(at, id);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_FREE_LIST_SORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct ForceFreeListSort(bool);
+
+#[cfg(test)]
+impl ForceFreeListSort {
+    pub(crate) fn new() -> Self {
+        Self(FORCE_FREE_LIST_SORT.with(|flag| flag.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceFreeListSort {
+    fn drop(&mut self) {
+        FORCE_FREE_LIST_SORT.with(|flag| flag.set(self.0));
+    }
+}
+
+fn sort_free_list_forced() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_FREE_LIST_SORT.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+mod free_list_tests {
+    use super::insert_free_id;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    proptest! {
+        #[test]
+        fn free_and_reallocate_match_ordered_set(
+            ops in prop::collection::vec((any::<bool>(), 1u32..9000), 0..1000)
+        ) {
+            let mut ids = Vec::new();
+            let mut expected = BTreeSet::new();
+            for (release, id) in ops {
+                if release {
+                    insert_free_id(&mut ids, id);
+                    expected.insert(id);
+                } else {
+                    prop_assert_eq!(ids.pop(), expected.pop_last());
+                }
+                prop_assert_eq!(&ids, &expected.iter().copied().collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
+    fn descending_duplicate_releases_preserve_reuse_order() {
+        let mut ids = Vec::new();
+        for id in (1..=8192).rev() {
+            insert_free_id(&mut ids, id);
+        }
+        for id in 1..=8192 {
+            insert_free_id(&mut ids, id);
+        }
+        for id in (1..=8192).rev() {
+            assert_eq!(ids.pop(), Some(id));
+        }
+        assert!(ids.is_empty());
+    }
 }

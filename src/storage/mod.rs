@@ -29,7 +29,9 @@ pub(crate) use btree::ForceLatePresence;
 #[cfg(test)]
 pub(crate) use btree::ForcePriorPlan;
 #[cfg(test)]
-pub(crate) use edit::{ForceDoomedHeapPatches, ForcePerRowUnlink, ForceRepeatedUpdateDecode};
+pub(crate) use edit::{
+    ForceDoomedHeapPatches, ForceFreeListSort, ForcePerRowUnlink, ForceRepeatedUpdateDecode,
+};
 #[cfg(test)]
 pub(crate) use page::{
     ForceBitwiseCrc, ForceChecksumRecheck, TYPE_HEAP, init_slotted, insert_cell, seal,

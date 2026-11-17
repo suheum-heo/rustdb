@@ -25169,6 +25169,193 @@ mod tests {
     }
 
     #[test]
+    fn ordered_free_list_matches_sort_and_dedup_pages() {
+        let (_dir, base) = seed_delete_db("m46-bytes", 400, 0x4600);
+        let statements = [
+            "DELETE FROM users WHERE id = 1;",
+            "DELETE FROM users WHERE id >= 1 AND id <= 10;",
+            "DELETE FROM users WHERE bucket = 0 OR bucket = 1;",
+            "DELETE FROM users WHERE id < 200;",
+            "DELETE FROM users WHERE active = TRUE;",
+            "DELETE FROM users WHERE id >= 1 AND id < 100;",
+            "DELETE FROM users WHERE bucket IS NULL;",
+            "DELETE FROM users WHERE TRUE OR id = 0;",
+            "UPDATE users SET name = 'edited' WHERE id = 2;",
+            "INSERT INTO users VALUES (401, 'added', TRUE, 1);",
+        ];
+        for sql in statements {
+            let (_fast_dir, fast_path, mut fast) = open_copy(&base, "m46-fast");
+            let (_slow_dir, slow_path, mut slow) = open_copy(&base, "m46-slow");
+            let fast_result = fast.execute(sql).unwrap();
+            let slow_result = {
+                let _guard = crate::storage::ForceFreeListSort::new();
+                slow.execute(sql).unwrap()
+            };
+            assert_eq!(fast_result, slow_result, "{sql}");
+            assert_eq!(
+                fast.table("users").unwrap().row_ids(),
+                slow.table("users").unwrap().row_ids(),
+                "{sql}"
+            );
+            assert_eq!(
+                fast.table("users").unwrap().next_row_id(),
+                slow.table("users").unwrap().next_row_id(),
+                "{sql}"
+            );
+            assert_eq!(table_rows(&mut fast), table_rows(&mut slow), "{sql}");
+            assert_eq!(
+                index_postings(&mut fast, "idx_users_id"),
+                index_postings(&mut slow, "idx_users_id"),
+                "{sql}"
+            );
+            assert_eq!(
+                index_postings(&mut fast, "idx_users_bucket"),
+                index_postings(&mut slow, "idx_users_bucket"),
+                "{sql}"
+            );
+            assert_eq!(db_file(&fast_path), db_file(&slow_path), "{sql}");
+            for followup in [
+                "INSERT INTO users VALUES (900, 'reuse freed pages', TRUE, 2);",
+                "UPDATE users SET name = 'a larger value to exercise relocation after reuse' WHERE id = 900;",
+                "DELETE FROM users WHERE id = 900;",
+            ] {
+                let fast_result = fast.execute(followup).unwrap();
+                let slow_result = {
+                    let _guard = crate::storage::ForceFreeListSort::new();
+                    slow.execute(followup).unwrap()
+                };
+                assert_eq!(fast_result, slow_result);
+                assert_eq!(
+                    db_file(&fast_path),
+                    db_file(&slow_path),
+                    "{sql}: {followup}"
+                );
+            }
+            drop(fast);
+            drop(slow);
+            let mut again = Database::open(&fast_path).unwrap();
+            let mut slow_open = Database::open(&slow_path).unwrap();
+            assert_eq!(table_rows(&mut again), table_rows(&mut slow_open), "{sql}");
+        }
+        let sql = "DELETE FROM users WHERE TRUE OR id = 0;";
+        let wal_of = |label: &str, doomed: bool| -> Vec<u8> {
+            let (_dir, path, mut db) = open_copy(&base, label);
+            db.set_inject(crate::storage::Inject::AfterLogSync);
+            let error = if doomed {
+                let _guard = crate::storage::ForceFreeListSort::new();
+                db.execute(sql)
+            } else {
+                db.execute(sql)
+            };
+            assert!(error.is_err(), "{label}");
+            wal_bytes(&path)
+        };
+        assert_eq!(wal_of("m46-wal-fast", false), wal_of("m46-wal-slow", true));
+        assert_precommit(&base, "m46-pre", sql, crate::storage::Inject::BeforeLogSync);
+        for inject in [
+            crate::storage::Inject::AfterLogSync,
+            crate::storage::Inject::CommitSyncFailed,
+            crate::storage::Inject::DuringCheckpoint(1),
+        ] {
+            assert_postcommit(&base, &format!("m46-post-{inject:?}"), sql, inject);
+        }
+        let half = "DELETE FROM users WHERE id < 200;";
+        {
+            let _guard = crate::storage::ForceFreeListSort::new();
+            assert_precommit(
+                &base,
+                "m46-pre-old",
+                half,
+                crate::storage::Inject::BeforeLogSync,
+            );
+            assert_postcommit(
+                &base,
+                "m46-post-old",
+                half,
+                crate::storage::Inject::DuringCheckpoint(1),
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_free_list_overflow_and_reuse_match_sorting() {
+        // One large row per heap page exceeds the inline free-list capacity
+        // without requiring a 100,000-row debug fixture.
+        let (_dir, base) = seed_delete_db("m46-overflow", 1_100, 0x4601);
+        let wide = "z".repeat(3_000);
+        let mut seed = Database::open(&base).unwrap();
+        seed.execute(&format!("UPDATE users SET name = '{wide}';"))
+            .unwrap();
+        drop(seed);
+        assert!(db_file(&base).len() > 1_100 * crate::storage::PAGE_SIZE);
+        let (_fast_dir, fast_path, mut fast) = open_copy(&base, "m46-overflow-fast");
+        let (_slow_dir, slow_path, mut slow) = open_copy(&base, "m46-overflow-slow");
+        let insert = format!(
+            "INSERT INTO users VALUES {};",
+            (1..=1_050)
+                .map(|id| format!("({id}, '{wide}', TRUE, 1)"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for sql in ["DELETE FROM users;", insert.as_str(), "DELETE FROM users;"] {
+            let result = fast.execute(sql).unwrap();
+            let reference = {
+                let _guard = crate::storage::ForceFreeListSort::new();
+                slow.execute(sql).unwrap()
+            };
+            assert_eq!(result, reference);
+            assert_eq!(db_file(&fast_path), db_file(&slow_path));
+            assert_eq!(table_rows(&mut fast), table_rows(&mut slow));
+            drop(fast);
+            drop(slow);
+            fast = Database::open(&fast_path).unwrap();
+            slow = Database::open(&slow_path).unwrap();
+        }
+        for repeated in [false, true] {
+            let _guard = repeated.then(crate::storage::ForceFreeListSort::new);
+            assert_postcommit(
+                &base,
+                &format!("m46-overflow-recovery-{repeated}"),
+                "DELETE FROM users;",
+                crate::storage::Inject::DuringCheckpoint(1),
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_free_list_matches_wal_and_recovery() {
+        let (_dir, base) = seed_delete_db("m46-fault-matrix", 400, 0x46f0);
+        for (case, sql) in [
+            "DELETE FROM users WHERE id < 200;",
+            "DELETE FROM users WHERE active = TRUE;",
+            "DELETE FROM users WHERE bucket = 0 OR bucket = 1;",
+            "DELETE FROM users WHERE TRUE OR id = 0;",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut logs = Vec::new();
+            for patched in [false, true] {
+                let _guard = patched.then(crate::storage::ForceFreeListSort::new);
+                let label = format!("m46-matrix-{case}-{patched}");
+                let (_copy_dir, path, mut db) = open_copy(&base, &label);
+                db.set_inject(crate::storage::Inject::AfterLogSync);
+                assert!(db.execute(sql).is_err());
+                logs.push(wal_bytes(&path));
+                assert_precommit(&base, &label, sql, crate::storage::Inject::BeforeLogSync);
+                for inject in [
+                    crate::storage::Inject::AfterLogSync,
+                    crate::storage::Inject::CommitSyncFailed,
+                    crate::storage::Inject::DuringCheckpoint(1),
+                ] {
+                    assert_postcommit(&base, &format!("{label}-{inject:?}"), sql, inject);
+                }
+            }
+            assert_eq!(logs[0], logs[1], "{sql}");
+        }
+    }
+
+    #[test]
     fn skipping_doomed_heap_patches_matches_the_milestone42_pages() {
         let (_dir, base) = seed_delete_db("m43-bytes", 400, 0x4300);
         let statements = [
@@ -25437,6 +25624,167 @@ mod tests {
         }
         println!(
             "milestone45 median kind={kind} rows={rows} samples={samples} single_us={} repeated_us={} single_min_us={} single_max_us={} repeated_min_us={} repeated_max_us={}",
+            median(&fast_walls),
+            median(&full_walls),
+            fast_walls.iter().copied().min().unwrap_or(0),
+            fast_walls.iter().copied().max().unwrap_or(0),
+            full_walls.iter().copied().min().unwrap_or(0),
+            full_walls.iter().copied().max().unwrap_or(0)
+        );
+    }
+
+    #[test]
+    #[ignore = "release profile of the post-checksum delete path"]
+    fn profile_milestone46() {
+        let cpu = profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]);
+        let mem = profile_command("sysctl", &["-n", "hw.memsize"]);
+        let os = profile_command("uname", &["-smr"]);
+        let rustc = profile_command("rustc", &["--version"]);
+        println!(
+            "milestone46 cpu={cpu} mem_bytes={mem} os={os} rustc={rustc} build=release-test seed=0x3100 warmup=1"
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [1_000_i64, 10_000, 100_000] {
+            let (_base_dir, base) = seed_delete_db("m46-base", rows, 0x3100);
+            let samples = if rows >= 10_000 { 5 } else { 1 };
+            for kind in [
+                "one",
+                "ten",
+                "buckets",
+                "half",
+                "alternating",
+                "consecutive",
+                "sparse",
+                "all",
+                "wide",
+            ] {
+                milestone46_workload(&base, rows, kind, samples);
+            }
+        }
+    }
+
+    fn milestone46_workload(base: &std::path::Path, rows: i64, kind: &str, samples: usize) {
+        let sql = milestone39_sql(kind, rows);
+        let mut fast_walls = Vec::with_capacity(samples);
+        let mut full_walls = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            let fast_first = sample % 2 == 0;
+            let run = |label: &str, doomed: bool| {
+                let (_dir, _, mut db) = open_copy(base, &format!("m46-{label}-{sample}"));
+                db.execute("SELECT COUNT(*) FROM users;").unwrap();
+                crate::storage::reset_phases();
+                let started = std::time::Instant::now();
+                let outcome = if doomed {
+                    let _guard = crate::storage::ForceFreeListSort::new();
+                    db.execute(&sql).unwrap().pop().unwrap()
+                } else {
+                    db.execute(&sql).unwrap().pop().unwrap()
+                };
+                let wall = started.elapsed().as_micros();
+                let phases = crate::storage::take_phases();
+                let note = mutation_note();
+                let (exclusive, gap) = milestone39_gap(wall, &phases);
+                let presence = phases.presence_build.as_micros();
+                let member = phases.presence_member.as_micros();
+                let index_rest = phases
+                    .index_edit
+                    .as_micros()
+                    .saturating_sub(presence)
+                    .saturating_sub(member);
+                let gather_rest = phases
+                    .page_gather
+                    .as_micros()
+                    .saturating_sub(phases.page_seal.as_micros())
+                    .saturating_sub(phases.page_verify.as_micros())
+                    .saturating_sub(phases.page_recheck.as_micros());
+                let encode_rest = phases
+                    .wal_encode
+                    .as_micros()
+                    .saturating_sub(phases.wal_crc.as_micros());
+                let count = match &outcome {
+                    StatementResult::Delete { count } => *count,
+                    _ => 0,
+                };
+                println!(
+                    "milestone46 sample kind={kind} rows={rows} n={sample} mode={} count={count} wall_us={wall} exclusive_us={exclusive} gap_us={gap} parse_us={} plan_us={} discover_us={} probe_us={} validate_rows_us={} filter_us={} undo_us={} memory_rest_us={} prepare_us={} validate_us={} decode_us={} heap_us={} presence_us={} path_us={} member_us={} index_rest_us={index_rest} index_us={} gather_rest_us={gather_rest} seal_us={} verify_us={} encode_rest_us={encode_rest} crc_us={} wal_write_us={} wal_sync_us={} db_write_us={} db_sync_us={} wal_clear_us={} apply_rest_us={} checksum={} wal_bytes={} frames={} heap_pages={} index_pages={} other_pages={} leaf_decodes={} bulk_spans={} descents={} scratch_bytes={} presence_builds={} ancestor_reads={}",
+                    if doomed { "sorted" } else { "inserted" },
+                    phases.parse.as_micros(),
+                    phases.plan.as_micros(),
+                    note.discover_us,
+                    note.probe_us,
+                    note.validate_us,
+                    note.filter_us,
+                    phases.undo.as_micros(),
+                    phases
+                        .memory
+                        .as_micros()
+                        .saturating_sub(phases.plan.as_micros())
+                        .saturating_sub(phases.undo.as_micros()),
+                    phases.prepare.as_micros(),
+                    phases.validate_ids.as_micros(),
+                    phases.decode.as_micros(),
+                    phases.heap_edit.as_micros(),
+                    presence,
+                    phases.path_record.as_micros(),
+                    member,
+                    phases.index_edit.as_micros(),
+                    phases.page_seal.as_micros(),
+                    phases.page_verify.as_micros(),
+                    phases.wal_crc.as_micros(),
+                    phases.wal_write.as_micros(),
+                    phases.wal_sync.as_micros(),
+                    phases.db_write.as_micros(),
+                    phases.db_sync.as_micros(),
+                    phases.wal_clear.as_micros(),
+                    phases.apply.as_micros().saturating_sub(
+                        phases.validate_ids.as_micros()
+                            + phases.decode.as_micros()
+                            + phases.heap_edit.as_micros()
+                            + phases.index_edit.as_micros()
+                            + phases.compare.as_micros()
+                            + phases.page_gather.as_micros()
+                    ),
+                    mutation_checksum(&mut db),
+                    phases.wal_bytes,
+                    phases.frames,
+                    phases.heap_pages,
+                    phases.index_pages,
+                    phases.other_pages,
+                    phases.leaf_decodes,
+                    phases.bulk_spans,
+                    phases.descents,
+                    phases.scratch_bytes,
+                    phases.presence_builds,
+                    phases.ancestor_reads
+                );
+                (
+                    wall,
+                    phases.wal_bytes,
+                    phases.frames,
+                    phases.heap_pages,
+                    phases.index_pages,
+                    phases.other_pages,
+                    mutation_checksum(&mut db),
+                    phases.heap_edit.as_micros(),
+                )
+            };
+            let (fast, full) = if fast_first {
+                (run("inserted", false), run("sorted", true))
+            } else {
+                let full = run("sorted", true);
+                (run("inserted", false), full)
+            };
+            assert_eq!(fast.1, full.1, "{kind} rows={rows} wal");
+            assert_eq!(fast.2, full.2, "{kind} rows={rows} frames");
+            assert_eq!(fast.3, full.3, "{kind} rows={rows} heap pages");
+            assert_eq!(fast.4, full.4, "{kind} rows={rows} index pages");
+            assert_eq!(fast.5, full.5, "{kind} rows={rows} other pages");
+            assert_eq!(fast.6, full.6, "{kind} rows={rows} checksum");
+            fast_walls.push(fast.0);
+            full_walls.push(full.0);
+        }
+        println!(
+            "milestone46 median kind={kind} rows={rows} samples={samples} inserted_us={} sorted_us={} inserted_min_us={} inserted_max_us={} sorted_min_us={} sorted_max_us={}",
             median(&fast_walls),
             median(&full_walls),
             fast_walls.iter().copied().min().unwrap_or(0),
