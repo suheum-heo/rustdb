@@ -7,8 +7,30 @@
 
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Profile {
+    /// Full durable undo preparation before memory execution; outside memory.
+    pub durable_prepare: Duration,
+    /// Dropping an unconsumed durable undo value at its original scope exit.
+    pub undo_drop: Duration,
+    /// Initial TableImage construction; nested inside prepare.
+    pub image_build: Duration,
+    /// Full image validation, including its local sets; outside apply.
+    pub image_validate: Duration,
+    /// Dropping the original TableImage batch at publish scope exit.
+    pub image_drop: Duration,
+    /// Collecting and sorting image references before full validation.
+    pub publish_order: Duration,
+    /// Store snapshot cloning on full-image publish; nested inside apply.
+    pub snapshot_clone: Duration,
+    /// Installing the committed snapshot, including dropping its predecessor.
+    pub snapshot_install: Duration,
+    /// Entire Database::publish call, including image cleanup; enclosing timer.
+    pub publish_total: Duration,
+    /// Full-image validation calls (not selective update/delete audits).
+    pub full_image_validations: u64,
+    /// Total rows supplied to those validations.
+    pub full_image_rows: u64,
     pub compare: Duration,
     /// Building the table image, or auditing memory when that image is skipped.
     pub prepare: Duration,
@@ -191,6 +213,17 @@ pub(crate) struct Profile {
 thread_local! {
     static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DATA: std::cell::Cell<Profile> = const { std::cell::Cell::new(Profile {
+        durable_prepare: Duration::ZERO,
+        undo_drop: Duration::ZERO,
+        image_build: Duration::ZERO,
+        image_validate: Duration::ZERO,
+        image_drop: Duration::ZERO,
+        publish_order: Duration::ZERO,
+        snapshot_clone: Duration::ZERO,
+        snapshot_install: Duration::ZERO,
+        publish_total: Duration::ZERO,
+        full_image_validations: 0,
+        full_image_rows: 0,
         compare: Duration::ZERO,
         prepare: Duration::ZERO,
         apply: Duration::ZERO,
@@ -687,5 +720,78 @@ fn add(slot: fn(&mut Profile) -> &mut Duration, mark: Option<Instant>) {
     #[cfg(not(test))]
     {
         let _ = (slot, mark);
+    }
+}
+
+/// Test-only ownership wrapper: measure the original scope-exit drop without
+/// moving cleanup earlier in the operation. Production retains the plain value.
+#[cfg(test)]
+pub(crate) struct ProfiledDrop<T> {
+    value: Option<T>,
+    slot: fn(&mut Profile) -> &mut Duration,
+}
+#[cfg(test)]
+impl<T> ProfiledDrop<T> {
+    pub(crate) fn new(value: T, slot: fn(&mut Profile) -> &mut Duration) -> Self {
+        Self {
+            value: Some(value),
+            slot,
+        }
+    }
+    pub(crate) fn into_inner(mut self) -> T {
+        self.value.take().expect("owned profiling value")
+    }
+}
+#[cfg(test)]
+impl<T> std::ops::Deref for ProfiledDrop<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.value.as_ref().expect("owned profiling value")
+    }
+}
+#[cfg(test)]
+impl<T> Drop for ProfiledDrop<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            let _timer = Timer::new(self.slot);
+            drop(value);
+        }
+    }
+}
+#[cfg(test)]
+pub(crate) fn note_full_image_validation(rows: usize) {
+    note_u64(|p| &mut p.full_image_validations, 1);
+    note_u64(|p| &mut p.full_image_rows, rows as u64);
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+    struct Counted(Rc<Cell<usize>>);
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn profiled_drop_preserves_scope_exit_and_consumed_ownership() {
+        let count = Rc::new(Cell::new(0));
+        {
+            let _value = ProfiledDrop::new(Counted(count.clone()), |p| &mut p.undo_drop);
+            assert_eq!(count.get(), 0);
+        }
+        assert_eq!(count.get(), 1);
+        let value = ProfiledDrop::new(Counted(count.clone()), |p| &mut p.undo_drop).into_inner();
+        assert_eq!(count.get(), 1);
+        drop(value);
+        assert_eq!(count.get(), 2);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _value = ProfiledDrop::new(Counted(count.clone()), |p| &mut p.undo_drop);
+            panic!("unwind the wrapper");
+        }));
+        assert!(caught.is_err());
+        assert_eq!(count.get(), 3);
     }
 }

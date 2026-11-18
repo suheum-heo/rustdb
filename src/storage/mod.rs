@@ -65,3 +65,6 @@ pub(crate) use wal::{Plan, encode_committed};
 
 #[cfg(test)]
 pub(crate) use store::ForcePublishImageCopy;
+
+#[cfg(test)]
+pub(crate) use profile::ProfiledDrop;

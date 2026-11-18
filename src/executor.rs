@@ -251,6 +251,8 @@ impl Database {
         }
         let change = durable_change(&statement);
         let undo = self.prepare_durable(&change);
+        #[cfg(test)]
+        let undo = crate::storage::ProfiledDrop::new(undo, |p| &mut p.undo_drop);
         let memory_mark = crate::storage::phase_start();
         let applied = self.apply(statement);
         crate::storage::add_memory(memory_mark);
@@ -271,6 +273,8 @@ impl Database {
         }
         if let Err(error) = self.publish() {
             if let crate::storage::StepError::BeforeCommit(_) = &error {
+                #[cfg(test)]
+                let undo = undo.into_inner();
                 self.rollback(undo)?;
             } else {
                 // The commit may already be durable. Drop the journal without
@@ -25740,6 +25744,265 @@ mod tests {
                 }
             }
             assert_eq!(logs[0], logs[1], "{sql}");
+        }
+    }
+
+    // Add only newly measured exclusive intervals. image_build/snapshot_clone
+    // are already inside prepare/apply; publish_total encloses all publish work.
+    fn milestone50_accounted(p: &crate::storage::Profile) -> u128 {
+        milestone39_gap(0, p).0
+            + p.durable_prepare.as_micros()
+            + p.undo_drop.as_micros()
+            + p.image_validate.as_micros()
+            + p.image_drop.as_micros()
+            + p.publish_order.as_micros()
+            + p.snapshot_install.as_micros()
+    }
+
+    #[test]
+    fn insert_profile_accounting_does_not_add_enclosing_timers() {
+        use std::time::Duration as D;
+        let p = crate::storage::Profile {
+            parse: D::from_micros(10),
+            memory: D::from_micros(100),
+            plan: D::from_micros(20),
+            undo: D::from_micros(30),
+            prepare: D::from_micros(40),
+            image_build: D::from_micros(30),
+            apply: D::from_micros(80),
+            compare: D::from_micros(10),
+            page_gather: D::from_micros(5),
+            snapshot_clone: D::from_micros(10),
+            wal_encode: D::from_micros(20),
+            durable_prepare: D::from_micros(10),
+            undo_drop: D::from_micros(15),
+            image_validate: D::from_micros(20),
+            image_drop: D::from_micros(5),
+            publish_order: D::from_micros(1),
+            snapshot_install: D::from_micros(2),
+            publish_total: D::from_micros(500),
+            ..Default::default()
+        };
+        assert_eq!(milestone50_accounted(&p), 303);
+        assert_eq!(1000_i128 - milestone50_accounted(&p) as i128, 697);
+    }
+
+    #[test]
+    fn insert_phase_measurement_preserves_results_and_bytes() {
+        let (_dir, base) = publish_image_fixture("m50-bytes");
+        let _phases = crate::storage::enable_phases();
+        for (case, sql, expected_rows) in [
+            (
+                "one",
+                "INSERT INTO users VALUES (401, 'added', TRUE, 1);",
+                402,
+            ),
+            (
+                "batch",
+                "INSERT INTO users VALUES (401, 'a', TRUE, NULL), (402, 'b', FALSE, 3);",
+                403,
+            ),
+            (
+                "update",
+                "UPDATE users SET name = 'edited' WHERE id = 2;",
+                0,
+            ),
+            ("select", "SELECT * FROM users WHERE id = 2;", 0),
+        ] {
+            let mut observations = Vec::new();
+            for enabled in [false, true] {
+                crate::storage::set_phases_enabled(false);
+                let (_dir, path, mut db) = open_copy(&base, &format!("m50-{case}-{enabled}"));
+                crate::storage::reset_phases();
+                crate::storage::set_phases_enabled(enabled);
+                let result = db.execute(sql).unwrap();
+                let p = crate::storage::take_phases();
+                crate::storage::set_phases_enabled(false);
+                if enabled {
+                    assert_eq!(p.full_image_rows, expected_rows);
+                    assert_eq!(p.full_image_validations, u64::from(expected_rows != 0));
+                } else {
+                    assert_eq!(p, Default::default());
+                }
+                let ids = db.table("users").unwrap().row_ids().to_vec();
+                let next = db.table("users").unwrap().next_row_id();
+                let bytes = db_file(&path);
+                drop(db);
+                let mut reopened = Database::open(&path).unwrap();
+                observations.push((
+                    result,
+                    bytes,
+                    ids,
+                    next,
+                    table_rows(&mut reopened),
+                    index_postings(&mut reopened, "idx_users_id"),
+                    index_postings(&mut reopened, "idx_users_bucket"),
+                ));
+            }
+            assert_eq!(observations[0], observations[1], "{case}");
+        }
+    }
+
+    #[test]
+    fn insert_phase_measurement_preserves_wal_and_failure_paths() {
+        let (_dir, base) = publish_image_fixture("m50-recovery");
+        let wide = format!(
+            "INSERT INTO users VALUES (401, '{}', TRUE, 1);",
+            "x".repeat(3000)
+        );
+        let _phases = crate::storage::enable_phases();
+        for (case, sql) in [
+            "INSERT INTO users VALUES (401, 'added', TRUE, 1);",
+            "INSERT INTO users VALUES (401, 'a', TRUE, NULL), (402, 'b', FALSE, 3);",
+            "INSERT INTO spare VALUES (2, 'other table');",
+            wide.as_str(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut logs = Vec::new();
+            for enabled in [false, true] {
+                crate::storage::set_phases_enabled(enabled);
+                let label = format!("m50-fault-{case}-{enabled}");
+                let (_dir, path, mut db) = open_copy(&base, &label);
+                db.set_inject(crate::storage::Inject::AfterLogSync);
+                assert!(db.execute(sql).is_err());
+                logs.push(wal_bytes(&path));
+                assert_precommit(&base, &label, sql, crate::storage::Inject::BeforeLogSync);
+                for inject in [
+                    crate::storage::Inject::AfterLogSync,
+                    crate::storage::Inject::CommitSyncFailed,
+                    crate::storage::Inject::DuringCheckpoint(1),
+                ] {
+                    assert_postcommit(&base, &format!("{label}-{inject:?}"), sql, inject);
+                }
+                // Apply fails before publish: the unconsumed undo is dropped
+                // at the original return, and the next valid statement works.
+                let (_err_dir, err_path, mut err_db) = open_copy(&base, &format!("{label}-apply"));
+                let before = db_file(&err_path);
+                assert!(
+                    err_db
+                        .execute("INSERT INTO users VALUES ('wrong type', 'x', TRUE, 1);")
+                        .is_err()
+                );
+                assert_eq!(db_file(&err_path), before);
+                err_db
+                    .execute("INSERT INTO users VALUES (401, 'after error', TRUE, 1);")
+                    .unwrap();
+            }
+            assert_eq!(logs[0], logs[1], "{sql}");
+        }
+    }
+
+    #[test]
+    #[ignore = "release attribution of full INSERT preparation, validation and cleanup"]
+    fn profile_milestone50() {
+        println!(
+            "milestone50 cpu={} os={} rustc={} seed=0x3100 durable=true warmup=1",
+            profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]),
+            profile_command("uname", &["-smr"]),
+            profile_command("rustc", &["--version"])
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [1_000_i64, 10_000, 100_000] {
+            crate::storage::set_phases_enabled(false);
+            let (_dir, base) = seed_delete_db("m50-base", rows, 0x3100);
+            for kind in ["insert-one", "insert-batch", "update-index"] {
+                let sql = milestone39_sql(kind, rows);
+                let mut off_walls = Vec::new();
+                let mut on_walls = Vec::new();
+                for sample in 0..5 {
+                    let run = |enabled: bool| {
+                        crate::storage::set_phases_enabled(false);
+                        let (_dir, path, mut db) =
+                            open_copy(&base, &format!("m50-{kind}-{sample}-{enabled}"));
+                        db.execute("SELECT COUNT(*) FROM users;").unwrap();
+                        crate::storage::reset_phases();
+                        crate::storage::set_phases_enabled(enabled);
+                        let started = std::time::Instant::now();
+                        let result = db.execute(&sql).unwrap();
+                        let wall = started.elapsed().as_micros();
+                        let p = crate::storage::take_phases();
+                        crate::storage::set_phases_enabled(false);
+                        if enabled {
+                            let (_, legacy_gap) = milestone39_gap(wall, &p);
+                            let gap = wall as i128 - milestone50_accounted(&p) as i128;
+                            let publish_sum = p.prepare
+                                + p.apply
+                                + p.wal_encode
+                                + p.wal_write
+                                + p.wal_sync
+                                + p.db_write
+                                + p.db_sync
+                                + p.wal_clear
+                                + p.image_validate
+                                + p.image_drop
+                                + p.publish_order
+                                + p.snapshot_install;
+                            let publish_gap = p.publish_total.as_micros() as i128
+                                - publish_sum.as_micros() as i128;
+                            println!(
+                                "milestone50 sample kind={kind} rows={rows} n={sample} enabled=true wall_us={wall} legacy_gap_us={legacy_gap} gap_us={gap} publish_gap_us={publish_gap} durable_prepare_us={} undo_drop_us={} image_build_us={} image_validate_us={} image_drop_us={} publish_order_us={} snapshot_clone_us={} snapshot_install_us={} publish_us={} prepare_us={} apply_us={} memory_us={} wal_encode_us={} wal_write_us={} wal_sync_us={} db_write_us={} db_sync_us={} wal_clear_us={} validations={} validated_rows={} wal_bytes={} frames={}",
+                                p.durable_prepare.as_micros(),
+                                p.undo_drop.as_micros(),
+                                p.image_build.as_micros(),
+                                p.image_validate.as_micros(),
+                                p.image_drop.as_micros(),
+                                p.publish_order.as_micros(),
+                                p.snapshot_clone.as_micros(),
+                                p.snapshot_install.as_micros(),
+                                p.publish_total.as_micros(),
+                                p.prepare.as_micros(),
+                                p.apply.as_micros(),
+                                p.memory.as_micros(),
+                                p.wal_encode.as_micros(),
+                                p.wal_write.as_micros(),
+                                p.wal_sync.as_micros(),
+                                p.db_write.as_micros(),
+                                p.db_sync.as_micros(),
+                                p.wal_clear.as_micros(),
+                                p.full_image_validations,
+                                p.full_image_rows,
+                                p.wal_bytes,
+                                p.frames
+                            );
+                            if kind.starts_with("insert") {
+                                assert_eq!(p.full_image_validations, 1);
+                                assert_eq!(
+                                    p.full_image_rows,
+                                    rows as u64 + if kind == "insert-one" { 1 } else { 32 }
+                                );
+                            } else {
+                                assert_eq!(p.full_image_validations, 0);
+                            }
+                        } else {
+                            assert_eq!(p, Default::default());
+                            println!(
+                                "milestone50 sample kind={kind} rows={rows} n={sample} enabled=false wall_us={wall}"
+                            );
+                        }
+                        (wall, result, mutation_checksum(&mut db), db_file(&path))
+                    };
+                    let (off, on) = if sample % 2 == 0 {
+                        (run(false), run(true))
+                    } else {
+                        let on = run(true);
+                        (run(false), on)
+                    };
+                    assert_eq!((&off.1, &off.2, &off.3), (&on.1, &on.2, &on.3));
+                    off_walls.push(off.0);
+                    on_walls.push(on.0);
+                }
+                println!(
+                    "milestone50 median kind={kind} rows={rows} samples=5 off_us={} on_us={} off_min={} off_max={} on_min={} on_max={}",
+                    median(&off_walls),
+                    median(&on_walls),
+                    off_walls.iter().min().unwrap(),
+                    off_walls.iter().max().unwrap(),
+                    on_walls.iter().min().unwrap(),
+                    on_walls.iter().max().unwrap()
+                );
+            }
         }
     }
 

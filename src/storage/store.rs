@@ -281,8 +281,12 @@ impl Store {
         if let Some(error) = &self.fence {
             return Err(StepError::AfterCommit(error.clone()));
         }
-        let mut ordered: Vec<&TableImage> = tables.iter().collect();
-        ordered.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut ordered = {
+            let _order = profile::Timer::new(|p| &mut p.publish_order);
+            let mut ordered: Vec<&TableImage> = tables.iter().collect();
+            ordered.sort_by(|left, right| left.name.cmp(&right.name));
+            ordered
+        };
         validate(&ordered).map_err(StepError::BeforeCommit)?;
         let prepare = profile::start();
         // The editor reads these images synchronously and retains no references
@@ -300,7 +304,11 @@ impl Store {
         let base_commit = self.state.commit_id;
         let nonce = self.state.nonce;
         let apply_mark = profile::start();
-        let prepared = Editor::new(self.state.clone())
+        let snapshot = {
+            let _clone = profile::Timer::new(|p| &mut p.snapshot_clone);
+            self.state.clone()
+        };
+        let prepared = Editor::new(snapshot)
             .apply(&mut self.pager, &ordered, indexes)
             .map_err(StepError::BeforeCommit)?;
         profile::add_apply(apply_mark);
@@ -398,6 +406,7 @@ impl Store {
             self.inject.take(),
         ) {
             Ok(()) => {
+                let _install = profile::Timer::new(|p| &mut p.snapshot_install);
                 self.state = prepared.snapshot;
                 Ok(())
             }
@@ -523,6 +532,9 @@ fn migrate_v2(path: &Path) -> Result<(), DbError> {
 }
 
 fn validate(tables: &[&TableImage]) -> Result<(), DbError> {
+    let _validate = profile::Timer::new(|p| &mut p.image_validate);
+    #[cfg(test)]
+    profile::note_full_image_validation(tables.iter().map(|t| t.rows.len()).sum());
     let mut names = HashSet::with_capacity(tables.len());
     for table in tables {
         if table.name.is_empty() || !names.insert(table.name.as_str()) {
