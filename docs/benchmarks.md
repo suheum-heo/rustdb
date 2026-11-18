@@ -2218,3 +2218,94 @@ Decision: merge. M37/M38/M41/M44/M47 experiments remain absent. This completes
 the targeted row-lookup and duplicate-image-copy improvements. Further INSERT
 work would need to address the first image construction and full-image validation
 with their correctness boundaries explicitly preserved; neither is bypassed here.
+
+## Milestone 50: account for INSERT preparation and cleanup
+
+17 Nov 2026, Apple M5, Darwin 25.2.0 arm64, Rust 1.100.0, baseline M49
+merge `cd1f5c4`. This is a measurement milestone, with no claimed speedup.
+The M49 follow-up left roughly 7 ms of a 100,000-row INSERT outside the
+existing timers. The gap was not all validation: durable rollback preparation
+copies the table before `memory` starts, and both that copy and the original
+publish image are destroyed outside the old intervals.
+
+New optional timers cover durable preparation, undo cleanup, image construction,
+full image validation, image cleanup, reference ordering, store snapshot cloning,
+snapshot installation, and the enclosing publish call. Validation counters count
+full-image calls and rows; selective update/delete audits are deliberately not
+included. No validation, allocation, persistence, or recovery check is removed.
+The cleanup wrappers exist only in tests, drop at the original scope exit, and
+give ownership back to rollback without an early drop. The other timers use the
+existing optional recorder, adding no production clock samples. The preexisting
+durable-snapshot diagnostic clock is unchanged.
+
+Accounting adds only disjoint intervals. `image_build` is inside `prepare`,
+`snapshot_clone` is inside `apply`, and `publish_total` encloses publish work;
+none is added again. Existing planning/undo timers remain inside `memory`.
+Signed residuals are reported, with integer-microsecond rounding. Tests check
+the accounting with synthetic durations rather than timing thresholds.
+
+Run `cargo test --release --locked --lib profile_milestone50 -- --ignored --nocapture`.
+Two isolated passes use seed `0x3100`, durable syncs, fresh database copies,
+one read warmup, and five alternating recorder-off/on pairs for each of one-row
+INSERT, 32-row INSERT, and indexed UPDATE at 1,000/10,000/100,000 rows.
+Each pair compares results, result checksum, and exact database bytes outside
+the timed statement. The table below reports individual phase medians in µs
+at 100,000 existing rows; medians of components need not sum to a median total.
+
+| phase | one row, pass 1 | one row, pass 2 | 32 rows, pass 1 | 32 rows, pass 2 |
+| --- | ---: | ---: | ---: | ---: |
+| statement wall | 20,693 | 21,122 | 20,975 | 20,817 |
+| old unexplained gap | 7,146 | 6,756 | 7,106 | 6,772 |
+| durable undo preparation | 2,476 | 2,229 | 2,423 | 2,298 |
+| undo cleanup | 1,580 | 1,558 | 1,584 | 1,546 |
+| full image validation | 1,553 | 1,473 | 1,562 | 1,432 |
+| image cleanup | 1,541 | 1,426 | 1,496 | 1,415 |
+| new unexplained gap | 85 | 95 | 102 | 91 |
+| image build (inside prepare) | 2,447 | 2,122 | 2,402 | 2,225 |
+| store snapshot clone (inside apply) | 23 | 24 | 24 | 23 |
+| snapshot installation | 1 | 1 | 1 | 1 |
+
+The new residual is about 1.2–1.4% of the old gap for one row and 1.3–1.4%
+for a batch. The large costs are the rollback copy and disposal, full validation,
+and original-image disposal; store snapshot cloning is comparatively small.
+The original image build costs another 2.1–2.4 ms already inside preparation.
+Exactly one full validation visits 100,001 or 100,032 rows. WAL output stays
+36,996 bytes / 9 frames for one row and 41,096 bytes / 10 frames for a batch.
+The indexed UPDATE control records zero full-image validations and retains a
+1.57–1.66 ms residual; M50 does not claim to explain that separate selective path.
+
+Recorder-off/on statement medians and ranges at 100,000 rows, in µs:
+
+| workload | pass | off median (range) | on median (range) |
+| --- | --- | --- | --- |
+| one row | 1 | 21,415 (20,388–22,361) | 20,693 (20,223–22,387) |
+| one row | 2 | 21,597 (19,457–24,771) | 21,122 (19,834–21,969) |
+| 32 rows | 1 | 21,479 (20,604–22,270) | 20,975 (20,648–21,037) |
+| 32 rows | 2 | 21,051 (20,651–21,586) | 20,817 (19,070–21,246) |
+| indexed update | 1 | 12,700 (12,457–13,324) | 13,822 (13,437–14,091) |
+| indexed update | 2 | 13,978 (12,216–14,513) | 13,439 (12,916–14,095) |
+
+These durable timings are noisy: the update effect changes sign across passes,
+and the 10,000-row batch in pass 2 measures 11,074 µs off versus 13,042 on.
+Do not interpret recorder-on wins as optimizations or claim a tight overhead
+bound. Both arms use the same test binary and test-only cleanup wrappers;
+this comparison measures enabling the entire recorder, not the wrappers'
+structural effect or the new timers in isolation. Attribution is repeatable,
+but a future optimization needs its own paired baseline comparison.
+
+Validation: formatting, strict Clippy, all-target build, and the full locked
+test suite pass: 621 passed, 0 failed, 43 ignored, including one doctest.
+All 17 storage reliability tests also pass with `PROPTEST_CASES=256`.
+New tests compare recording on/off results, row IDs/counters, exact file bytes,
+reopened rows and both indexes, plus exact WAL bytes. Single/batch/other-table/
+wide INSERTs cover precommit rollback, after-log-sync recovery, ambiguous sync,
+partial checkpoint, fencing, repeated reopen, and application type errors.
+The ownership wrapper is checked for scope exit, consumed ownership, and unwind.
+These are injected failures, not physical power-loss tests.
+
+Decision: merge the diagnostic improvement. Page/WAL formats, checksums, and
+recovery guarantees stay unchanged; M37/M38/M41/M44/M47 experiments remain absent.
+The next candidate is an INSERT-specific rollback journal replacing the whole
+table snapshot, subject to atomic batch insertion, row-ID/counter restoration,
+index restoration, failure tests, and fresh measured benefit. M50 establishes
+the evidence for investigating that change; it does not implement it.

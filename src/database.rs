@@ -213,6 +213,7 @@ impl Database {
     }
 
     pub(crate) fn prepare_durable(&self, change: &DurableChange) -> Undo {
+        let _prepare = crate::storage::Timer::new(|p| &mut p.durable_prepare);
         match change {
             DurableChange::None => Undo::None,
             DurableChange::Create(name) => Undo::Remove {
@@ -645,6 +646,7 @@ impl Database {
     }
 
     pub(crate) fn publish(&mut self) -> Result<(), StepError> {
+        let _publish = crate::storage::Timer::new(|p| &mut p.publish_total);
         let selective = self.selective.take();
         let deleted = self.delete_targets.take();
         if self.store.is_none() {
@@ -668,8 +670,13 @@ impl Database {
             return self.publish_deleted(name, deleted_ids);
         }
         let prepare = crate::storage::publish_timer();
-        let images: Vec<TableImage> = self.tables.values().map(Table::image).collect();
+        let images: Vec<TableImage> = {
+            let _build = crate::storage::Timer::new(|p| &mut p.image_build);
+            self.tables.values().map(Table::image).collect()
+        };
         crate::storage::add_publish_prepare(prepare);
+        #[cfg(test)]
+        let images = crate::storage::ProfiledDrop::new(images, |p| &mut p.image_drop);
         #[cfg(test)]
         note_publish_images(images.len());
         let Some(store) = self.store.as_mut() else {
