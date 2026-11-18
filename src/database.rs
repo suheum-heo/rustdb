@@ -703,6 +703,17 @@ impl Database {
         {
             return self.publish_deleted(name, deleted_ids);
         }
+        if !crate::storage::owned_publish_forced() {
+            let prepare = crate::storage::publish_timer();
+            let mut views: Vec<_> = self.tables.values().map(Table::view).collect();
+            crate::storage::add_publish_prepare(prepare);
+            #[cfg(test)]
+            note_publish_images(views.len());
+            let Some(store) = self.store.as_mut() else {
+                return Err(Self::missing_store());
+            };
+            return store.publish_views(&mut views, &self.indexes);
+        }
         let prepare = crate::storage::publish_timer();
         let images: Vec<TableImage> = {
             let _build = crate::storage::Timer::new(|p| &mut p.image_build);
@@ -1092,7 +1103,7 @@ pub(crate) fn reset_publish_images() {
     PUBLISH_IMAGES.with(|slot| slot.set(0));
 }
 
-/// Table images built by the full publish path since the last reset.
+/// Tables supplied to full publish (owned images or borrowed views) since reset.
 ///
 /// A selective `DELETE` leaves this at zero. The full-image guard increments
 /// it by the number of tables.

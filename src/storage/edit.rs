@@ -12,7 +12,7 @@ use crate::storage::page::{self, PAGE_SIZE, Page};
 use crate::storage::pager::Pager;
 use crate::storage::profile;
 use crate::storage::record::{self, IndexCatalog, Link, NULL_LINK, StoredRecord};
-use crate::storage::store::{IndexImage, MemoryRows, TableImage};
+use crate::storage::store::{IndexImage, MemoryRows, TableView};
 use crate::value::{DataType, Value};
 
 const FREE_DIRECTORY_CAPACITY: usize = (PAGE_SIZE - 28) / 4;
@@ -90,11 +90,10 @@ impl Editor {
     pub(crate) fn apply(
         mut self,
         pager: &mut Pager,
-        desired: &[&TableImage],
+        desired: &[TableView<'_>],
         indexes: &[IndexImage],
     ) -> Result<Option<Prepared>, DbError> {
-        let desired_names: HashSet<&str> =
-            desired.iter().map(|table| table.name.as_str()).collect();
+        let desired_names: HashSet<&str> = desired.iter().map(|table| table.name).collect();
         self.drop_absent_indexes(pager, indexes)?;
         let existing: Vec<String> = self.snapshot.tables.keys().cloned().collect();
         for name in existing {
@@ -103,14 +102,14 @@ impl Editor {
             }
         }
         for table in desired {
-            if self.snapshot.tables.contains_key(&table.name) {
+            if self.snapshot.tables.contains_key(table.name) {
                 self.sync_table(pager, table)?;
             } else {
                 self.create_table(pager, table)?;
-                for (row_id, values) in &table.rows {
-                    self.append_row(pager, &table.name, *row_id, values)?;
+                for (row_id, values) in table.rows.iter() {
+                    self.append_row(pager, table.name, row_id, values)?;
                 }
-                self.set_next_row_id(pager, &table.name, table.next_row_id)?;
+                self.set_next_row_id(pager, table.name, table.next_row_id)?;
             }
         }
         self.create_missing_indexes(pager, indexes)?;
@@ -265,12 +264,12 @@ impl Editor {
         }))
     }
 
-    fn create_table(&mut self, pager: &mut Pager, table: &TableImage) -> Result<(), DbError> {
+    fn create_table(&mut self, pager: &mut Pager, table: &TableView<'_>) -> Result<(), DbError> {
         let table_id = self.next_table_id()?;
-        let bytes = record::encode_catalog(table_id, 1, NULL_LINK, &table.name, &table.columns)?;
+        let bytes = record::encode_catalog(table_id, 1, NULL_LINK, table.name, table.columns)?;
         let (page_id, slot) = self.insert_catalog(pager, &bytes)?;
         self.snapshot.tables.insert(
-            table.name.clone(),
+            table.name.to_string(),
             LiveTable {
                 table_id,
                 catalog_page: page_id,
@@ -318,25 +317,25 @@ impl Editor {
         Ok(())
     }
 
-    fn sync_table(&mut self, pager: &mut Pager, desired: &TableImage) -> Result<(), DbError> {
-        let current_ids = self.snapshot.tables[&desired.name].row_ids.clone();
-        let desired_ids: Vec<u64> = desired.rows.iter().map(|(id, _)| *id).collect();
+    fn sync_table(&mut self, pager: &mut Pager, desired: &TableView<'_>) -> Result<(), DbError> {
+        let current_ids = self.snapshot.tables[desired.name].row_ids.clone();
+        let desired_ids: Vec<u64> = desired.rows.iter().map(|(id, _)| id).collect();
         if desired_ids == current_ids {
             for (index, (row_id, values)) in desired.rows.iter().enumerate() {
-                self.rewrite_row(pager, &desired.name, index, *row_id, values)?;
+                self.rewrite_row(pager, desired.name, index, row_id, values)?;
             }
         } else if desired_ids.starts_with(&current_ids) {
             for (row_id, values) in desired.rows.iter().skip(current_ids.len()) {
-                self.append_row(pager, &desired.name, *row_id, values)?;
+                self.append_row(pager, desired.name, row_id, values)?;
             }
         } else if is_subsequence(&desired_ids, &current_ids) {
             let keep: HashSet<u64> = desired_ids.into_iter().collect();
             loop {
-                let ids = &self.snapshot.tables[&desired.name].row_ids;
+                let ids = &self.snapshot.tables[desired.name].row_ids;
                 let Some(index) = ids.iter().rposition(|id| !keep.contains(id)) else {
                     break;
                 };
-                self.unlink_row(pager, &desired.name, index)?;
+                self.unlink_row(pager, desired.name, index)?;
             }
         } else {
             return Err(DbError::Internal(format!(
@@ -344,7 +343,7 @@ impl Editor {
                 desired.name
             )));
         }
-        self.set_next_row_id(pager, &desired.name, desired.next_row_id)?;
+        self.set_next_row_id(pager, desired.name, desired.next_row_id)?;
         Ok(())
     }
 
