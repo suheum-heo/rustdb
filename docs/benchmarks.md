@@ -2309,3 +2309,88 @@ The next candidate is an INSERT-specific rollback journal replacing the whole
 table snapshot, subject to atomic batch insertion, row-ID/counter restoration,
 index restoration, failure tests, and fresh measured benefit. M50 establishes
 the evidence for investigating that change; it does not implement it.
+
+## Milestone 51: restore INSERT from its append boundary
+
+18 Nov 2026, Apple M5, Rust 1.100.0. Baseline M50 merge `b776baf`.
+M50 measured the full-table rollback copy and its disposal at roughly 4 ms
+for INSERT into 100,000 existing rows. INSERT appends values and stable IDs;
+it does not alter existing rows, schema, or the database's index definitions.
+The store builds and commits changed index pages independently.
+
+The durable INSERT undo now retains the table name, original row count, and
+original next-row-ID counter. Before-commit failure checks the appended suffix's
+length, consecutive IDs, counter, and position-map entries before removing any
+memory. It then removes those positions, truncates rows/IDs, and restores the
+counter. Restore costs scale with appended rows, with no new allocation in the
+successful restore path. The original vector/map capacities may remain enlarged
+after a failed insert; logical state is restored. If restoration cannot be
+confirmed, the database is fenced until reopen. After-commit/ambiguous failures
+retain the existing recovery behavior and never apply the undo.
+
+The old full-table snapshot remains behind `ForceFullUndo` for differential
+tests and benchmarks. INSERT validation and application order are unchanged.
+The first publish image construction, full-image validation, index maintenance,
+page/WAL encoding, checksums, and durability barriers remain unchanged. This
+does not make the entire INSERT path constant-time or eliminate its O(n) image
+work. M37/M38/M41/M44/M47 rejected experiments remain absent.
+
+New tests compare snapshot and append undo for repeated rollback/retry sequences
+with deletion gaps, row IDs/counters/positions, exact database bytes, and both
+indexes. Single/batch/other-table/wide INSERTs cover exact WAL equality, pre-sync
+rollback, after-log-sync recovery, ambiguous commit sync, partial checkpoint,
+fencing and repeated reopen. A forced undo failure must fence until reopen.
+Boundary tests cover malformed restore metadata/positions, an empty table, and
+row IDs near u64::MAX. Existing atomic batch/type/overflow tests remain in the
+full suite. Injected failures are not physical power-loss testing.
+
+`cargo test --release --locked --lib profile_milestone51 -- --ignored --nocapture`
+uses fresh copies, durable syncs, one read warmup, seed `0x3100`, and five pairs
+per workload at 1,000/10,000/100,000 rows, alternating execution order. Both arms
+have recording enabled. The indexed UPDATE control deliberately uses the same
+implementation in both arms. Results, checksums, exact database bytes, WAL byte
+counts and frame counts are compared outside the timed statement. Exact WAL
+content is additionally checked by the recovery tests. No peak RSS measurement
+or timing assertion is used.
+
+Two isolated release passes measured µs at 100,000 existing rows:
+
+| workload | pass | append median (range) | snapshot median (range) | median improvement |
+| --- | --- | --- | --- | --- |
+| one row | 1 | 18,648 (16,690–20,217) | 23,464 (21,798–31,077) | 20.5% |
+| one row | 2 | 17,575 (16,417–18,310) | 21,918 (21,414–22,223) | 19.8% |
+| 32 rows | 1 | 17,831 (17,004–18,077) | 22,011 (21,334–23,053) | 19.0% |
+| 32 rows | 2 | 16,282 (15,497–17,610) | 20,858 (19,773–21,947) | 21.9% |
+
+Both INSERT workloads improve in all ten paired copies across both passes.
+Paired median savings are 5,108/3,839 µs for one row and 4,330/4,337 µs for
+32 rows in passes 1/2. Pass 1 durable preparation/undo disposal medians fall
+from 3,180/1,613 µs to below the timer's 1 µs reporting resolution for one row,
+and from 2,490/1,534 µs to below 1 µs for the batch. Sub-microsecond reports
+are not zero execution cost.
+
+Small tables do not show a reliable wall-time improvement. At 1,000 rows,
+one-row medians are 12,122 vs 11,300 µs in pass 1 and 10,766 vs 10,192 in
+pass 2 (append vs snapshot). At 10,000 rows, one-row medians are 11,793 vs
+12,400 and 12,140 vs 11,997; batch medians are 13,215 vs 12,443 and 12,150
+vs 12,102. The identical-path UPDATE control also shows substantial timing
+variation: at 100,000 rows its two arms measure 13,316 vs 14,507 µs in pass 1
+and 13,025 vs 13,165 in pass 2. No control speedup or small-table speedup is
+claimed. Durable sync noise and allocator/cache effects limit precision; the
+large-table benefit is supported by both disjoint ranges and paired results.
+
+At 100,000 rows, one-row INSERT retains WAL 36,996 bytes / 9 frames / result
+checksum 5,001,582,569; the batch retains 41,096 bytes / 10 frames / checksum
+5,004,683,315. Every paired database file is byte-identical.
+
+Validation: formatting, strict Clippy, all-target build, full locked suite
+625 passed / 0 failed / 44 ignored (including a doctest), and all 17 storage
+reliability tests with `PROPTEST_CASES=256`. Both release profile passes pass.
+An existing test's snapshot-count expectation for ordinary INSERT changes from
+one to zero; its row-ID expectations are unchanged.
+
+Decision: merge. The requested INSERT rollback-copy optimization has measured
+benefit with recovery checks preserved. Further INSERT work still needs to
+address the first publish image and its cleanup/validation. A next milestone
+should profile that remaining path and establish whether borrowing live table
+rows can preserve its validation and ownership boundaries before implementation.

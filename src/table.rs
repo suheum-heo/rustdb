@@ -110,6 +110,34 @@ impl Table {
         Ok(count)
     }
 
+    /// Undo only the appended suffix. Validate before changing any memory;
+    /// retained rows, positions, schema and index definitions are untouched.
+    pub(crate) fn restore_insert(&mut self, rows: usize, next_row_id: u64) -> Result<(), DbError> {
+        let invalid = || DbError::Storage("insert undo boundary is inconsistent".into());
+        let added = self.rows.len().checked_sub(rows).ok_or_else(invalid)?;
+        let added = u64::try_from(added).map_err(|_| invalid())?;
+        if self.row_ids.len() != self.rows.len()
+            || self.positions.len() != self.rows.len()
+            || next_row_id.checked_add(added) != Some(self.next_row_id)
+        {
+            return Err(invalid());
+        }
+        for (offset, id) in self.row_ids[rows..].iter().copied().enumerate() {
+            if next_row_id.checked_add(offset as u64) != Some(id)
+                || self.positions.get(&id) != Some(&(rows + offset))
+            {
+                return Err(invalid());
+            }
+        }
+        for id in &self.row_ids[rows..] {
+            self.positions.remove(id);
+        }
+        self.rows.truncate(rows);
+        self.row_ids.truncate(rows);
+        self.next_row_id = next_row_id;
+        Ok(())
+    }
+
     fn align_row(&self, positions: &[usize], row: Vec<Value>) -> Result<Vec<Value>, DbError> {
         if row.len() != positions.len() {
             return Err(DbError::ValueCount {
@@ -666,6 +694,45 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn append_restore_checks_boundary_and_restores_extreme_counter() {
+        let mut table = users();
+        table.next_row_id = u64::MAX - 2;
+        let mark = table.next_row_id;
+        table
+            .insert(
+                &[],
+                vec![
+                    vec![Value::Integer(1), Value::Text("a".into())],
+                    vec![Value::Integer(2), Value::Text("b".into())],
+                ],
+            )
+            .unwrap();
+        let before = table.clone();
+        assert!(table.restore_insert(3, mark).is_err());
+        assert!(table.restore_insert(0, mark - 1).is_err());
+        assert_eq!(table.rows, before.rows);
+        assert_eq!(table.row_ids, before.row_ids);
+        assert_eq!(table.positions, before.positions);
+        assert_eq!(table.next_row_id, before.next_row_id);
+        table.positions.insert(mark, 1);
+        assert!(table.restore_insert(0, mark).is_err());
+        assert_eq!(table.rows, before.rows);
+        table.positions.insert(mark, 0);
+        table.restore_insert(0, mark).unwrap();
+        assert!(table.rows.is_empty());
+        assert!(table.row_ids.is_empty());
+        assert!(table.positions.is_empty());
+        assert_eq!(table.next_row_id, mark);
+        table
+            .insert(
+                &[],
+                vec![vec![Value::Integer(3), Value::Text("retry".into())]],
+            )
+            .unwrap();
+        assert_eq!(table.row_ids, vec![mark]);
     }
 
     #[test]

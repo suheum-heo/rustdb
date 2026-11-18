@@ -3138,7 +3138,13 @@ fn durable_change(statement: &Statement) -> DurableChange {
     match statement {
         Statement::CreateTable { name, .. } => DurableChange::Create(name.clone()),
         Statement::DropTable { names } => DurableChange::Drop(names.clone()),
-        Statement::Insert { table, .. } => DurableChange::Write(table.clone()),
+        Statement::Insert { table, .. } => {
+            if force_full_undo() {
+                DurableChange::Write(table.clone())
+            } else {
+                DurableChange::Insert(table.clone())
+            }
+        }
         Statement::Delete { table, .. } => {
             if force_full_undo() {
                 DurableChange::Write(table.clone())
@@ -17950,7 +17956,7 @@ mod tests {
         assert_eq!(db.table("users").unwrap().next_row_id(), 6);
         db.execute("INSERT INTO users VALUES (9, 'Zed', TRUE, 1);")
             .unwrap();
-        assert_eq!(crate::database::table_snapshots(), 1);
+        assert_eq!(crate::database::table_snapshots(), 0);
         assert_eq!(db.table("users").unwrap().next_row_id(), 7);
     }
 
@@ -25840,6 +25846,191 @@ mod tests {
                 ));
             }
             assert_eq!(observations[0], observations[1], "{case}");
+        }
+    }
+
+    #[test]
+    fn insert_append_undo_matches_snapshot_through_retries() {
+        let (_dir, base) = publish_image_fixture("m51-sequence");
+        let mut observations = Vec::new();
+        for snapshot in [false, true] {
+            let (_dir, path, mut db) = open_copy(&base, &format!("m51-sequence-{snapshot}"));
+            let _guard = snapshot.then(ForceFullUndo::new);
+            for n in 0..12 {
+                // Include deletion gaps and repeated counter restoration.
+                db.execute("DELETE FROM users WHERE id = 2;").unwrap();
+                let sql = format!(
+                    "INSERT INTO users VALUES ({}, 'a', TRUE, NULL), ({}, 'b', FALSE, 3);",
+                    500 + n * 2,
+                    501 + n * 2
+                );
+                let before = db.table("users").unwrap().clone();
+                let bytes = db_file(&path);
+                db.set_inject(crate::storage::Inject::BeforeLogSync);
+                assert!(db.execute(&sql).is_err());
+                let table = db.table("users").unwrap();
+                assert_eq!(table.rows(), before.rows());
+                assert_eq!(table.row_ids(), before.row_ids());
+                assert_eq!(table.next_row_id(), before.next_row_id());
+                for (position, id) in table.row_ids().iter().copied().enumerate() {
+                    assert_eq!(table.position(id), Some(position));
+                }
+                assert_eq!(db_file(&path), bytes);
+                db.execute(&sql).unwrap();
+                assert_eq!(crate::database::table_snapshots(), u64::from(snapshot));
+            }
+            observations.push((
+                db_file(&path),
+                table_rows(&mut db),
+                index_postings(&mut db, "idx_users_id"),
+                index_postings(&mut db, "idx_users_bucket"),
+            ));
+            drop(db);
+            let mut reopened = Database::open(&path).unwrap();
+            assert_eq!(table_rows(&mut reopened), observations.last().unwrap().1);
+        }
+        assert_eq!(observations[0], observations[1]);
+    }
+
+    #[test]
+    fn insert_append_undo_failure_fences_until_reopen() {
+        let (_dir, base) = publish_image_fixture("m51-fence");
+        let (_dir, path, mut db) = open_copy(&base, "m51-fence-copy");
+        let bytes = db_file(&path);
+        db.set_inject(crate::storage::Inject::BeforeLogSync);
+        {
+            let _guard = crate::database::FailUndoRestore::new();
+            let error = db
+                .execute("INSERT INTO users VALUES (401, 'x', TRUE, 1);")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not a confirmed rollback"));
+        }
+        assert!(db.execute("SELECT * FROM users;").is_err());
+        assert_eq!(db_file(&path), bytes);
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        db.execute("INSERT INTO users VALUES (401, 'x', TRUE, 1);")
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore = "release comparison of INSERT append undo with whole-table snapshots"]
+    fn profile_milestone51() {
+        println!(
+            "milestone51 cpu={} rustc={} seed=0x3100 durable=true warmup=1",
+            profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]),
+            profile_command("rustc", &["--version"])
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [1_000_i64, 10_000, 100_000] {
+            let (_dir, base) = seed_delete_db("m51-base", rows, 0x3100);
+            for kind in ["insert-one", "insert-batch", "update-index"] {
+                let sql = milestone39_sql(kind, rows);
+                let mut append = Vec::new();
+                let mut snapshot = Vec::new();
+                for n in 0..5 {
+                    let run = |full: bool| {
+                        let (_dir, path, mut db) =
+                            open_copy(&base, &format!("m51-{kind}-{n}-{full}"));
+                        db.execute("SELECT COUNT(*) FROM users;").unwrap();
+                        crate::storage::reset_phases();
+                        let _guard = (full && kind.starts_with("insert")).then(ForceFullUndo::new);
+                        let started = std::time::Instant::now();
+                        let result = db.execute(&sql).unwrap();
+                        let wall = started.elapsed().as_micros();
+                        let p = crate::storage::take_phases();
+                        let checksum = mutation_checksum(&mut db);
+                        println!(
+                            "milestone51 sample kind={kind} rows={rows} n={n} snapshot={full} wall_us={wall} durable_prepare_us={} undo_drop_us={} wal_bytes={} frames={} checksum={checksum}",
+                            p.durable_prepare.as_micros(),
+                            p.undo_drop.as_micros(),
+                            p.wal_bytes,
+                            p.frames
+                        );
+                        (
+                            wall,
+                            result,
+                            checksum,
+                            db_file(&path),
+                            p.wal_bytes,
+                            p.frames,
+                        )
+                    };
+                    let (fast, old) = if n % 2 == 0 {
+                        (run(false), run(true))
+                    } else {
+                        let old = run(true);
+                        (run(false), old)
+                    };
+                    assert_eq!(
+                        (&fast.1, &fast.2, &fast.3, &fast.4, &fast.5),
+                        (&old.1, &old.2, &old.3, &old.4, &old.5)
+                    );
+                    append.push(fast.0);
+                    snapshot.push(old.0);
+                }
+                println!(
+                    "milestone51 median kind={kind} rows={rows} append_us={} snapshot_us={} append_min={} append_max={} snapshot_min={} snapshot_max={}",
+                    median(&append),
+                    median(&snapshot),
+                    append.iter().min().unwrap(),
+                    append.iter().max().unwrap(),
+                    snapshot.iter().min().unwrap(),
+                    snapshot.iter().max().unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn insert_append_undo_matches_snapshot_recovery() {
+        let (_dir, base) = publish_image_fixture("m51-recovery");
+        let wide = format!(
+            "INSERT INTO users VALUES (401, '{}', TRUE, 1);",
+            "x".repeat(3000)
+        );
+        let _phases = crate::storage::enable_phases();
+        for (case, sql) in [
+            "INSERT INTO users VALUES (401, 'added', TRUE, 1);",
+            "INSERT INTO users VALUES (401, 'a', TRUE, NULL), (402, 'b', FALSE, 3);",
+            "INSERT INTO spare VALUES (2, 'other table');",
+            wide.as_str(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut logs = Vec::new();
+            for enabled in [false, true] {
+                let _snapshot = enabled.then(ForceFullUndo::new);
+                let label = format!("m51-fault-{case}-{enabled}");
+                let (_dir, path, mut db) = open_copy(&base, &label);
+                db.set_inject(crate::storage::Inject::AfterLogSync);
+                assert!(db.execute(sql).is_err());
+                logs.push(wal_bytes(&path));
+                assert_precommit(&base, &label, sql, crate::storage::Inject::BeforeLogSync);
+                for inject in [
+                    crate::storage::Inject::AfterLogSync,
+                    crate::storage::Inject::CommitSyncFailed,
+                    crate::storage::Inject::DuringCheckpoint(1),
+                ] {
+                    assert_postcommit(&base, &format!("{label}-{inject:?}"), sql, inject);
+                }
+                // Apply fails before publish: the unconsumed undo is dropped
+                // at the original return, and the next valid statement works.
+                let (_err_dir, err_path, mut err_db) = open_copy(&base, &format!("{label}-apply"));
+                let before = db_file(&err_path);
+                assert!(
+                    err_db
+                        .execute("INSERT INTO users VALUES ('wrong type', 'x', TRUE, 1);")
+                        .is_err()
+                );
+                assert_eq!(db_file(&err_path), before);
+                err_db
+                    .execute("INSERT INTO users VALUES (401, 'after error', TRUE, 1);")
+                    .unwrap();
+            }
+            assert_eq!(logs[0], logs[1], "{sql}");
         }
     }
 

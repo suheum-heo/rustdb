@@ -104,7 +104,9 @@ pub(crate) enum DurableChange {
     Create(String),
     /// `DROP TABLE` removed these names.
     Drop(Vec<String>),
-    /// `INSERT` changed this table.
+    /// `INSERT` appends to this table.
+    Insert(String),
+    /// Test-only comparison path: retain the full table.
     ///
     /// A test can also force `UPDATE` or `DELETE` through this path so the old
     /// full-table snapshot stays available for comparison.
@@ -134,6 +136,12 @@ pub(crate) enum Undo {
         tables: Vec<Table>,
         /// Index list from before the statement.
         indexes: Vec<IndexImage>,
+    },
+    /// Restore the pre-INSERT append boundary; index definitions do not change.
+    Insert {
+        table: String,
+        rows: usize,
+        next_row_id: u64,
     },
     /// Replace one table and restore the index list.
     Replace {
@@ -233,6 +241,14 @@ impl Database {
                     indexes: self.indexes.clone(),
                 }
             }
+            DurableChange::Insert(name) => match self.tables.get(name) {
+                Some(table) => Undo::Insert {
+                    table: name.clone(),
+                    rows: table.rows().len(),
+                    next_row_id: table.next_row_id(),
+                },
+                None => Undo::None,
+            },
             DurableChange::Write(name) => match self.tables.get(name) {
                 Some(table) => {
                     let started = std::time::Instant::now();
@@ -606,6 +622,24 @@ impl Database {
                 }
                 self.indexes = indexes;
                 Ok(())
+            }
+            Undo::Insert {
+                table,
+                rows,
+                next_row_id,
+            } => {
+                self.update_undo = None;
+                self.delete_undo = None;
+                #[cfg(test)]
+                if fail_undo_restore() {
+                    return Err(self.fence_uncertain("restore was forced to fail"));
+                }
+                let restored = self
+                    .tables
+                    .get_mut(&table)
+                    .ok_or_else(|| DbError::Storage("insert undo table is missing".into()))
+                    .and_then(|table| table.restore_insert(rows, next_row_id));
+                restored.map_err(|error| self.fence_uncertain(&error.to_string()))
             }
             Undo::Replace { table, indexes } => {
                 self.update_undo = None;
