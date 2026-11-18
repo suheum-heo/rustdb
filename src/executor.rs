@@ -25062,6 +25062,166 @@ mod tests {
     }
 
     #[test]
+    fn live_publish_views_match_copies_for_inserts_and_schema_edits() {
+        let (_dir, base) = publish_image_fixture("m52-images");
+        for (case, sql) in [
+            "INSERT INTO users VALUES (401, 'added', TRUE, 1);",
+            "INSERT INTO users VALUES (401, 'a', TRUE, NULL), (402, 'b', FALSE, 3);",
+            "INSERT INTO spare VALUES (2, 'other table');",
+            "CREATE TABLE later (id INT, name TEXT);",
+            "DROP TABLE spare;",
+            "CREATE INDEX idx_spare_id ON spare(id);",
+            "DROP INDEX idx_users_bucket;",
+            "UPDATE users SET name = 'edited' WHERE id = 2;",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (_fast_dir, fast_path, mut fast) = open_copy(&base, &format!("m52-fast-{case}"));
+            let (_old_dir, old_path, mut old) = open_copy(&base, &format!("m52-copy-{case}"));
+            let result = fast.execute(sql).unwrap();
+            let reference = {
+                let _guard = crate::storage::ForceOwnedPublish::new();
+                old.execute(sql).unwrap()
+            };
+            assert_eq!(result, reference, "{sql}");
+            assert_eq!(db_file(&fast_path), db_file(&old_path), "{sql}");
+            assert_eq!(
+                fast.table("users").unwrap().row_ids(),
+                old.table("users").unwrap().row_ids()
+            );
+            assert_eq!(
+                fast.table("users").unwrap().next_row_id(),
+                old.table("users").unwrap().next_row_id()
+            );
+            drop(fast);
+            drop(old);
+            let mut fast = Database::open(&fast_path).unwrap();
+            let mut old = Database::open(&old_path).unwrap();
+            for query in [
+                "SELECT * FROM users;",
+                "SELECT * FROM spare;",
+                "SELECT * FROM later;",
+            ] {
+                assert_eq!(
+                    fast.execute(query).map_err(|e| e.to_string()),
+                    old.execute(query).map_err(|e| e.to_string()),
+                    "{sql}: {query}"
+                );
+            }
+            let mut logs = Vec::new();
+            for copy in [false, true] {
+                let _guard = copy.then(crate::storage::ForceOwnedPublish::new);
+                let (_dir, path, mut db) = open_copy(&base, &format!("m52-log-{case}-{copy}"));
+                db.set_inject(crate::storage::Inject::AfterLogSync);
+                assert!(db.execute(sql).is_err());
+                logs.push(wal_bytes(&path));
+            }
+            assert_eq!(logs[0], logs[1], "{sql}");
+        }
+    }
+
+    #[test]
+    fn live_publish_views_keep_insert_recovery() {
+        let (_dir, base) = publish_image_fixture("m52-recovery");
+        let wide = format!(
+            "INSERT INTO users VALUES (401, '{}', TRUE, 1);",
+            "x".repeat(3000)
+        );
+        for (case, sql) in [
+            "INSERT INTO users VALUES (401, 'added', TRUE, 1);",
+            "INSERT INTO users VALUES (401, 'a', TRUE, NULL), (402, 'b', FALSE, 3);",
+            "INSERT INTO spare VALUES (2, 'other table');",
+            wide.as_str(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            for copy in [false, true] {
+                let _guard = copy.then(crate::storage::ForceOwnedPublish::new);
+                let label = format!("m52-recovery-{case}-{copy}");
+                assert_precommit(&base, &label, sql, crate::storage::Inject::BeforeLogSync);
+                for inject in [
+                    crate::storage::Inject::AfterLogSync,
+                    crate::storage::Inject::CommitSyncFailed,
+                    crate::storage::Inject::DuringCheckpoint(1),
+                ] {
+                    assert_postcommit(&base, &format!("{label}-{inject:?}"), sql, inject);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release comparison of live publish views with owned images"]
+    fn profile_milestone52() {
+        println!(
+            "milestone52 cpu={} rustc={} seed=0x3100 durable=true warmup=1",
+            profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]),
+            profile_command("rustc", &["--version"])
+        );
+        let _phases = crate::storage::enable_phases();
+        for rows in [1_000_i64, 10_000, 100_000] {
+            let (_dir, base) = seed_delete_db("m52-base", rows, 0x3100);
+            for kind in ["insert-one", "insert-batch", "update-index"] {
+                let sql = milestone39_sql(kind, rows);
+                let mut borrowed = Vec::new();
+                let mut owned = Vec::new();
+                for n in 0..5 {
+                    let run = |full: bool| {
+                        let (_dir, path, mut db) =
+                            open_copy(&base, &format!("m52-{kind}-{n}-{full}"));
+                        db.execute("SELECT COUNT(*) FROM users;").unwrap();
+                        crate::storage::reset_phases();
+                        let _guard = full.then(crate::storage::ForceOwnedPublish::new);
+                        let started = std::time::Instant::now();
+                        let result = db.execute(&sql).unwrap();
+                        let wall = started.elapsed().as_micros();
+                        let p = crate::storage::take_phases();
+                        let checksum = mutation_checksum(&mut db);
+                        println!(
+                            "milestone52 sample kind={kind} rows={rows} n={n} owned={full} wall_us={wall} prepare_us={} image_drop_us={} wal_bytes={} frames={} checksum={checksum}",
+                            p.prepare.as_micros(),
+                            p.image_drop.as_micros(),
+                            p.wal_bytes,
+                            p.frames
+                        );
+                        (
+                            wall,
+                            result,
+                            checksum,
+                            db_file(&path),
+                            p.wal_bytes,
+                            p.frames,
+                        )
+                    };
+                    let (fast, old) = if n % 2 == 0 {
+                        (run(false), run(true))
+                    } else {
+                        let old = run(true);
+                        (run(false), old)
+                    };
+                    assert_eq!(
+                        (&fast.1, &fast.2, &fast.3, &fast.4, &fast.5),
+                        (&old.1, &old.2, &old.3, &old.4, &old.5)
+                    );
+                    borrowed.push(fast.0);
+                    owned.push(old.0);
+                }
+                println!(
+                    "milestone52 median kind={kind} rows={rows} borrowed_us={} owned_us={} borrowed_min={} borrowed_max={} owned_min={} owned_max={}",
+                    median(&borrowed),
+                    median(&owned),
+                    borrowed.iter().min().unwrap(),
+                    borrowed.iter().max().unwrap(),
+                    owned.iter().min().unwrap(),
+                    owned.iter().max().unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn borrowed_publish_images_match_copies_for_inserts_and_schema_edits() {
         let (_dir, base) = publish_image_fixture("m49-images");
         for (case, sql) in [

@@ -655,6 +655,18 @@ impl Table {
         self.positions.insert(row_id, position);
     }
 
+    pub(crate) fn view(&self) -> crate::storage::TableView<'_> {
+        crate::storage::TableView {
+            name: &self.name,
+            columns: self.schema.columns(),
+            next_row_id: self.next_row_id,
+            rows: crate::storage::ViewRows::Memory {
+                ids: &self.row_ids,
+                values: &self.rows,
+            },
+        }
+    }
+
     pub(crate) fn image(&self) -> TableImage {
         TableImage {
             name: self.name.clone(),
@@ -694,6 +706,23 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn live_view_borrows_schema_and_values() {
+        let mut table = users();
+        table
+            .insert(
+                &[],
+                vec![vec![Value::Integer(1), Value::Text("borrowed".into())]],
+            )
+            .unwrap();
+        let view = table.view();
+        assert_eq!(view.columns.as_ptr(), table.schema.columns().as_ptr());
+        let (id, values) = view.rows.iter().next().unwrap();
+        assert_eq!(id, table.row_ids[0]);
+        assert_eq!(values.as_ptr(), table.rows[0].as_ptr());
+        assert_eq!(view.next_row_id, table.next_row_id);
     }
 
     #[test]

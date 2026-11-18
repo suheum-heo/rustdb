@@ -2394,3 +2394,98 @@ benefit with recovery checks preserved. Further INSERT work still needs to
 address the first publish image and its cleanup/validation. A next milestone
 should profile that remaining path and establish whether borrowing live table
 rows can preserve its validation and ownership boundaries before implementation.
+
+## Milestone 52: borrow live tables during full publish
+
+18 Nov 2026, Apple M5, Rust 1.100.0. Baseline M51 merge `829fe84`.
+After removing INSERT's rollback snapshot, the remaining publish path still
+deep-copied all row values into `TableImage` and destroyed those copies after
+commit. The editor only needs read-only access during its synchronous call.
+
+Full publish now constructs a small view per table, borrowing the name, schema,
+row-ID slice, and row-value slice. It does not allocate a per-row reference list
+or clone row values. Owned images and live views share the same validation and
+editor logic through a row-view adapter. The editor returns owned prepared
+pages and a snapshot, with no references to the input. Rust's borrows keep the
+tables immutable while the separate store field is being changed.
+
+Validation still checks table names, counters, duplicate/out-of-range IDs,
+row width/types, and record size in the same order for aligned inputs. Live
+views additionally reject mismatched row-ID/value lengths before iteration;
+the old image-building zip could otherwise truncate inconsistent internal
+vectors. Store fences are checked before editing. Page/WAL formats, encoding,
+checksums, index maintenance and commit/recovery boundaries are unchanged.
+The selected UPDATE/DELETE paths are unchanged. Full publish for schema changes
+also uses the borrowed views and is covered by differential tests.
+
+`ForceOwnedPublish` retains the M51 image-construction path for comparison.
+The earlier forced second-copy guard also selects owned input, preserving that
+reference path. The existing `publish_images` test counter now explicitly counts
+tables supplied to full publish, whether views or owned images; it is not an
+allocation counter. The storage snapshot and row-ID scratch vectors remain,
+and validation still visits every row: this is not an O(1) INSERT claim.
+
+New tests check that views point at the original schema/value storage, compare
+validation errors for valid/invalid owned and borrowed input, and reject both
+directions of row-ID/value length mismatch. Differential statements include
+one/batch/other-table INSERT, CREATE/DROP TABLE, CREATE/DROP INDEX and an UPDATE
+control, comparing results, IDs/counters, exact database/WAL bytes and reopened
+queries. Single/batch/wide/other-table INSERT recovery covers pre-sync rollback,
+after-log-sync recovery, ambiguous commit sync, partial checkpoint, fencing and
+repeated reopen. These are injected failures, not physical power-loss tests.
+
+Run `cargo test --release --locked --lib profile_milestone52 -- --ignored --nocapture`.
+Two isolated release passes use fresh database copies, durable syncs, seed
+`0x3100`, one read warmup, and five alternating borrowed/owned pairs per workload
+at 1,000/10,000/100,000 rows. Both arms use the common validator/editor and have
+recording enabled; the owned arm adds the original image construction and
+disposal. The UPDATE control uses the unchanged selective path in both arms.
+Each pair compares results, checksums, exact database bytes, WAL byte counts,
+and frame counts outside the timed statement. No timing assertions or peak RSS
+measurements are used.
+
+Two isolated release passes measured µs at 100,000 existing rows:
+
+| workload | pass | borrowed median (range) | owned median (range) | median improvement |
+| --- | --- | --- | --- | --- |
+| one row | 1 | 13,050 (11,856–13,185) | 17,616 (16,370–18,097) | 25.9% |
+| one row | 2 | 13,672 (12,481–14,320) | 18,347 (15,761–18,761) | 25.5% |
+| 32 rows | 1 | 13,790 (12,777–14,324) | 17,365 (16,124–25,334) | 20.6% |
+| 32 rows | 2 | 13,737 (13,103–14,440) | 18,088 (15,090–19,366) | 24.1% |
+
+Both INSERT workloads improve in all ten paired copies across both passes.
+Paired median savings are 4,566/4,460 µs for one row and 4,129/4,360 µs for
+32 rows in passes 1/2. Pass 1 owned-image preparation/disposal medians are
+2,550/1,571 µs for one row and 2,507/1,530 µs for the batch. Borrowed-view
+preparation reports below 1 µs; there are no owned row images to dispose.
+A sub-microsecond report is not zero execution cost. Full validation remains.
+
+Small-table results do not establish a benefit. At 1,000 rows, one-row medians
+are 11,244 vs 10,261 µs in pass 1 and 11,281 vs 10,415 in pass 2 (borrowed vs
+owned), so both small-table runs are slower. Batch medians are 11,990 vs 11,620
+and 10,031 vs 11,449. At 10,000 rows, one-row medians are 12,171 vs 11,886 and
+11,065 vs 13,559; batch medians are 12,521 vs 12,250 and 10,576 vs 11,104.
+These mixed results are reported without a small-table speedup claim.
+The unchanged UPDATE control at 100,000 rows measures 14,508 vs 17,434 µs
+in pass 1 and 14,874 vs 13,299 in pass 2. Pass 1 includes control outliers
+of 71,533 and 37,584 µs; they are retained, not discarded. Sync/host noise
+limits precision. The large-table INSERT result has disjoint ranges and wins
+every pair in both runs, while the control changes sign.
+
+One-row INSERT retains WAL 36,996 bytes / 9 frames / result checksum
+5,001,582,569; the batch retains 41,096 bytes / 10 frames / checksum
+5,004,683,315. Every paired database file is byte-identical. Exact WAL bytes
+also match in the new INSERT and schema-change differential tests.
+
+Validation: formatting, strict Clippy, all-target build, full locked suite
+629 passed / 0 failed / 45 ignored (including a doctest), all 17 storage
+reliability tests with `PROPTEST_CASES=256`, and both release profile passes.
+The validation fixture was strengthened to include valid full-width rows and
+an oversized record after the initial focused run; the full suite covers that
+final fixture. Production code is identical in both profile passes.
+
+Decision: merge. The remaining full publish deep copy is removed with measured
+large-table benefit and recovery checks preserved. M37/M38/M41/M44/M47 rejected
+experiments remain absent. Further work should re-profile the remaining
+validation and durable I/O costs before selecting another optimization; this
+milestone does not bypass validation or weaken syncing to chase lower timings.

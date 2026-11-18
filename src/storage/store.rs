@@ -53,6 +53,55 @@ pub(crate) struct TableImage {
     pub rows: Vec<(u64, Vec<Value>)>,
 }
 
+/// Read-only publish input. Rows stay owned by the caller for the synchronous
+/// validation/edit call; Prepared contains no references to this view.
+#[derive(Clone, Copy)]
+pub(crate) struct TableView<'a> {
+    pub name: &'a str,
+    pub columns: &'a [Column],
+    pub next_row_id: u64,
+    pub rows: ViewRows<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ViewRows<'a> {
+    Image(&'a [(u64, Vec<Value>)]),
+    Memory {
+        ids: &'a [u64],
+        values: &'a [Vec<Value>],
+    },
+}
+impl ViewRows<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Image(rows) => rows.len(),
+            Self::Memory { values, .. } => values.len(),
+        }
+    }
+    fn aligned(&self) -> bool {
+        match self {
+            Self::Image(_) => true,
+            Self::Memory { ids, values } => ids.len() == values.len(),
+        }
+    }
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (u64, &[Value])> {
+        (0..self.len()).map(|i| match self {
+            Self::Image(rows) => (rows[i].0, rows[i].1.as_slice()),
+            Self::Memory { ids, values } => (ids[i], values[i].as_slice()),
+        })
+    }
+}
+impl TableImage {
+    fn view(&self) -> TableView<'_> {
+        TableView {
+            name: &self.name,
+            columns: &self.columns,
+            next_row_id: self.next_row_id,
+            rows: ViewRows::Image(&self.rows),
+        }
+    }
+}
+
 pub(crate) struct Store {
     pager: Pager,
     state: Snapshot,
@@ -301,6 +350,31 @@ impl Store {
             ordered = owned.iter().collect();
         }
         profile::add_prepare(prepare);
+        let views: Vec<_> = ordered.iter().map(|table| table.view()).collect();
+        self.apply_views(&views, indexes)
+    }
+
+    pub(crate) fn publish_views(
+        &mut self,
+        tables: &mut [TableView<'_>],
+        indexes: &[IndexImage],
+    ) -> Result<(), StepError> {
+        if let Some(error) = &self.fence {
+            return Err(StepError::AfterCommit(error.clone()));
+        }
+        {
+            let _order = profile::Timer::new(|p| &mut p.publish_order);
+            tables.sort_by(|left, right| left.name.cmp(right.name));
+        }
+        validate_views(tables).map_err(StepError::BeforeCommit)?;
+        self.apply_views(tables, indexes)
+    }
+
+    fn apply_views(
+        &mut self,
+        tables: &[TableView<'_>],
+        indexes: &[IndexImage],
+    ) -> Result<(), StepError> {
         let base_commit = self.state.commit_id;
         let nonce = self.state.nonce;
         let apply_mark = profile::start();
@@ -309,7 +383,7 @@ impl Store {
             self.state.clone()
         };
         let prepared = Editor::new(snapshot)
-            .apply(&mut self.pager, &ordered, indexes)
+            .apply(&mut self.pager, tables, indexes)
             .map_err(StepError::BeforeCommit)?;
         profile::add_apply(apply_mark);
         self.commit_prepared(prepared, nonce, base_commit)
@@ -532,12 +606,17 @@ fn migrate_v2(path: &Path) -> Result<(), DbError> {
 }
 
 fn validate(tables: &[&TableImage]) -> Result<(), DbError> {
+    let views: Vec<_> = tables.iter().map(|table| table.view()).collect();
+    validate_views(&views)
+}
+
+fn validate_views(tables: &[TableView<'_>]) -> Result<(), DbError> {
     let _validate = profile::Timer::new(|p| &mut p.image_validate);
     #[cfg(test)]
     profile::note_full_image_validation(tables.iter().map(|t| t.rows.len()).sum());
     let mut names = HashSet::with_capacity(tables.len());
     for table in tables {
-        if table.name.is_empty() || !names.insert(table.name.as_str()) {
+        if table.name.is_empty() || !names.insert(table.name) {
             return Err(DbError::Internal(
                 "cannot publish a catalog with a missing or duplicate table name".to_string(),
             ));
@@ -547,9 +626,15 @@ fn validate(tables: &[&TableImage]) -> Result<(), DbError> {
                 "table row-id counter must start at 1".to_string(),
             ));
         }
+        if !table.rows.aligned() {
+            return Err(DbError::Internal(format!(
+                "table '{}' has mismatched row ids and values",
+                table.name
+            )));
+        }
         let mut ids = HashSet::with_capacity(table.rows.len());
-        for (row_id, values) in &table.rows {
-            if *row_id == 0 || *row_id >= table.next_row_id || !ids.insert(*row_id) {
+        for (row_id, values) in table.rows.iter() {
+            if row_id == 0 || row_id >= table.next_row_id || !ids.insert(row_id) {
                 return Err(DbError::Internal(format!(
                     "row id {row_id} is outside the counter for table '{}'",
                     table.name
@@ -561,7 +646,7 @@ fn validate(tables: &[&TableImage]) -> Result<(), DbError> {
                     table.name
                 )));
             }
-            for (value, column) in values.iter().zip(&table.columns) {
+            for (value, column) in values.iter().zip(table.columns) {
                 if let Some(actual) = value.data_type()
                     && actual != column.data_type()
                 {
@@ -1270,8 +1355,34 @@ fn definition_too_big() -> DbError {
 
 #[cfg(test)]
 thread_local! {
+    static FORCE_OWNED_VIEWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FORCE_PUBLISH_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+#[cfg(test)]
+pub(crate) struct ForceOwnedPublish(bool);
+#[cfg(test)]
+impl ForceOwnedPublish {
+    pub(crate) fn new() -> Self {
+        Self(FORCE_OWNED_VIEWS.with(|flag| flag.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for ForceOwnedPublish {
+    fn drop(&mut self) {
+        FORCE_OWNED_VIEWS.with(|flag| flag.set(self.0));
+    }
+}
+pub(crate) fn owned_publish_forced() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_OWNED_VIEWS.with(|flag| flag.get()) || copy_publish_images_forced()
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct ForcePublishImageCopy(bool);
 #[cfg(test)]
@@ -1336,6 +1447,91 @@ mod tests {
             table_id: 0,
             rows,
         }
+    }
+
+    #[test]
+    fn live_view_validation_matches_owned_errors_and_rejects_misalignment() {
+        for case in 0..9 {
+            let mut input = image(
+                "users",
+                vec![(
+                    1,
+                    vec![
+                        Value::Integer(7),
+                        Value::Text("name".into()),
+                        Value::Boolean(true),
+                    ],
+                )],
+                2,
+            );
+            match case {
+                0 => {}
+                1 => input.name.clear(),
+                2 => input.next_row_id = 0,
+                3 => input.rows[0].0 = 0,
+                4 => input.rows.push(input.rows[0].clone()),
+                5 => input.rows[0].1.clear(),
+                6 => input.rows[0].1[0] = Value::Text("bad".into()),
+                7 => input.rows[0].0 = 2,
+                _ => input.rows[0].1[1] = Value::Text("x".repeat(10000)),
+            }
+            assert_eq!(validate(&[&input]).is_ok(), case == 0);
+            let ids: Vec<_> = input.rows.iter().map(|r| r.0).collect();
+            let rows: Vec<_> = input.rows.iter().map(|r| r.1.clone()).collect();
+            let view = TableView {
+                name: &input.name,
+                columns: &input.columns,
+                next_row_id: input.next_row_id,
+                rows: ViewRows::Memory {
+                    ids: &ids,
+                    values: &rows,
+                },
+            };
+            assert_eq!(
+                validate(&[&input]).map_err(|e| e.to_string()),
+                validate_views(&[view]).map_err(|e| e.to_string()),
+                "case {case}"
+            );
+        }
+        let input = image(
+            "users",
+            vec![(
+                1,
+                vec![
+                    Value::Integer(7),
+                    Value::Text("name".into()),
+                    Value::Boolean(true),
+                ],
+            )],
+            2,
+        );
+        let rows = vec![vec![Value::Integer(7)]];
+        let mut views = [TableView {
+            rows: ViewRows::Memory {
+                ids: &[],
+                values: &rows,
+            },
+            ..input.view()
+        }];
+        let path = TempPath::new();
+        let (mut store, _) = Store::open(path.path()).unwrap();
+        let before = fs::read(path.path()).unwrap();
+        assert!(matches!(
+            store.publish_views(&mut views, &[]),
+            Err(StepError::BeforeCommit(_))
+        ));
+        assert_eq!(fs::read(path.path()).unwrap(), before);
+        views[0].rows = ViewRows::Memory {
+            ids: &[1, 2],
+            values: &rows,
+        };
+        assert!(validate_views(&views).is_err());
+        assert_eq!(
+            validate(&[&input, &input]).unwrap_err().to_string(),
+            validate_views(&[input.view(), input.view()])
+                .unwrap_err()
+                .to_string()
+        );
     }
 
     #[test]
