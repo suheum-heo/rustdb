@@ -2733,3 +2733,97 @@ unchanged.
 Decision: merge the diagnostic benchmark and report. This completes the broader
 survey and identifies a concrete next candidate. There is no production speedup
 in M54; implementation of the candidate remains separate pending evidence.
+
+## Milestone 55 — sparse local deletion experiment (rejected)
+
+Decision: retain the M54 production implementation. A conservative sparse-delete
+candidate reduces the first transaction's WAL but regresses consecutive deletes,
+including with phase recording disabled. This milestone merges only this report.
+
+Baseline: M54 merge `2510ebc11f238decdc87ba85a51c82f56c87be3e` (PR #50).
+The complete rejected source, tests and benchmarks are preserved on the local
+branch `experiment/milestone-55-sparse-local`, commit
+`e7bac6ddb13079f2c0ce6a16bd4be7dffebfb42b`. It is not part of main.
+
+### Candidate and correctness boundary
+
+For at most 32 verified postings spanning more than four times as many leaves,
+use existing single-entry B-tree deletion instead of packing the entire span.
+Keep both user indexes, request ordering, the existing initial validation or
+validated presence plan, and final whole-tree validation. Other cases retain
+bulk rebuilding. The old path is selectable by a test-only RAII guard.
+
+Page and WAL formats, commit syncs and recovery protocol are unchanged. Valid
+B-tree layouts and free-page sets intentionally differ between implementations,
+so cross-mode comparisons check logical rows and both indexes, not identical
+page or WAL bytes. Recovery checks compare each mode against its own clean
+committed image. No rejected M37/M38/M41/M44/M47 experiment was restored.
+
+Tests cover sorted reference results, duplicate keys, reversed requests, the
+32/33-posting boundary, free/live-page separation, reinsertion and delete-all,
+corruption outside the target span, request errors, injected storage failures,
+rollback before log sync, recovery after log sync, failed commit sync, interrupted
+checkpoint, repeated reopen, page checksums, and subsequent INSERT/UPDATE/DELETE.
+
+Candidate validation passed formatting, strict Clippy, all-target locked build,
+and the full suite: 640 passed, 0 failed, 49 ignored (including one doctest).
+The subsequently added sequence benchmark raises the ignored count to 50;
+formatting and strict Clippy passed on the final archived source. The added
+property test passed 256 cases, and the reliability filter passed 17 tests with
+PROPTEST_CASES=256. Both release benchmark families passed their correctness
+checks. Production source remains the already-validated M54 baseline.
+
+### Measurements
+
+Apple M5, rustc 1.100.0, release, durable storage, seed 0x3100. Fresh-copy runs
+use five paired samples per workload and size (1k/10k/100k), alternating arm
+order and warming with COUNT. Phase recording is enabled in both arms.
+Two isolated passes measured the 100k ten-row DELETE median as:
+
+| Pass | Local candidate | Existing wide rebuild |
+| --- | ---: | ---: |
+| 1 | 24.321 ms | 26.484 ms |
+| 2 | 23.030 ms | 25.841 ms |
+
+That first transaction writes 139,496 bytes / 34 frames versus 2,045,996 bytes /
+499 frames, a 93.2% WAL reduction. This does not establish a sustained benefit.
+Other 100k pass-2 medians (candidate / baseline, ms) are one-row 17.048 / 18.205,
+half 65.417 / 64.100, alternating 72.462 / 73.525, all 76.065 / 75.853.
+Controls that do not select the new path vary too; do not interpret these as
+independent production improvements. Timing ranges and raw samples are retained.
+
+The decisive follow-up performs 50 consecutive ten-row deletes on one 100k-row
+connection, three fresh paired copies, alternating arm order. Every copy checks
+99,500 remaining rows, reopen, both indexes and page checksums.
+
+| Pair | Candidate, recorder off | Baseline, recorder off | Slowdown |
+| --- | ---: | ---: | ---: |
+| 0 | 1,138.502 ms | 993.840 ms | 14.6% |
+| 1 | 1,137.610 ms | 1,012.554 ms | 12.3% |
+| 2 | 1,131.974 ms | 1,005.175 ms | 12.6% |
+
+With recording enabled, the same sequence regresses 15.5–27.3%. Total recorded
+WAL falls from 4,900,200 to 3,153,600 bytes (35.6%). The last transaction writes
+14 frames versus 9; the enabled log's `frames` field means last-statement frames,
+not aggregate frames (renamed `last_frames` in the final harness). Recorder-off
+counters are zero by design. Compaction changing subsequent tree work is a
+plausible explanation, not an independently isolated causal measurement.
+
+One exploratory invocation accidentally selected both benchmark tests by prefix
+and ran them concurrently. Its timing log is explicitly excluded. Final runs
+use exact test names and run the families sequentially. Host noise and three
+sequence pairs limit precision, but every recorder-off pair is slower; the
+first-transaction win does not justify merging this candidate.
+
+Reproduce from the archived experiment commit:
+
+```sh
+cargo test --release --locked --lib executor::tests::profile_milestone55 -- --ignored --nocapture --exact
+cargo test --release --locked --lib executor::tests::profile_milestone55_sequence -- --ignored --nocapture --exact
+RUSTDB_PROFILE_ENABLED=0 cargo test --release --locked --lib executor::tests::profile_milestone55_sequence -- --ignored --nocapture --exact
+```
+
+Next investigation: attribute repeated-delete validation and tree-layout costs
+before designing another optimization. Any successor must preserve compaction's
+later-transaction benefits and demonstrate a sustained workload improvement.
+Do not simply loosen this candidate's threshold to favor the first transaction.
