@@ -25061,6 +25061,355 @@ mod tests {
         (dir, base)
     }
 
+    const MILESTONE54_KINDS: [&str; 17] = [
+        "select-index",
+        "select-range",
+        "select-scan",
+        "count",
+        "group",
+        "join",
+        "sort-limit",
+        "update-index",
+        "update-scan",
+        "insert-one",
+        "insert-batch",
+        "one",
+        "ten",
+        "ten-no-bucket",
+        "half",
+        "alternating",
+        "all",
+    ];
+
+    fn milestone54_sql(kind: &str, rows: i64) -> String {
+        match kind {
+            "ten-no-bucket" => milestone39_sql("ten", rows),
+            "select-range" => "SELECT id, name FROM users WHERE id >= 1 AND id <= 10;".into(),
+            "count" => "SELECT COUNT(*) FROM users;".into(),
+            "sort-limit" => "SELECT id, name FROM users ORDER BY id DESC LIMIT 10;".into(),
+            _ => milestone39_sql(kind, rows),
+        }
+    }
+
+    fn milestone54_is_read(kind: &str) -> bool {
+        kind.starts_with("select") || matches!(kind, "count" | "group" | "join" | "sort-limit")
+    }
+
+    // Independent model of the seeded rows and this fixed workload matrix.
+    // It does not execute SQL or use the engine's filter/aggregation routines.
+    fn milestone54_model(kind: &str, count: i64) -> (Vec<Vec<Value>>, Vec<Vec<Value>>, usize) {
+        let kind = if kind == "ten-no-bucket" { "ten" } else { kind };
+        let mut rows: Vec<_> = (1..=count)
+            .map(|id| {
+                let mixed = 0x3100_u64 + id as u64;
+                vec![
+                    Value::Integer(id),
+                    Value::Text(if id % 11 == 0 {
+                        "w".repeat(80)
+                    } else {
+                        format!("n{id}")
+                    }),
+                    Value::Boolean(id % 2 == 0),
+                    if mixed.is_multiple_of(5) {
+                        Value::Null
+                    } else {
+                        Value::Integer((mixed % 4) as i64)
+                    },
+                ]
+            })
+            .collect();
+        let mut query_rows = Vec::new();
+        let mut affected = 0;
+        match kind {
+            "select-index" => query_rows.push(rows[0][..2].to_vec()),
+            "select-range" => query_rows.extend(rows.iter().take(10).map(|r| r[..2].to_vec())),
+            "select-scan" => query_rows.extend(
+                rows.iter()
+                    .filter(|r| r[2] == Value::Boolean(true))
+                    .map(|r| r[..2].to_vec()),
+            ),
+            "count" => query_rows.push(vec![Value::Integer(count)]),
+            "sort-limit" => query_rows.extend(rows.iter().rev().take(10).map(|r| r[..2].to_vec())),
+            "group" => {
+                for key in [
+                    Value::Null,
+                    Value::Integer(0),
+                    Value::Integer(1),
+                    Value::Integer(2),
+                    Value::Integer(3),
+                ] {
+                    let n = rows.iter().filter(|r| r[3] == key).count();
+                    if n > 0 {
+                        query_rows.push(vec![key, Value::Integer(n as i64)]);
+                    }
+                }
+            }
+            "join" => {
+                for row in &rows {
+                    if let Value::Integer(bucket) = row[3] {
+                        query_rows.push(vec![
+                            row[0].clone(),
+                            Value::Text(char::from(b'a' + bucket as u8).to_string()),
+                        ]);
+                    }
+                }
+            }
+            "insert-one" | "insert-batch" => {
+                affected = if kind == "insert-one" { 1 } else { 32 };
+                for offset in 1..=affected {
+                    rows.push(vec![
+                        Value::Integer(count + offset as i64),
+                        Value::Text(if kind == "insert-one" { "new" } else { "batch" }.into()),
+                        Value::Boolean(true),
+                        Value::Integer(1),
+                    ]);
+                }
+            }
+            "update-index" | "update-scan" => {
+                for row in &mut rows {
+                    if (kind == "update-index" && row[0] == Value::Integer(1))
+                        || (kind == "update-scan" && row[2] == Value::Boolean(true))
+                    {
+                        row[1] = Value::Text("edited".into());
+                        affected += 1;
+                    }
+                }
+            }
+            "one" | "ten" | "half" | "alternating" | "all" => {
+                rows.retain(|row| {
+                    let Value::Integer(id) = row[0] else {
+                        unreachable!()
+                    };
+                    let remove = match kind {
+                        "one" => id == 1,
+                        "ten" => id <= 10,
+                        "half" => id < count / 2,
+                        "alternating" => id % 2 == 0,
+                        "all" => true,
+                        _ => unreachable!(),
+                    };
+                    affected += usize::from(remove);
+                    !remove
+                });
+            }
+            _ => unreachable!("unknown M54 workload"),
+        }
+        (rows, query_rows, affected)
+    }
+
+    fn milestone54_survey(rows: i64, samples: usize) {
+        let _phases = crate::storage::enable_phases();
+        crate::storage::set_phases_enabled(false);
+        let (_dir, base) = seed_delete_db("m54-base", rows, 0x3100);
+        let mut setup = Database::open(&base).unwrap();
+        setup.execute("CREATE TABLE labels (bucket INT, tag TEXT); INSERT INTO labels VALUES (0, 'a'), (1, 'b'), (2, 'c'), (3, 'd'); CREATE INDEX idx_labels_bucket ON labels(bucket);").unwrap();
+        drop(setup);
+        let base_bytes = db_file(&base);
+        println!(
+            "milestone54 fixture rows={rows} file_bytes={} seed=0x3100 user_indexes=2 label_rows=4 label_indexes=1 durable=true",
+            base_bytes.len()
+        );
+        for kind in MILESTONE54_KINDS {
+            let sql = milestone54_sql(kind, rows);
+            let read = milestone54_is_read(kind);
+            let (expected, expected_query, affected) = milestone54_model(kind, rows);
+            let expected_ids: Vec<u64> = expected
+                .iter()
+                .map(|r| {
+                    let Value::Integer(id) = r[0] else {
+                        unreachable!()
+                    };
+                    id as u64
+                })
+                .collect();
+            let expected_next = rows as u64
+                + 1
+                + if kind.starts_with("insert") {
+                    affected as u64
+                } else {
+                    0
+                };
+            let mut off_walls = Vec::new();
+            let mut on_walls = Vec::new();
+            println!("milestone54 workload kind={kind} rows={rows} sql={sql}");
+            for n in 0..samples {
+                let run = |enabled: bool| {
+                    crate::storage::set_phases_enabled(false);
+                    let (_dir, path, mut db) =
+                        open_copy(&base, &format!("m54-{kind}-{rows}-{n}-{enabled}"));
+                    if kind == "ten-no-bucket" {
+                        db.execute("DROP INDEX idx_users_bucket;").unwrap();
+                    }
+                    db.execute(if read {
+                        &sql
+                    } else {
+                        "SELECT COUNT(*) FROM users;"
+                    })
+                    .unwrap();
+                    crate::storage::reset_phases();
+                    crate::storage::set_phases_enabled(enabled);
+                    let started = std::time::Instant::now();
+                    let result = db.execute(&sql).unwrap().pop().unwrap();
+                    let wall_ns = started.elapsed().as_nanos();
+                    let p = crate::storage::take_phases();
+                    crate::storage::set_phases_enabled(false);
+                    if read {
+                        assert!(matches!(result, StatementResult::Query(_)));
+                    } else if kind.starts_with("insert") {
+                        assert!(matches!(result, StatementResult::Insert { .. }));
+                    } else if kind.starts_with("update") {
+                        assert!(matches!(result, StatementResult::Update { .. }));
+                    } else {
+                        assert!(matches!(result, StatementResult::Delete { .. }));
+                    }
+                    let count = match &result {
+                        StatementResult::Query(query) => {
+                            let mut actual = query.rows.clone();
+                            if kind == "group" {
+                                actual.sort_by_key(|r| match r[0] {
+                                    Value::Integer(i) => i,
+                                    Value::Null => -1,
+                                    _ => unreachable!(),
+                                });
+                            }
+                            assert_eq!(actual, expected_query, "{kind}");
+                            query.rows.len()
+                        }
+                        StatementResult::Insert { count }
+                        | StatementResult::Update { count }
+                        | StatementResult::Delete { count } => {
+                            assert_eq!(*count, affected, "{kind}");
+                            *count
+                        }
+                        StatementResult::Ok => panic!("unexpected {kind} result"),
+                    };
+                    assert_eq!(db.table("users").unwrap().rows(), expected, "{kind}");
+                    assert_eq!(db.table("users").unwrap().row_ids(), expected_ids, "{kind}");
+                    assert_eq!(
+                        db.table("users").unwrap().next_row_id(),
+                        expected_next,
+                        "{kind}"
+                    );
+                    let bytes = db_file(&path);
+                    assert_eq!(wal_len(&path), 0);
+                    if read {
+                        assert_eq!(bytes, base_bytes, "read wrote database");
+                    } else {
+                        drop(db);
+                        let mut reopened = Database::open(&path).unwrap();
+                        assert_eq!(
+                            reopened.table("users").unwrap().rows(),
+                            expected,
+                            "reopen {kind}"
+                        );
+                        assert_eq!(reopened.table("users").unwrap().row_ids(), expected_ids);
+                        assert_eq!(
+                            reopened.table("users").unwrap().next_row_id(),
+                            expected_next
+                        );
+                        assert_eq!(
+                            index_postings(&mut reopened, "idx_users_id"),
+                            reference_postings(&expected, &expected_ids, 0)
+                        );
+                        if kind != "ten-no-bucket" {
+                            assert_eq!(
+                                index_postings(&mut reopened, "idx_users_bucket"),
+                                reference_postings(&expected, &expected_ids, 3)
+                            );
+                        }
+                        assert_checksums(&path);
+                    }
+                    if enabled {
+                        if read {
+                            assert_eq!(p.wal_bytes, 0);
+                            assert_eq!(p.frames, 0);
+                        } else {
+                            assert!(p.wal_bytes > 0);
+                            assert!(p.frames > 0);
+                        }
+                        let wall = wall_ns / 1000;
+                        println!(
+                            "milestone54 sample kind={kind} rows={rows} n={n} enabled=true wall_ns={wall_ns} count={count} gap_us={} parse_us={} memory_us={} prepare_us={} image_validate_us={} apply_us={} decode_us={} heap_us={} index_us={} compare_us={} wal_encode_us={} wal_write_us={} wal_sync_us={} db_write_us={} db_sync_us={} wal_clear_us={} wal_bytes={} frames={}",
+                            wall as i128 - milestone50_accounted(&p) as i128,
+                            p.parse.as_micros(),
+                            p.memory.as_micros(),
+                            p.prepare.as_micros(),
+                            p.image_validate.as_micros(),
+                            p.apply.as_micros(),
+                            p.decode.as_micros(),
+                            p.heap_edit.as_micros(),
+                            p.index_edit.as_micros(),
+                            p.compare.as_micros(),
+                            p.wal_encode.as_micros(),
+                            p.wal_write.as_micros(),
+                            p.wal_sync.as_micros(),
+                            p.db_write.as_micros(),
+                            p.db_sync.as_micros(),
+                            p.wal_clear.as_micros(),
+                            p.wal_bytes,
+                            p.frames
+                        );
+                        println!(
+                            "milestone54 storage kind={kind} rows={rows} n={n} heap_pages={} index_pages={} other_pages={} bulk_spans={} leaf_merges={} internal_merges={} ancestor_writes={} freed={} leaf_decodes={}",
+                            p.heap_pages,
+                            p.index_pages,
+                            p.other_pages,
+                            p.bulk_spans,
+                            p.leaf_merges,
+                            p.internal_merges,
+                            p.ancestor_writes,
+                            p.pages_freed,
+                            p.leaf_decodes
+                        );
+                    } else {
+                        assert_eq!(p, Default::default());
+                        println!(
+                            "milestone54 sample kind={kind} rows={rows} n={n} enabled=false wall_ns={wall_ns} count={count}"
+                        );
+                    }
+                    (wall_ns, result, bytes)
+                };
+                let (off, on) = if n % 2 == 0 {
+                    (run(false), run(true))
+                } else {
+                    let on = run(true);
+                    (run(false), on)
+                };
+                assert_eq!((&off.1, &off.2), (&on.1, &on.2), "{kind}");
+                off_walls.push(off.0);
+                on_walls.push(on.0);
+            }
+            println!(
+                "milestone54 median kind={kind} rows={rows} samples={samples} off_ns={} on_ns={} off_min={} off_max={} on_min={} on_max={}",
+                median(&off_walls),
+                median(&on_walls),
+                off_walls.iter().min().unwrap(),
+                off_walls.iter().max().unwrap(),
+                on_walls.iter().min().unwrap(),
+                on_walls.iter().max().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn milestone54_reference_checks_reads_writes_and_reopen() {
+        milestone54_survey(24, 1);
+    }
+
+    #[test]
+    #[ignore = "release survey of read/write workloads and recorder overhead"]
+    fn profile_milestone54() {
+        println!(
+            "milestone54 cpu={} os={} rustc={} build=release-test durable=true fresh_copies=true samples=5",
+            profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]),
+            profile_command("uname", &["-smr"]),
+            profile_command("rustc", &["--version"])
+        );
+        for rows in [1_000, 10_000, 100_000] {
+            milestone54_survey(rows, 5);
+        }
+    }
+
     #[test]
     fn ordered_validation_matches_hash_for_inserts_and_schema_edits() {
         let (_dir, base) = publish_image_fixture("m53-images");
