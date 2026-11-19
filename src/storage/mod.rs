@@ -72,3 +72,6 @@ pub(crate) use profile::ProfiledDrop;
 #[cfg(test)]
 pub(crate) use store::ForceOwnedPublish;
 pub(crate) use store::{TableView, ViewRows, owned_publish_forced};
+
+#[cfg(test)]
+pub(crate) use store::ForceValidationHash;
