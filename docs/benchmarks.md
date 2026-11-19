@@ -2582,3 +2582,154 @@ Decision: merge the checked uniqueness fast path. M37/M38/M41/M44/M47 experiment
 remain absent. Durable I/O now dominates this INSERT workload. Further work
 should profile a broader workload before selecting another optimization rather
 than relaxing sync or validation guarantees for another timing reduction.
+
+## Milestone 54: broader read/write performance survey
+
+19 Nov 2026, Apple M5, Rust 1.100.0, baseline M53 merge `bdedae9`.
+M53 is merged, its feature CI and subsequent main CI succeeded, and the local
+checkout was clean and matched origin/main. This milestone adds a test-only
+survey and report. It makes no production optimization or speedup claim.
+
+`profile_milestone54` covers 17 workloads: indexed-predicate point/range reads,
+a Boolean scan, COUNT, grouped COUNT, a four-row lookup-table join, descending
+ORDER BY/LIMIT, point/half-table UPDATE, one/32-row INSERT, and one/ten/half/
+alternating/all-row DELETE. A ten-row DELETE control drops only the bucket index
+on its temporary copy before warmup and timing. It keeps the ID index and the
+same heap rows; its result is compared with the same independent row model.
+The control's database bytes are compared between recorder arms, not against a
+database with a different index catalog.
+
+Each fixture has 1,000, 10,000 or 100,000 users, two user indexes, four label rows
+and an index on labels.bucket. Data generation uses seed `0x3100`, nullable
+buckets, alternating Boolean values and an 80-character name every eleventh row.
+The control removes one of the user indexes; all other workloads keep both.
+
+Every timed statement uses a fresh database copy and an open database. Reads
+warm the query once; writes warm COUNT once. Five recorder-off/on pairs alternate
+execution order. The survey reports nanosecond wall durations and microsecond
+phases, medians and full sample ranges. Durable syncs remain enabled. Open,
+fixture creation, the control's DROP INDEX, warmup, result cleanup, independent
+checks, reopen, file reads and page-checksum verification are outside timing.
+These are warm statement measurements, not cold-start or concurrency results.
+
+A small normal test runs the same matrix at 24 users. A separate handwritten
+model constructs expected values without SQL or engine predicates/aggregators.
+It checks returned row values (canonicalized by key for GROUP BY), statement
+result variants/counts, final user rows, stable IDs and next-ID counters.
+Writes are reopened and both remaining user indexes are compared with reference
+postings; page checksums and cleared WAL are checked. Reads must leave exact
+database bytes unchanged. Each recorder pair must return identical complete
+results and database bytes; the disabled recorder must stay empty. Recorded
+reads must emit no WAL, and every selected write must emit frames.
+
+Run `cargo test --release --locked --lib profile_milestone54 -- --ignored --nocapture`.
+One exploratory pass identified a ten-row delete WAL jump. The final survey
+adds the index control and page/tree counters; two complete final passes each
+contain 510 timed statements. The final tables use those two passes. Recording
+overhead is assessed against the same binary with recording disabled; existing
+test-only instrumentation remains in both arms. No timing thresholds are used.
+
+### Warm statement timings
+
+Recorder-off medians at 100,000 users, in milliseconds. Each cell is five fresh
+copies; all observations, including outliers, remain in the raw logs and CSV.
+These workloads perform different amounts of useful work; this is a census,
+not a claim that one operation is interchangeable with another.
+
+| workload | final pass 1 | final pass 2 |
+| --- | ---: | ---: |
+| Point SELECT | 0.008 | 0.008 |
+| Ten-row range SELECT | 0.012 | 0.012 |
+| Boolean scan (50,000 rows returned) | 1.843 | 1.836 |
+| COUNT(*) | 2.015 | 2.181 |
+| GROUP BY bucket | 4.701 | 5.446 |
+| Four-label JOIN (80,000 rows returned) | 4.069 | 4.072 |
+| Descending ORDER BY / LIMIT 10 | 0.585 | 0.561 |
+| One-row UPDATE | 14.634 | 14.761 |
+| 50,000-row UPDATE | 59.775 | 58.574 |
+| One-row INSERT | 13.022 | 14.208 |
+| 32-row INSERT | 13.551 | 13.785 |
+| One-row DELETE | 18.457 | 17.262 |
+| Ten-row DELETE | 25.358 | 26.460 |
+| Ten-row DELETE, ID index only | 22.881 | 23.656 |
+| 49,999-row DELETE | 65.921 | 64.974 |
+| 50,000 alternating-row DELETE | 73.447 | 91.882 |
+| 100,000-row DELETE | 79.155 | 93.120 |
+
+The warm reads range from about 8 µs for a point lookup to 4.7–5.4 ms for grouped
+COUNT. Point UPDATE and INSERT are mostly durable-commit latency. Broad UPDATE
+and DELETE have substantial storage-edit CPU work as well as durable I/O.
+For 50,000-row UPDATE, recorded apply medians are 27.0/26.8 ms and memory work
+8.8/8.8 ms. Delete-all records 42.6/41.9 ms apply, including 23.9/23.3 ms index
+editing and about 9–10 ms record decoding. Index time is nested inside apply;
+it must not be added to apply again. Individual component medians need not
+sum to the wall median.
+
+The second pass's last two workloads experienced higher sync time. Delete-all
+WAL sync rose from a 6.6 ms median to 13.6 ms and database sync from 4.9 to
+11.5 ms, while its apply median stayed near 42 ms. Alternating DELETE similarly
+shows increased sync time. Its second-pass recorder-off range is 90.7–133.3 ms,
+and delete-all ranges are 77.8–82.2 ms and 92.6–96.1 ms across the two passes.
+These observations are retained; they do not indicate an engine regression.
+Workload order is fixed, so host/time drift can affect cross-workload comparisons.
+
+Recorder-on/off comparisons also limit precision. At 100,000 rows point SELECT
+is about 8.5 µs on vs 8.1 µs off; the ten-row range is 12.3 vs 11.9 µs in pass 1
+and 13.2 vs 11.6 in pass 2. Delete-all measures 81.6 vs 79.2 ms and 96.6 vs
+93.1 ms. Several reads and writes have on medians below off due to noise.
+There is no universal overhead correction. Use off medians for wall-time
+ranking and on phases for approximate attribution. Remaining signed accounting
+gaps include about 5.2 ms for broad UPDATE and 4.4–4.6 ms for delete-all; the
+survey does not claim to explain every CPU/cleanup interval.
+
+### Selected next investigation: sparse multi-key index deletion
+
+The most actionable new observation is write amplification for just ten deleted
+rows. It is deterministic in both final passes and every recorded copy:
+
+| 100,000-user workload | WAL bytes | frames | heap images | index images | other images | bulk spans | leaf merges |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| one-row DELETE, both user indexes | 36,996 | 9 | 1 | 4 | 4 | 0 | 0 |
+| ten-row DELETE, both user indexes | 2,045,996 | 499 | 1 | 249 | 249 | 2 | 235 |
+| ten-row DELETE, bucket index removed | 82,096 | 20 | 1 | 8 | 11 | 1 | 1 |
+
+The control removes 479 frames / 1,963,900 bytes (96.0% of WAL bytes), but its
+wall median only falls from 25.4 to 22.9 ms and from 26.5 to 23.7 ms. Index-edit
+medians remain roughly 3.5–3.7 ms in both configurations. This isolates the
+bucket index's contribution to written pages; it is not a measured optimization
+that preserves both indexes and does not predict a 96% latency reduction.
+The control intentionally has a different index catalog. User data, deletion
+count, remaining-index results, and recovery by reopen are checked independently.
+
+Page classes describe final dirty images. Freed index pages appear under
+"other", not "index"; delete-all's one final index image therefore does not
+mean it avoided index work. The ten-row case records 250 freed pages with both
+indexes versus 9 without the bucket index, and 7 versus 3 internal merges.
+Code inspection of bulk deletion shows a span of affected leaves being packed
+and internal levels rebuilt. Together with the spread of bucket keys and the
+control, this supports investigating span selection for sparse multi-key
+requests. It is not yet proof that a narrower rebuild is correct or faster:
+compaction frees pages, and occupancy, links, separators, corruption checks,
+page reuse, error order and recovery must all remain valid.
+
+Recommended M55: investigate whether sparse multi-key deletion can avoid broad
+leaf repacking while retaining both indexes and existing corruption validation.
+Require a paired baseline with exact results/pages or explicitly justified page
+differences, WAL/recovery tests, sorted-map reference checks, and measured
+end-to-end benefit. Do not reinstate M37 spine caching, M38 deferred leaf writes,
+M41 streaming checksums, or the rejected M44/M47 experiments. No such experiment
+was reintroduced in this milestone.
+
+Validation: formatting, strict Clippy, all-target build and the full locked suite
+pass: 634 passed / 0 failed / 48 ignored, including one doctest. The normal
+reference-model test covers all 17 workloads at 24 users; both final release
+passes cover them at all three larger sizes, with 1,020 timed statements total.
+Both passes verify recorder-off/on result and database-byte identity, read
+immutability, write reopen/index consistency, cleared WAL and page checksums.
+The final passes add counters/control absent from the exploratory log. All new
+code is inside the test module; page/WAL formats and recovery guarantees are
+unchanged.
+
+Decision: merge the diagnostic benchmark and report. This completes the broader
+survey and identifies a concrete next candidate. There is no production speedup
+in M54; implementation of the candidate remains separate pending evidence.
