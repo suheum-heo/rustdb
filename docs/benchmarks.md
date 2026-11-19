@@ -2489,3 +2489,96 @@ large-table benefit and recovery checks preserved. M37/M38/M41/M44/M47 rejected
 experiments remain absent. Further work should re-profile the remaining
 validation and durable I/O costs before selecting another optimization; this
 milestone does not bypass validation or weaken syncing to chase lower timings.
+
+## Milestone 53: prove ordered row-ID uniqueness before validation
+
+19 Nov 2026, Apple M5, Rust 1.100.0, baseline M52 merge `17dae09`.
+Fresh `profile_milestone50` on M52 found full-image validation at 1,520–1,622 µs
+for one INSERT into 100,000 existing rows. Durable syncs dominate the rest;
+this milestone does not weaken them. M52's PR was merged, its feature-head
+manual CI had passed, and its later main push run was cancelled. M53 runs the
+complete local checks and requires its own exact-head CI before merging.
+
+Full validation previously allocated a HashSet of every row ID. It now checks
+whether IDs are strictly increasing, for both owned images and live views.
+Strict increase proves uniqueness, allowing the per-row loop to omit the set.
+Unordered or duplicate IDs use the original hash-set path. The prepass reports
+no errors and runs only after length alignment is checked, so a later duplicate
+cannot mask an earlier value/type/size error. Every row still gets its counter,
+width, type and record-size checks. Names and table ordering are unchanged.
+No page/WAL format, checksum, index, commit or recovery behavior changes.
+
+The checked property is not assumed from the table representation. Empty,
+single-row, gapped, reversed, duplicate, zero and near-u64::MAX IDs are covered.
+`ForceValidationHash` restores the original duplicate-ID algorithm for tests.
+A property test compares exact errors on owned and live representations with
+random IDs, counters, value types and row widths, including sorted/deduplicated
+cases. 1,024 extended cases pass. Fixed tests ensure an earlier type error wins
+over a later duplicate. Differential INSERT/schema-edit tests compare results,
+row IDs/counters, database/WAL bytes and reopened queries. Single/batch/wide/
+other-table INSERT tests cover rollback, after-log-sync recovery, ambiguous
+sync, partial checkpoint, fencing and repeated reopen. Injected faults do not
+substitute for physical power-loss tests.
+
+`profile_milestone53` uses fresh copies, seed `0x3100`, durable syncs, one read
+warmup, and five alternating ordered/hash pairs at 1,000/10,000/100,000 rows.
+Both arms record phases and compare results, checksums, exact database bytes,
+WAL byte counts and frames outside timing. UPDATE is an unchanged-path control.
+Two isolated release passes measured µs at 100,000 existing rows:
+
+| workload | pass | ordered median (range) | hash median (range) | observed median improvement |
+| --- | --- | --- | --- | --- |
+| one row | 1 | 13,313 (12,839–13,621) | 14,301 (13,978–14,436) | 6.9% |
+| one row | 2 | 11,902 (11,312–13,622) | 14,558 (13,392–14,931) | 18.2% |
+| 32 rows | 1 | 13,333 (11,362–14,778) | 14,469 (12,484–14,932) | 7.9% |
+| 32 rows | 2 | 12,575 (12,044–14,557) | 14,692 (12,296–14,987) | 14.4% |
+
+Single-row INSERT wins all ten pairs; the batch wins eight of ten. Paired median
+savings are 1,073/2,620 µs for one row and 1,122/430 µs for the batch in passes
+1/2. Validation medians are 654/671 vs 1,551/1,583 µs for one row and 658/669 vs
+1,575/1,603 µs for the batch: about 58% less validation time in either pass.
+The larger wall-time differences are not all attributable to validation:
+sync/host noise varies, and ranges overlap except the first one-row run.
+The unchanged UPDATE control measures 13,652 vs 13,212 µs in pass 1 and
+14,255 vs 13,722 in pass 2. No UPDATE speedup is claimed.
+
+Small-table durable results are mixed. At 1,000 rows, one-row medians are
+11,616 vs 11,531 and 11,311 vs 12,004 µs (ordered vs hash); batch medians are
+12,264 vs 10,380 and 12,389 vs 12,810. At 10,000 rows, one-row medians are
+10,581 vs 12,050 and 11,222 vs 11,290; batch medians are 11,645 vs 11,832 and
+11,104 vs 11,130. No consistent small-table wall-time benefit is claimed.
+
+`profile_validation53` separately isolates complete validation, with recording
+disabled, four-column rows, reused warm input, five alternating pairs and 20
+calls per timed sample. It tests increasing IDs, an inversion at the start,
+and an inversion at the end. Both passes use black-boxed inputs/results and
+require validation success. Median µs per call at 100,000 rows:
+
+| order | pass 1 new / hash | pass 2 new / hash |
+| --- | --- | --- |
+| increasing | 551.0 / 1,737.1 | 559.4 / 1,709.3 |
+| early inversion | 1,726.8 / 1,733.1 | 1,710.0 / 1,710.7 |
+| late inversion | 1,755.3 / 1,731.5 | 1,733.2 / 1,700.6 |
+
+The increasing-ID microbenchmark improves 67.3–68.3%; its fixture, cache reuse
+and disabled recorder differ from the statement benchmark. Early fallback is
+within 0.4%; late fallback adds 23.7–32.7 µs (1.4–1.9%) for the additional scan.
+No peak RSS measurement is claimed, although the ordered path does not allocate
+the per-row-ID hash set. Validation remains O(n), with a second ID-only scan.
+
+At 100,000 rows, WAL remains 36,996 bytes / 9 frames / checksum 5,001,582,569
+for one row and 41,096 bytes / 10 frames / checksum 5,004,683,315 for a batch.
+Every paired database file is byte-identical.
+
+Validation: formatting, strict Clippy, all-target build, full locked suite
+633 passed / 0 failed / 47 ignored (including a doctest), all 17 reliability
+tests with `PROPTEST_CASES=256`, the validation property with
+`PROPTEST_CASES=1024`, two durable profiles and two validation microbenchmark
+passes. Final test-name cleanup and the late-fallback benchmark extension were
+rechecked with formatting/strict Clippy and compiled in release; production
+code is identical across the profile passes. No timing assertions are used.
+
+Decision: merge the checked uniqueness fast path. M37/M38/M41/M44/M47 experiments
+remain absent. Durable I/O now dominates this INSERT workload. Further work
+should profile a broader workload before selecting another optimization rather
+than relaxing sync or validation guarantees for another timing reduction.

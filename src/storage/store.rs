@@ -78,6 +78,12 @@ impl ViewRows<'_> {
             Self::Memory { values, .. } => values.len(),
         }
     }
+    fn strictly_ordered(&self) -> bool {
+        match self {
+            Self::Image(rows) => rows.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            Self::Memory { ids, .. } => ids.windows(2).all(|pair| pair[0] < pair[1]),
+        }
+    }
     fn aligned(&self) -> bool {
         match self {
             Self::Image(_) => true,
@@ -632,9 +638,15 @@ fn validate_views(tables: &[TableView<'_>]) -> Result<(), DbError> {
                 table.name
             )));
         }
-        let mut ids = HashSet::with_capacity(table.rows.len());
+        // Prove uniqueness without allocating for increasing IDs. The prepass
+        // reports no errors: fallback retains per-row validation/error order.
+        let mut ids = (force_validation_hash() || !table.rows.strictly_ordered())
+            .then(|| HashSet::with_capacity(table.rows.len()));
         for (row_id, values) in table.rows.iter() {
-            if row_id == 0 || row_id >= table.next_row_id || !ids.insert(row_id) {
+            if row_id == 0
+                || row_id >= table.next_row_id
+                || ids.as_mut().is_some_and(|ids| !ids.insert(row_id))
+            {
                 return Err(DbError::Internal(format!(
                     "row id {row_id} is outside the counter for table '{}'",
                     table.name
@@ -1355,9 +1367,35 @@ fn definition_too_big() -> DbError {
 
 #[cfg(test)]
 thread_local! {
+    static FORCE_VALIDATION_HASH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FORCE_OWNED_VIEWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FORCE_PUBLISH_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+#[cfg(test)]
+pub(crate) struct ForceValidationHash(bool);
+#[cfg(test)]
+impl ForceValidationHash {
+    pub(crate) fn new() -> Self {
+        Self(FORCE_VALIDATION_HASH.with(|flag| flag.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for ForceValidationHash {
+    fn drop(&mut self) {
+        FORCE_VALIDATION_HASH.with(|flag| flag.set(self.0));
+    }
+}
+fn force_validation_hash() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_VALIDATION_HASH.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct ForceOwnedPublish(bool);
 #[cfg(test)]
@@ -1446,6 +1484,154 @@ mod tests {
             next_row_id,
             table_id: 0,
             rows,
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(128))]
+        #[test]
+        fn ordered_validation_matches_hash_error_order(
+            mut ids in proptest::collection::vec(0u64..32, 0..64),
+            kinds in proptest::collection::vec(0u8..5, 0..64),
+            counter in 0u64..36,
+            sorted in proptest::bool::ANY,
+        ) {
+            if sorted { ids.sort_unstable(); ids.dedup(); }
+            let columns = vec![Column::new("id", DataType::Integer)];
+            let values: Vec<Vec<Value>> = ids.iter().enumerate().map(|(i,_)| match kinds.get(i).copied().unwrap_or(0) {
+                0 => vec![Value::Integer(i as i64)],
+                1 => vec![Value::Null],
+                2 => vec![],
+                3 => vec![Value::Text("wrong type".into())],
+                _ => vec![Value::Integer(1), Value::Integer(2)],
+            }).collect();
+            let image = TableImage {name:"t".into(),columns,next_row_id:counter,table_id:0, rows:ids.iter().copied().zip(values.clone()).collect()};
+            for rows in [ViewRows::Image(&image.rows), ViewRows::Memory {ids:&ids,values:&values}] {
+                let view = TableView {rows,..image.view()};
+                let result = validate_views(&[view]).map_err(|e|e.to_string());
+                let reference = {let _guard = ForceValidationHash::new();validate_views(&[view]).map_err(|e|e.to_string())};
+                proptest::prop_assert_eq!(result,reference);
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_validation_extremes_and_late_duplicates_keep_first_error() {
+        for ids in [
+            vec![],
+            vec![1],
+            vec![1, 3, u64::MAX - 1],
+            vec![3, 1],
+            vec![1, 2, 1],
+            vec![0, 1],
+            vec![1, u64::MAX],
+        ] {
+            let rows: Vec<_> = ids.iter().map(|_| vec![Value::Integer(1)]).collect();
+            let columns = vec![Column::new("id", DataType::Integer)];
+            let view = TableView {
+                name: "t",
+                columns: &columns,
+                next_row_id: u64::MAX,
+                rows: ViewRows::Memory {
+                    ids: &ids,
+                    values: &rows,
+                },
+            };
+            assert_eq!(
+                view.rows.strictly_ordered(),
+                ids.windows(2).all(|p| p[0] < p[1])
+            );
+            let actual = validate_views(&[view]).map_err(|e| e.to_string());
+            let reference = {
+                let _guard = ForceValidationHash::new();
+                validate_views(&[view]).map_err(|e| e.to_string())
+            };
+            assert_eq!(actual, reference);
+        }
+        let ids = [1, 2, 1];
+        let rows = vec![
+            vec![Value::Text("bad".into())],
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+        ];
+        let columns = vec![Column::new("id", DataType::Integer)];
+        let view = TableView {
+            name: "t",
+            columns: &columns,
+            next_row_id: 4,
+            rows: ViewRows::Memory {
+                ids: &ids,
+                values: &rows,
+            },
+        };
+        assert!(
+            validate_views(&[view])
+                .unwrap_err()
+                .to_string()
+                .contains("does not match its column")
+        );
+    }
+
+    #[test]
+    #[ignore = "release microbenchmark of full row validation"]
+    fn profile_validation53() {
+        use std::hint::black_box;
+        let columns = vec![
+            Column::new("id", DataType::Integer),
+            Column::new("name", DataType::Text),
+            Column::new("active", DataType::Boolean),
+            Column::new("bucket", DataType::Integer),
+        ];
+        for count in [1_000usize, 10_000, 100_000] {
+            let values: Vec<_> = (0..count)
+                .map(|i| {
+                    vec![
+                        Value::Integer(i as i64),
+                        Value::Text(format!("row{i}")),
+                        Value::Boolean(i % 2 == 0),
+                        Value::Integer((i % 10) as i64),
+                    ]
+                })
+                .collect();
+            for order in ["sorted", "early", "late"] {
+                let mut ids: Vec<u64> = (1..=count as u64).collect();
+                if order == "early" {
+                    ids.swap(0, 1);
+                }
+                if order == "late" {
+                    ids.swap(count - 2, count - 1);
+                }
+                let view = TableView {
+                    name: "t",
+                    columns: &columns,
+                    next_row_id: count as u64 + 1,
+                    rows: ViewRows::Memory {
+                        ids: &ids,
+                        values: &values,
+                    },
+                };
+                for hashed in [false, true] {
+                    let _guard = hashed.then(ForceValidationHash::new);
+                    validate_views(&[view]).unwrap();
+                }
+                for n in 0..5 {
+                    for hashed in if n % 2 == 0 {
+                        [false, true]
+                    } else {
+                        [true, false]
+                    } {
+                        let _guard = hashed.then(ForceValidationHash::new);
+                        let started = std::time::Instant::now();
+                        for _ in 0..20 {
+                            black_box(validate_views(black_box(&[view]))).unwrap();
+                        }
+                        println!(
+                            "validation53 rows={count} order={order} n={n} hashed={hashed} ns_per_call={}",
+                            started.elapsed().as_nanos() / 20
+                        );
+                    }
+                }
+            }
         }
     }
 
