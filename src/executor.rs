@@ -25410,6 +25410,107 @@ mod tests {
         }
     }
 
+    fn milestone56_sequence(rows: i64, steps: usize, pairs: usize) {
+        let (_dir, base) = seed_delete_db("m56-sequence", rows, 0x3100);
+        let mut reference = Database::open(&base).unwrap();
+        let expected: Vec<_> = table_rows(&mut reference)
+            .into_iter()
+            .filter(|row| matches!(row[0], Value::Integer(id) if id > (steps * 10) as i64))
+            .collect();
+        drop(reference);
+        let _phases = crate::storage::enable_phases();
+        for pair in 0..pairs {
+            let run = |recording: bool| {
+                let (_dir, path, mut db) = open_copy(&base, &format!("m56-{pair}-{recording}"));
+                db.execute("SELECT COUNT(*) FROM users;").unwrap();
+                crate::storage::set_phases_enabled(recording);
+                let mut walls = Vec::new();
+                for step in 0..steps {
+                    crate::storage::reset_phases();
+                    let sql = format!(
+                        "DELETE FROM users WHERE id >= {} AND id <= {};",
+                        1 + step * 10,
+                        10 + step * 10
+                    );
+                    let started = std::time::Instant::now();
+                    let result = db.execute(&sql).unwrap();
+                    let wall = started.elapsed().as_nanos();
+                    let p = crate::storage::take_phases();
+                    assert_eq!(result, vec![StatementResult::Delete { count: 10 }]);
+                    walls.push(wall);
+                    println!(
+                        "milestone56 rows={rows} pair={pair} recording={recording} step={step} wall_ns={wall} index_ns={} validation_ns={} validations={} presence_ns={} prepare_ns={} memory_ns={} apply_ns={} wal_sync_ns={} db_sync_ns={} wal_bytes={} frames={} bulk_spans={} leaf_merges={} leaf_decodes={}",
+                        p.index_edit.as_nanos(),
+                        p.tree_validate.as_nanos(),
+                        p.tree_validations,
+                        p.presence_build.as_nanos(),
+                        p.prepare.as_nanos(),
+                        p.memory.as_nanos(),
+                        p.apply.as_nanos(),
+                        p.wal_sync.as_nanos(),
+                        p.db_sync.as_nanos(),
+                        p.wal_bytes,
+                        p.frames,
+                        p.bulk_spans,
+                        p.leaf_merges,
+                        p.leaf_decodes
+                    );
+                    if !recording {
+                        assert_eq!(p, crate::storage::Profile::default());
+                    }
+                }
+                crate::storage::set_phases_enabled(false);
+                let remaining = table_rows(&mut db);
+                assert_eq!(remaining.len(), rows as usize - steps * 10);
+                assert_eq!(remaining, expected);
+                let id = index_postings(&mut db, "idx_users_id");
+                let bucket = index_postings(&mut db, "idx_users_bucket");
+                assert_eq!(id.len(), remaining.len());
+                let bytes = db_file(&path);
+                drop(db);
+                let mut reopened = Database::open(&path).unwrap();
+                assert_eq!(table_rows(&mut reopened), remaining);
+                assert_eq!(index_postings(&mut reopened, "idx_users_id"), id);
+                assert_eq!(index_postings(&mut reopened, "idx_users_bucket"), bucket);
+                assert_checksums(&path);
+                println!(
+                    "milestone56_total rows={rows} pair={pair} recording={recording} total_ns={} median_ns={}",
+                    walls.iter().sum::<u128>(),
+                    median(&walls)
+                );
+                (remaining, id, bucket, bytes)
+            };
+            let (off, on) = if pair % 2 == 0 {
+                (run(false), run(true))
+            } else {
+                let on = run(true);
+                (run(false), on)
+            };
+            assert_eq!(
+                off, on,
+                "recording must preserve rows, indexes and database bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn milestone56_sequence_preserves_results_and_recording_identity() {
+        milestone56_sequence(100, 5, 1);
+    }
+
+    #[test]
+    #[ignore = "release attribution of consecutive durable deletes"]
+    fn profile_milestone56() {
+        println!(
+            "milestone56 cpu={} rustc={} durable=true seed=0x3100 pairs=3 steps=50",
+            profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]),
+            profile_command("rustc", &["--version"])
+        );
+        for rows in [10_000, 100_000] {
+            milestone56_sequence(rows, 50, 3);
+        }
+    }
+
     #[test]
     fn ordered_validation_matches_hash_for_inserts_and_schema_edits() {
         let (_dir, base) = publish_image_fixture("m53-images");

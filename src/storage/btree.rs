@@ -2455,6 +2455,8 @@ fn validate_tree(
     limits: Limits,
     hints: Option<&mut Vec<LeafHint>>,
 ) -> Result<(Vec<Entry>, u64), DbError> {
+    #[cfg(test)]
+    let _timer = super::profile::Timer::new(|p| &mut p.tree_validate);
     super::profile::note_tree_validation();
     if root == 0 {
         return Ok((Vec::new(), 0));

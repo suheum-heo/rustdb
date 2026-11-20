@@ -2827,3 +2827,96 @@ Next investigation: attribute repeated-delete validation and tree-layout costs
 before designing another optimization. Any successor must preserve compaction's
 later-transaction benefits and demonstrate a sustained workload improvement.
 Do not simply loosen this candidate's threshold to favor the first transaction.
+
+## Milestone 56 — consecutive-delete cost attribution
+
+Decision: merge test-only instrumentation and a reproducible sustained-workload
+benchmark. Do not change the production index algorithm. M55's rejected local
+sparse deletion is not restored. Baseline is M55 merge
+`a4609fcbdbbf93876c77a8c4d6616199fe4ccab5` (PR #51).
+
+A test-only scope timer measures whole-tree validation, including error returns.
+It is nested within index editing or presence building; never add it to those
+parent times. The timer and its new field compile out of production. The new
+benchmark runs 50 successive ten-row DELETEs on each fresh database, retaining
+both indexes and normal durable syncs. It resets counters before every statement,
+so WAL bytes and frames both refer to that statement, not mixed aggregate/last
+values. Recording is alternated on/off across three paired copies at 10k and
+100k rows (seed 0x3100). Every copy warms with COUNT. Each pair checks identical
+final database bytes, both indexes and rows. Remaining rows are also compared
+with an independently filtered seed snapshot; reopen and all page checksums
+are checked outside timing. A normal 100-row, five-delete test exercises the
+same harness. This is a diagnostic milestone, not a claimed production speedup.
+
+### Two isolated release passes
+
+Apple M5, rustc 1.100.0. Each pass contains 600 timed durable statements. First
+medians pool three samples per configuration; later medians pool the 147
+remaining statements across three copies. These are correlated sequence samples,
+not 147 independent fresh databases. Later phases include occasional rebuilds.
+
+| Rows | Pass | First wall, recording off | Later wall, recording off |
+| --- | --- | ---: | ---: |
+| 10,000 | 1 | 16.055 ms | 12.733 ms |
+| 10,000 | 2 | 13.454 ms | 12.263 ms |
+| 100,000 | 1 | 25.270 ms | 18.990 ms |
+| 100,000 | 2 | 25.855 ms | 18.966 ms |
+
+At 100k, recorded first index-edit medians are 3.706 / 3.683 ms, of which
+whole-tree validation is 2.033 / 2.076 ms (four calls). The first statement
+performs two span rebuilds, 235 leaf merges, 7,085 leaf decodes and writes
+2,045,996 WAL bytes / 499 frames, reproducing M54's observation.
+
+Later median index editing is only 0.069 ms in both passes. In each pass,
+135 of 147 later statements have zero whole-tree validations and zero bulk
+spans; twelve perform one bulk span and two validations. Median WAL is 32,896
+bytes / eight frames. One later statement in each copy still writes 250 frames;
+this is not a claim that every later transaction is cheap. Raw per-statement
+logs retain the outliers and exact positions.
+
+| 100k recorded phase, later median | Pass 1 | Pass 2 |
+| --- | ---: | ---: |
+| Memory execution | 4.518 ms | 4.469 ms |
+| Prepare | 2.022 ms | 1.934 ms |
+| Storage apply, includes index editing | 0.935 ms | 0.915 ms |
+| WAL sync | 3.670 ms | 3.599 ms |
+| Database sync | 2.993 ms | 2.986 ms |
+| Index editing, nested in apply | 0.069 ms | 0.069 ms |
+
+These per-phase medians must not be added to reconstruct a median statement;
+nested stages overlap and this table is not complete wall-time accounting.
+Recording-on later wall medians are 18.970 / 18.960 ms versus recording-off
+18.990 / 18.966 ms. That does not imply zero overhead: on/off copies execute
+at different times, and storage noise is visible at 10k (later on 12.943 /
+12.936 ms versus off 12.733 / 12.263 ms). No universal overhead correction is
+applied. An initial exploratory run overlapped build/test activity and used an
+earlier harness; its timing is excluded. Both reported passes use the final
+source and execute sequentially after all other build/test jobs finish.
+
+### Consequence and next work
+
+The current compaction path makes most subsequent index edits inexpensive.
+Optimizing whole-tree validation alone cannot remove the typical later-delete
+cost observed here, because most later statements do not invoke it. This gives
+stronger evidence for preserving M55's rejection, without claiming to isolate
+every cause of that candidate's slowdown (the candidate was not rerun here).
+
+Next investigate the roughly 4.5 ms memory execution and 2 ms preparation at
+100k, breaking down row scanning, survivor movement, undo and consistency checks
+before selecting a change. Preserve sync/recovery guarantees; sync time is not
+permission to remove durability. Require sustained paired measurements as well
+as fresh-copy measurements for any production successor. Do not restore the
+previously rejected M37/M38/M41/M44/M47/M55 implementations.
+
+Validation: formatting, strict Clippy, all-target locked build and full locked
+tests passed: 635 passed, 0 failed, 49 ignored, including one doctest. Both final
+release passes passed their reference, recording identity, reopen/index and page
+checksum checks (1,200 timed statements total). Only test code is added; page
+and WAL formats, error behavior and recovery guarantees remain unchanged.
+
+Reproduce:
+
+```sh
+cargo test --locked --lib milestone56_sequence_preserves_results_and_recording_identity
+cargo test --release --locked --lib executor::tests::profile_milestone56 -- --ignored --nocapture --exact
+```
