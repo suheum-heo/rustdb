@@ -43,6 +43,9 @@ pub(crate) struct Profile {
     pub heap_edit: Duration,
     /// Removing index postings for a delete.
     pub index_edit: Duration,
+    /// Whole-tree validation, nested inside index editing or presence building.
+    #[cfg(test)]
+    pub tree_validate: Duration,
     pub wal_write: Duration,
     pub wal_sync: Duration,
     pub db_write: Duration,
@@ -231,6 +234,7 @@ thread_local! {
         decode: Duration::ZERO,
         heap_edit: Duration::ZERO,
         index_edit: Duration::ZERO,
+        tree_validate: Duration::ZERO,
         wal_write: Duration::ZERO,
         wal_sync: Duration::ZERO,
         db_write: Duration::ZERO,
