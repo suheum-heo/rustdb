@@ -17,6 +17,36 @@ use crate::schema::{Column, Schema};
 use crate::storage::{TableImage, ensure_record_fits};
 use crate::value::Value;
 
+#[cfg(test)]
+thread_local! {
+    static SEPARATE_RETAIN_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct SeparateRetainCheck(bool);
+#[cfg(test)]
+impl SeparateRetainCheck {
+    pub(crate) fn new() -> Self {
+        Self(SEPARATE_RETAIN_CHECK.with(|flag| flag.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for SeparateRetainCheck {
+    fn drop(&mut self) {
+        SEPARATE_RETAIN_CHECK.with(|flag| flag.set(self.0));
+    }
+}
+fn separate_retain_check() -> bool {
+    #[cfg(test)]
+    {
+        SEPARATE_RETAIN_CHECK.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// One relation: a fixed schema and an insertion-ordered row list.
 #[derive(Debug, Clone)]
 pub(crate) struct Table {
@@ -423,13 +453,27 @@ impl Table {
         positions
             .try_reserve(original)
             .map_err(|_| restoration_capacity())?;
-        let mut seen = HashSet::new();
-        seen.try_reserve(indexes.len())
-            .map_err(|_| restoration_capacity())?;
-        for index in indexes {
-            if !seen.insert(self.row_ids[*index]) {
-                return Err(DbError::Storage("database file is corrupt".to_string()));
+        let separate = separate_retain_check();
+        let mut positions_us = 0;
+        if separate {
+            let mut seen = HashSet::new();
+            seen.try_reserve(indexes.len())
+                .map_err(|_| restoration_capacity())?;
+            for index in indexes {
+                if !seen.insert(self.row_ids[*index]) {
+                    return Err(DbError::Storage("database file is corrupt".to_string()));
+                }
             }
+        } else {
+            // Build the replacement map before moving rows. Insertion detects
+            // duplicate surviving ids, so no separate membership set is needed.
+            let started = std::time::Instant::now();
+            for (position, index) in indexes.iter().copied().enumerate() {
+                if positions.insert(self.row_ids[index], position).is_some() {
+                    return Err(DbError::Storage("database file is corrupt".to_string()));
+                }
+            }
+            positions_us = started.elapsed().as_micros();
         }
 
         let mut rows = std::mem::take(&mut self.rows);
@@ -439,11 +483,13 @@ impl Table {
             kept_ids.push(row_ids[*index]);
         }
         drop(rows);
-        let started = std::time::Instant::now();
-        for (position, row_id) in kept_ids.iter().copied().enumerate() {
-            positions.insert(row_id, position);
+        if separate {
+            let started = std::time::Instant::now();
+            for (position, row_id) in kept_ids.iter().copied().enumerate() {
+                positions.insert(row_id, position);
+            }
+            positions_us = started.elapsed().as_micros();
         }
-        let positions_us = started.elapsed().as_micros();
         self.rows = kept_rows;
         self.row_ids = kept_ids;
         self.positions = positions;
@@ -839,6 +885,70 @@ mod tests {
         assert!(table.row_ids.is_empty());
         assert!(table.positions.is_empty());
         assert_eq!(table.next_row_id, u64::MAX);
+    }
+
+    #[test]
+    fn retained_map_matches_separate_check_for_all_subsets_and_errors() {
+        let mut base = users();
+        base.insert(
+            &[],
+            (0..8)
+                .map(|n| vec![Value::Integer(n), Value::Text(format!("row {n}"))])
+                .collect(),
+        )
+        .unwrap();
+        for ids in [
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            vec![8, 7, 6, 5, 4, 3, 2, 1],
+            vec![1, 2, 3, 4, 5, 6, 7, 1],
+            vec![0, 2, 3, 4, 5, 6, 7, u64::MAX],
+        ] {
+            let mut original = base.clone();
+            original.row_ids = ids;
+            for mask in 0..256 {
+                let kept: Vec<_> = (0..8).filter(|i| mask & (1 << i) != 0).collect();
+                let mut fast = original.clone();
+                let mut old = original.clone();
+                let actual = fast
+                    .retain_indexes(&kept)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+                let expected = {
+                    let _guard = SeparateRetainCheck::new();
+                    old.retain_indexes(&kept)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                };
+                assert_eq!(actual, expected);
+                assert_eq!(fast.rows, old.rows);
+                assert_eq!(fast.row_ids, old.row_ids);
+                assert_eq!(fast.positions, old.positions);
+                assert_eq!(fast.next_row_id, old.next_row_id);
+                if actual.is_err() {
+                    assert_eq!(fast.rows, original.rows);
+                    assert_eq!(fast.row_ids, original.row_ids);
+                    assert_eq!(fast.positions, original.positions);
+                }
+            }
+        }
+        for kept in [
+            vec![8],
+            vec![2, 1],
+            vec![1, 1],
+            vec![0, 1, 2, 3, 4, 5, 6, 8],
+        ] {
+            let mut fast = base.clone();
+            let mut old = base.clone();
+            let actual = fast.retain_indexes(&kept).unwrap_err().to_string();
+            let expected = {
+                let _guard = SeparateRetainCheck::new();
+                old.retain_indexes(&kept).unwrap_err().to_string()
+            };
+            assert_eq!(actual, expected);
+            assert_eq!(fast.rows, base.rows);
+            assert_eq!(fast.row_ids, base.row_ids);
+            assert_eq!(fast.positions, base.positions);
+        }
     }
 
     #[test]

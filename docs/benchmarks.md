@@ -2920,3 +2920,111 @@ Reproduce:
 cargo test --locked --lib milestone56_sequence_preserves_results_and_recording_identity
 cargo test --release --locked --lib executor::tests::profile_milestone56 -- --ignored --nocapture --exact
 ```
+
+## Milestone 57 — combine survivor validation with position-map construction
+
+Decision: merge. Build the replacement row-id position map before moving DELETE
+survivors, using failed insertion to detect duplicate IDs. This removes the
+separate survivor HashSet and its full pass while preserving the pre-mutation
+validation boundary. Baseline: M56 merge
+`9750fd3e884b26b527450c4abc5f09a0ba5162f3` (PR #52).
+
+### Selection and implementation
+
+The unmodified baseline's 100k consecutive-delete memory medians were 1.802 ms
+filtering, 2.606 ms installing survivors (including 0.913 ms constructing the
+position map), and 0.002 ms capturing undo. Inspection found that installation
+hashed every surviving ID twice: once into a temporary uniqueness set, then
+again into the permanent position map. The new path does the latter first and
+uses HashMap::insert's previous-value result for the same uniqueness check.
+
+All selected positions are validated before allocation or mutation, as before.
+Replacement vectors and map capacity are reserved before any rows move. A
+repeated surviving ID returns the same corruption error and leaves the table
+untouched. All-survivor/no-match early returns are unchanged. Row order, stable
+IDs, next_row_id, position mappings and undo restoration are unchanged. There
+is no new assumption that IDs are sorted. Allocation failures still occur
+before mutation; the now-unneeded temporary set allocation is removed.
+
+The old implementation remains selectable only by a test guard. The positions
+timer still measures map construction, now before survivor movement. No page,
+WAL, B-tree, sync or recovery protocol changes are made. No previously rejected
+experiment is restored.
+
+### Correctness
+
+A new exhaustive differential test checks all 256 survivor subsets for four ID
+patterns (ordered, reversed, duplicate and boundary IDs), plus out-of-range,
+reversed and repeated position requests. It compares errors, rows, IDs, maps,
+counters and unchanged state on failure. Existing compaction/undo restoration,
+corruption, publish, fault-injection and recovery tests run on the new default.
+The sequence harness independently filters the seed rows and compares both
+implementations' results, both indexes and exact final database bytes; it also
+checks reopen and every page checksum. Fresh controls do the same for each
+statement's result and final database. A normal small sequence test exercises
+the paired path in CI. The candidate uses no extra production clock sampling;
+the existing map-construction timer moves with that work.
+
+### Measurements
+
+Apple M5, rustc 1.100.0, release, durable syncs enabled, seed 0x3100. Sequence
+runs use 50 successive ten-row deletes on each copy, three paired copies per
+size (10k and 100k), alternating arm order and COUNT warmup. Two isolated passes
+have phase recording disabled; a separate recorded pass supplies attribution.
+Each pass contains 600 statements. Timings within a sequence are correlated.
+No benchmark overlaps builds or other tests. Pass 1 preceded the addition of
+an extra ignored fresh-control harness; production code is identical across
+all candidate passes.
+
+| 100k sequence pair | Pass 1 candidate / baseline | Pass 2 candidate / baseline |
+| --- | ---: | ---: |
+| 0 | 901.832 / 969.451 ms | 906.356 / 966.491 ms |
+| 1 | 862.481 / 935.394 ms | 879.956 / 981.095 ms |
+| 2 | 897.938 / 947.635 ms | 882.092 / 978.356 ms |
+
+All six large-table pairs improve: 5.2–7.8% in pass 1 and 6.2–10.3% in pass 2.
+At 10k, pass 1 has two wins and one 3.1% slowdown; pass 2 improves in all pairs
+by 2.4–5.0%. The smaller effect competes with durable-storage noise; this is
+not a universal latency guarantee.
+
+Recorded 100k survivor-install medians fall from 2.660 to 1.289 ms. Map building
+itself is 0.923 ms before versus 0.996 ms after, so the saving is removal of the
+extra validation allocation/pass, not a faster hash-map algorithm. Filter time
+is 1.718 versus 1.809 ms and undo 0.002 versus 0.003 ms. These phase medians
+are descriptive, not additive wall-time accounting. Preparation still audits
+survivors and is intentionally unchanged.
+
+Fresh-copy controls at 100k, five alternating pairs, recording disabled:
+
+| DELETE workload | Candidate median | Baseline median |
+| --- | ---: | ---: |
+| One row | 16.633 ms | 17.900 ms |
+| Ten rows | 24.493 ms | 24.414 ms |
+| Half | 64.168 ms | 64.760 ms |
+| Alternating | 71.687 ms | 73.610 ms |
+| All | 76.443 ms | 77.122 ms |
+| No match | 14.960 ms | 15.124 ms |
+
+The fresh ten-row median is effectively flat (+0.3%); the first compaction and
+sync costs dominate it. Delete-all and no-match do little or none of the
+removed work, so their small differences should be treated as noise. The
+merge decision rests on the consistently improved sustained large-table
+pairs and reduced measured survivor-install work, with no changed bytes.
+
+Validation: formatting, strict Clippy, all-target locked build and full locked
+test suite pass: 637 passed, 0 failed, 51 ignored, including one doctest.
+All three candidate sequence runs and the 60-statement fresh-control run pass
+correctness checks. The baseline profiling pass is retained separately.
+
+Reproduce:
+
+```sh
+cargo test --locked
+cargo test --release --locked --lib executor::tests::profile_milestone57 -- --ignored --nocapture --exact
+RUSTDB_PROFILE_ENABLED=1 cargo test --release --locked --lib executor::tests::profile_milestone57 -- --ignored --nocapture --exact
+cargo test --release --locked --lib executor::tests::profile_milestone57_fresh -- --ignored --nocapture --exact
+```
+
+Next: investigate filtering and the unchanged survivor audit only after
+profiling their internal costs. Preserve the current corruption checks and
+require paired sustained-workload evidence for any further change.
