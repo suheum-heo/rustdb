@@ -46,6 +46,12 @@ pub(crate) struct Profile {
     /// Whole-tree validation, nested inside index editing or presence building.
     #[cfg(test)]
     pub tree_validate: Duration,
+    /// In-memory ID and row-shape audit; nested inside preparation.
+    #[cfg(test)]
+    pub table_audit: Duration,
+    /// Survivor record-size checks; nested inside preparation.
+    #[cfg(test)]
+    pub table_fits: Duration,
     pub wal_write: Duration,
     pub wal_sync: Duration,
     pub db_write: Duration,
@@ -235,6 +241,8 @@ thread_local! {
         heap_edit: Duration::ZERO,
         index_edit: Duration::ZERO,
         tree_validate: Duration::ZERO,
+        table_audit: Duration::ZERO,
+        table_fits: Duration::ZERO,
         wal_write: Duration::ZERO,
         wal_sync: Duration::ZERO,
         db_write: Duration::ZERO,

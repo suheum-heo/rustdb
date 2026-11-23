@@ -3028,3 +3028,118 @@ cargo test --release --locked --lib executor::tests::profile_milestone57_fresh -
 Next: investigate filtering and the unchanged survivor audit only after
 profiling their internal costs. Preserve the current corruption checks and
 require paired sustained-workload evidence for any further change.
+
+## Milestone 58 — ordered uniqueness proof for survivor audits
+
+Decision: merge. Prove uniqueness with a strict-order check for ordered in-memory
+row IDs, retaining the original HashSet audit for every unordered sequence.
+Baseline: M57 merge `b1954299657d5277b0074ac226c9989d654f1eda` (PR #53).
+
+### Independent attribution and change
+
+Before changing the production algorithm, a paired baseline profile measured
+100k-row survivor ID/type audits at 1.779 / 1.766 ms and record-size checks at
+0.313 / 0.316 ms (two identical baseline arms). This identifies the audit as
+the larger preparation cost. Test-only scope timers distinguish the two and
+include error returns. Both are nested in preparation, not additional stages.
+
+The candidate checks whether every adjacent ID is strictly increasing. If so,
+uniqueness is proven without allocating a HashSet. Otherwise the original hash
+membership check runs. No data is sorted, and no assumption about row order is
+trusted. Empty and single-row inputs still receive the original counter, ID,
+shape and type checks. This applies the established M53 proof pattern to the
+in-memory selective-publish audit, rather than to full-image validation.
+
+Counter and vector-length checks still happen first. The order prepass reports
+no errors, so the original row walk retains the same ID-versus-shape error
+precedence. Bounds checks, runtime types, survivor record sizes and all recovery
+checks remain intact. The old algorithm can be forced only in tests. New phase
+timers compile out of production. No page/WAL formats, index layouts, commit
+syncs or recovery protocol change. No rejected experiment is restored.
+
+### Correctness
+
+The differential audit test enumerates all 2,401 four-ID sequences over 0..6,
+each with valid rows and four early/late malformed-width/type variants (12,005
+combinations). It compares exact errors from both audit entry points against
+the original hash path. Additional cases cover length mismatches, empty tables,
+zero/max counters, max IDs, reversed IDs, oversized records and error precedence
+between oversized records and invalid IDs. Unordered unique IDs remain valid;
+duplicates still fail. The ordinary paired sequence test compares independently
+filtered seed rows, both indexes, exact database bytes, reopen and page checksums.
+
+Formatting, strict Clippy, all-target locked build and the full locked test
+suite pass: 639 passed, 0 failed, 53 ignored, including one doctest. Existing
+corruption, rollback, fault-injection and recovery tests run on the candidate.
+The final ignored fresh-control harness additionally exercises three UPDATE
+workloads, then passes its release run and final strict Clippy compilation.
+
+### Sustained measurements
+
+Apple M5, rustc 1.100.0, release, durable syncs, seed 0x3100. Each sequence is
+50 ten-row deletes on one database; three paired fresh copies at 10k and 100k,
+alternating arm order, COUNT warmup. Two isolated passes disable phase recording;
+a third records phases. Each pass contains 600 timed statements. No builds or
+tests overlap measurements. `separate=true` in logs means forced original hash
+audit; false means the candidate. Sequence statements are correlated samples.
+
+| 100k sequence pair | Pass 1 candidate / hash | Pass 2 candidate / hash |
+| --- | ---: | ---: |
+| 0 | 855.444 / 906.394 ms | 897.619 / 1,047.497 ms |
+| 1 | 851.818 / 919.613 ms | 831.260 / 922.980 ms |
+| 2 | 967.645 / 950.906 ms | 856.147 / 918.497 ms |
+
+Five of six totals improve. Pass 1 pair 2 is 1.8% slower: candidate statement
+21 took 132.573 ms, versus a typical candidate statement around 17 ms. Pass 2
+also contains large baseline outliers (73.340 and 48.679 ms). These samples
+are retained in totals; their cause was not isolated. Do not treat the largest
+total improvement as a guaranteed gain. All six candidate per-sequence medians
+are lower: 16.216–16.973 ms versus 17.888–18.009 ms. At 10k all six totals
+improve, with smaller effects. Raw logs retain every transaction and its order.
+
+The recorded 100k audit median is 0.359 ms candidate versus 1.836 ms hash
+(about 80% less audit time). Record-size checks remain 0.317 versus 0.289 ms.
+Memory filtering and survivor installation are essentially unchanged work;
+their medians fluctuate (filter 1.904 / 1.797 ms; install 1.384 / 1.363 ms).
+All three recorded 100k sequence totals improve. Nested phase medians must not
+be summed to reconstruct median wall time. The attribution supports the removed
+hash work; recorder-off measurements establish end-to-end behavior.
+
+### Fresh DELETE and UPDATE controls
+
+100k rows, five alternating pairs per workload, recording disabled. Every pair
+checks statement results, rows, both indexes, exact final database bytes,
+reopen and all page checksums.
+
+| Workload | Candidate median | Hash median |
+| --- | ---: | ---: |
+| DELETE one | 14.453 ms | 16.867 ms |
+| DELETE ten | 23.297 ms | 23.754 ms |
+| DELETE half | 61.361 ms | 61.223 ms |
+| DELETE alternating | 72.480 ms | 72.811 ms |
+| DELETE all | 75.264 ms | 75.715 ms |
+| DELETE no match | 13.497 ms | 14.926 ms |
+| UPDATE one, indexed bucket | 12.021 ms | 14.136 ms |
+| UPDATE half, active flag | 38.127 ms | 39.817 ms |
+| UPDATE no match | 1.179 ms | 2.421 ms |
+
+Half-delete is effectively flat (+0.2%). Delete-all has no survivors to audit,
+so its small difference is not evidence of a benefit from this change. These
+results do not promise identical gains for unordered IDs, which use the hash
+fallback. The merge is justified by preserved correctness, consistent median
+sustained improvements and direct reduction of the profiled audit cost, while
+retaining the adverse total and small control differences.
+
+Candidate release checks cover 1,890 timed statements (three sequence passes
+plus 90 fresh controls); the independent baseline pass adds 600. All pass.
+
+```sh
+cargo test --locked
+cargo test --release --locked --lib executor::tests::profile_milestone58 -- --ignored --nocapture --exact
+RUSTDB_PROFILE_ENABLED=1 cargo test --release --locked --lib executor::tests::profile_milestone58 -- --ignored --nocapture --exact
+cargo test --release --locked --lib executor::tests::profile_milestone58_fresh -- --ignored --nocapture --exact
+```
+
+Next: investigate predicate filtering only after breaking down expression and
+row-walk costs. The remaining record-size audit stays intact; do not trade
+corruption detection or durable syncs for timing gains.
