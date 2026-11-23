@@ -47,6 +47,35 @@ fn separate_retain_check() -> bool {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static HASH_AUDIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) struct HashAudit(bool);
+#[cfg(test)]
+impl HashAudit {
+    pub(crate) fn new() -> Self {
+        Self(HASH_AUDIT.with(|flag| flag.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for HashAudit {
+    fn drop(&mut self) {
+        HASH_AUDIT.with(|flag| flag.set(self.0));
+    }
+}
+fn hash_audit_forced() -> bool {
+    #[cfg(test)]
+    {
+        HASH_AUDIT.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// One relation: a fixed schema and an insertion-ordered row list.
 #[derive(Debug, Clone)]
 pub(crate) struct Table {
@@ -324,6 +353,8 @@ impl Table {
     /// Check row ids and cell types the way a full publish does, without cloning
     /// or encoding rows this statement does not rewrite.
     pub(crate) fn audit(&self) -> Result<(), DbError> {
+        #[cfg(test)]
+        let _timer = crate::storage::Timer::new(|p| &mut p.table_audit);
         if self.next_row_id == 0 {
             return Err(DbError::Internal(
                 "table row-id counter must start at 1".to_string(),
@@ -337,9 +368,15 @@ impl Table {
                 self.rows.len()
             )));
         }
-        let mut seen = HashSet::with_capacity(self.rows.len());
+        // Strict order proves uniqueness without allocating a set. This pass
+        // reports no errors: the original row walk retains error precedence.
+        let ordered = !hash_audit_forced() && self.row_ids.windows(2).all(|ids| ids[0] < ids[1]);
+        let mut seen = (!ordered).then(|| HashSet::with_capacity(self.rows.len()));
         for (row_id, values) in self.row_ids.iter().zip(self.rows.iter()) {
-            if *row_id == 0 || *row_id >= self.next_row_id || !seen.insert(*row_id) {
+            if *row_id == 0
+                || *row_id >= self.next_row_id
+                || seen.as_mut().is_some_and(|seen| !seen.insert(*row_id))
+            {
                 return Err(DbError::Internal(format!(
                     "row id {row_id} is outside the counter for table '{}'",
                     self.name
@@ -357,6 +394,8 @@ impl Table {
     /// `validate` did on the table image. Neither check encodes the row.
     pub(crate) fn audit_for_publish(&self) -> Result<(), DbError> {
         self.audit()?;
+        #[cfg(test)]
+        let _timer = crate::storage::Timer::new(|p| &mut p.table_fits);
         for values in &self.rows {
             ensure_record_fits(values)?;
         }
@@ -885,6 +924,68 @@ mod tests {
         assert!(table.row_ids.is_empty());
         assert!(table.positions.is_empty());
         assert_eq!(table.next_row_id, u64::MAX);
+    }
+
+    #[test]
+    fn ordered_audit_matches_hash_errors_and_unordered_ids() {
+        let mut base = users();
+        base.insert(
+            &[],
+            (0..4)
+                .map(|n| vec![Value::Integer(n), Value::Text(format!("r{n}"))])
+                .collect(),
+        )
+        .unwrap();
+        let compare = |table: &Table| {
+            let fast = table.audit().map_err(|e| e.to_string());
+            let publish = table.audit_for_publish().map_err(|e| e.to_string());
+            let _guard = HashAudit::new();
+            assert_eq!(fast, table.audit().map_err(|e| e.to_string()));
+            assert_eq!(
+                publish,
+                table.audit_for_publish().map_err(|e| e.to_string())
+            );
+        };
+        for code in 0..2401 {
+            let mut table = base.clone();
+            let mut value = code;
+            for id in &mut table.row_ids {
+                *id = value % 7;
+                value /= 7;
+            }
+            compare(&table);
+            for position in [0, 3] {
+                let mut malformed = table.clone();
+                malformed.rows[position].pop();
+                compare(&malformed);
+                malformed = table.clone();
+                malformed.rows[position][0] = Value::Text("wrong type".into());
+                compare(&malformed);
+            }
+        }
+        for ids in [
+            vec![],
+            vec![1],
+            vec![1, 2, 3],
+            vec![1, 2, 3, 4, 5],
+            vec![1, 2, 3, u64::MAX],
+            vec![4, 3, 2, 1],
+        ] {
+            let mut table = base.clone();
+            table.row_ids = ids;
+            compare(&table);
+            table.next_row_id = 0;
+            compare(&table);
+            table.next_row_id = u64::MAX;
+            compare(&table);
+        }
+        let mut oversized = base.clone();
+        oversized.rows[0][1] = Value::Text("x".repeat(100_000));
+        compare(&oversized);
+        oversized.row_ids[3] = 0;
+        compare(&oversized);
+        let empty = users();
+        compare(&empty);
     }
 
     #[test]
