@@ -52,6 +52,13 @@ pub(crate) struct Profile {
     /// Survivor record-size checks; nested inside preparation.
     #[cfg(test)]
     pub table_fits: Duration,
+    /// Plain single-table SELECT collection, sorting and projection (nested in memory).
+    #[cfg(test)]
+    pub select_collect: Duration,
+    #[cfg(test)]
+    pub select_sort: Duration,
+    #[cfg(test)]
+    pub select_project: Duration,
     pub wal_write: Duration,
     pub wal_sync: Duration,
     pub db_write: Duration,
@@ -243,6 +250,9 @@ thread_local! {
         tree_validate: Duration::ZERO,
         table_audit: Duration::ZERO,
         table_fits: Duration::ZERO,
+        select_collect: Duration::ZERO,
+        select_sort: Duration::ZERO,
+        select_project: Duration::ZERO,
         wal_write: Duration::ZERO,
         wal_sync: Duration::ZERO,
         db_write: Duration::ZERO,
