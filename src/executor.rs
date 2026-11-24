@@ -428,6 +428,8 @@ impl Database {
                 tail.limit,
             );
         }
+        #[cfg(test)]
+        let collect_timer = crate::storage::Timer::new(|p| &mut p.select_collect);
         let mut rows: Vec<&[Value]> = Vec::new();
         if let Some(positions) = positions {
             for position in positions {
@@ -448,9 +450,15 @@ impl Database {
                 }
             }
         }
+        #[cfg(test)]
+        drop(collect_timer);
+        #[cfg(test)]
+        let sort_timer = crate::storage::Timer::new(|p| &mut p.select_sort);
         if !prepared.sort_keys.is_empty() {
             rows.sort_by(|left, right| compare_rows(left, right, &prepared.sort_keys));
         }
+        #[cfg(test)]
+        drop(sort_timer);
         if let Some(limit) = tail.limit {
             let limit = usize::try_from(limit).unwrap_or(usize::MAX);
             if rows.len() > limit {
@@ -458,10 +466,14 @@ impl Database {
             }
         }
 
+        #[cfg(test)]
+        let project_timer = crate::storage::Timer::new(|p| &mut p.select_project);
         let mut projected = Vec::with_capacity(rows.len());
         for row in rows {
             projected.push(project_row(row, &prepared.output_indexes)?);
         }
+        #[cfg(test)]
+        drop(project_timer);
         Ok(StatementResult::Query(QueryResult {
             columns: prepared.output_names,
             rows: projected,
@@ -26023,6 +26035,149 @@ mod tests {
                 };
                 assert_eq!(fast, old);
             }
+        }
+    }
+
+    const MILESTONE60_READS: [&str; 8] = [
+        "text-count",
+        "text-sort",
+        "text-group",
+        "distinct-bucket",
+        "join-count",
+        "join-group",
+        "null-count",
+        "group-having",
+    ];
+
+    fn milestone60_read_model(kind: &str, rows: &[Vec<Value>]) -> (String, Vec<Vec<Value>>) {
+        let mut buckets = std::collections::BTreeMap::<Option<i64>, i64>::new();
+        let mut names = std::collections::BTreeMap::<String, i64>::new();
+        for row in rows {
+            let bucket = match row[3] {
+                Value::Null => None,
+                Value::Integer(i) => Some(i),
+                _ => unreachable!(),
+            };
+            *buckets.entry(bucket).or_default() += 1;
+            let Value::Text(name) = &row[1] else {
+                unreachable!()
+            };
+            *names.entry(name.clone()).or_default() += 1;
+        }
+        let key = |b: Option<i64>| b.map_or(Value::Null, Value::Integer);
+        match kind {
+            "text-count" => ("SELECT COUNT(*) FROM users WHERE name >= 'M';".into(), vec![vec![Value::Integer(rows.iter().filter(|r| matches!(&r[1], Value::Text(s) if s.as_str() >= "M")).count() as i64)]]),
+            "text-sort" => {
+                let mut selected = rows.to_vec();
+                selected.sort_by(|a,b| {
+                    let (Value::Text(a_name),Value::Text(b_name)) = (&a[1],&b[1]) else { unreachable!() };
+                    let (Value::Integer(a_id),Value::Integer(b_id)) = (a[0].clone(),b[0].clone()) else { unreachable!() };
+                    a_name.cmp(b_name).then(a_id.cmp(&b_id))
+                });
+                ("SELECT id, name FROM users ORDER BY name, id LIMIT 10;".into(), selected.into_iter().take(10).map(|r| r[..2].to_vec()).collect())
+            }
+            "text-group" => ("SELECT name, COUNT(*) FROM users GROUP BY name ORDER BY name;".into(), names.into_iter().map(|(name,n)| vec![Value::Text(name),Value::Integer(n)]).collect()),
+            "distinct-bucket" => ("SELECT DISTINCT bucket FROM users ORDER BY bucket NULLS FIRST;".into(), buckets.keys().copied().map(|b| vec![key(b)]).collect()),
+            "join-count" => ("SELECT COUNT(*) FROM users JOIN labels ON users.bucket = labels.bucket;".into(), vec![vec![Value::Integer(buckets.iter().filter(|(b,_)| b.is_some()).map(|(_,n)| n).sum())]]),
+            "join-group" => ("SELECT labels.tag, COUNT(*) FROM users JOIN labels ON users.bucket = labels.bucket GROUP BY labels.tag ORDER BY labels.tag;".into(), buckets.iter().filter_map(|(b,n)| b.map(|b| vec![Value::Text(char::from(b'a'+b as u8).to_string()),Value::Integer(*n)])).collect()),
+            "null-count" => ("SELECT COUNT(*) FROM users WHERE bucket IS NULL;".into(), vec![vec![Value::Integer(*buckets.get(&None).unwrap_or(&0))]]),
+            "group-having" => {
+                let cutoff = rows.len() as i64 / 5;
+                (format!("SELECT bucket, COUNT(*) FROM users GROUP BY bucket HAVING COUNT(*) >= {cutoff} ORDER BY bucket NULLS FIRST;"), buckets.into_iter().filter(|(_,n)| *n >= cutoff).map(|(b,n)| vec![key(b),Value::Integer(n)]).collect())
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn milestone60_reads(rows: i64, samples: usize) {
+        let _phases = crate::storage::enable_phases();
+        crate::storage::set_phases_enabled(false);
+        let (_dir, base) = seed_delete_db("m60-reads", rows, 0x3100);
+        let mut setup = Database::open(&base).unwrap();
+        setup.execute("CREATE TABLE labels (bucket INT, tag TEXT); INSERT INTO labels VALUES (0, 'a'), (1, 'b'), (2, 'c'), (3, 'd'); CREATE INDEX idx_labels_bucket ON labels(bucket);").unwrap();
+        drop(setup);
+        let base_bytes = db_file(&base);
+        let expected_rows = milestone54_model("count", rows).0;
+        for kind in MILESTONE60_READS {
+            let (sql, expected) = milestone60_read_model(kind, &expected_rows);
+            let mut off = Vec::new();
+            let mut on = Vec::new();
+            for sample in 0..samples {
+                let run = |recording: bool| {
+                    crate::storage::set_phases_enabled(false);
+                    let (_dir, path, mut db) =
+                        open_copy(&base, &format!("m60-{kind}-{sample}-{recording}"));
+                    db.execute(&sql).unwrap();
+                    crate::storage::reset_phases();
+                    crate::storage::set_phases_enabled(recording);
+                    let started = std::time::Instant::now();
+                    let result = db.execute(&sql).unwrap().pop().unwrap();
+                    let wall = started.elapsed().as_nanos();
+                    let p = crate::storage::take_phases();
+                    println!(
+                        "milestone60_select_phases kind={kind} rows={rows} sample={sample} recording={recording} collect_ns={} sort_ns={} project_ns={}",
+                        p.select_collect.as_nanos(),
+                        p.select_sort.as_nanos(),
+                        p.select_project.as_nanos()
+                    );
+                    crate::storage::set_phases_enabled(false);
+                    let StatementResult::Query(result) = result else {
+                        panic!("expected read")
+                    };
+                    assert_eq!(result.rows, expected, "{kind}");
+                    assert_eq!(table_rows(&mut db), expected_rows);
+                    assert_eq!(db_file(&path), base_bytes, "read changed bytes");
+                    assert_eq!(wal_len(&path), 0);
+                    assert_checksums(&path);
+                    assert_eq!(p.wal_bytes, 0);
+                    assert_eq!(p.frames, 0);
+                    if !recording {
+                        assert_eq!(p, crate::storage::Profile::default());
+                    }
+                    println!(
+                        "milestone60_read kind={kind} rows={rows} sample={sample} recording={recording} wall_ns={wall} result_rows={} parse_ns={} plan_ns={} memory_ns={}",
+                        result.rows.len(),
+                        p.parse.as_nanos(),
+                        p.plan.as_nanos(),
+                        p.memory.as_nanos()
+                    );
+                    wall
+                };
+                let (a, b) = if sample % 2 == 0 {
+                    (run(false), run(true))
+                } else {
+                    let b = run(true);
+                    (run(false), b)
+                };
+                off.push(a);
+                on.push(b);
+            }
+            println!(
+                "milestone60_read_median kind={kind} rows={rows} samples={samples} off_ns={} on_ns={} off_min={} off_max={}",
+                median(&off),
+                median(&on),
+                off.iter().min().unwrap(),
+                off.iter().max().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn milestone60_read_models_match_engine() {
+        milestone60_reads(24, 1);
+    }
+
+    #[test]
+    #[ignore = "release broad post-M59 workload survey"]
+    fn profile_milestone60() {
+        println!(
+            "milestone60 baseline=ace3470434efa01cdc4b2eebcd33b8dadc2f3038 cpu={} rustc={} samples=3 durable=true; milestone54 labels below are reruns on this baseline",
+            profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]),
+            profile_command("rustc", &["--version"])
+        );
+        for rows in [1_000, 10_000, 100_000] {
+            milestone54_survey(rows, 3);
+            milestone60_reads(rows, 3);
         }
     }
 

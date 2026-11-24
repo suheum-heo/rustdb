@@ -3248,7 +3248,8 @@ recording off. Table entries are borrowed / owned medians in milliseconds.
 The repeat was prompted by the first alternating-delete regression (6.2%); it
 narrows to 0.9% but is retained, not declared eliminated. Several other controls
 change direction. Do not claim zero regression for every workload. Delete-all
-has no predicate and cannot substantiate an expression benefit. Point UPDATE
+uses `TRUE OR id = 0`: eager evaluation still evaluates its integer comparison,
+although storage work dominates this workload. Point UPDATE
 shows small slower medians in both passes. Additional workloads or hosts may
 have different tradeoffs.
 
@@ -3270,3 +3271,131 @@ cargo test --release --locked --lib executor::tests::profile_milestone59_fresh -
 Next: broaden workload profiling before further tuning. Preserve eager error
 semantics and test joined expressions whenever changing the shared evaluator;
 do not chase small storage-timing differences by weakening validation or syncs.
+
+## Milestone 60 — broader post-M59 workload survey
+
+Decision: merge diagnostic coverage and select a scoped sorting investigation.
+There is no production performance change in M60. Baseline is M59 merge
+`ace3470434efa01cdc4b2eebcd33b8dadc2f3038` (PR #55).
+
+### Coverage and methodology
+
+Rerun M54's 17-workload read/write matrix on the current baseline, adding eight
+reads: text-filter COUNT, text ORDER BY/LIMIT, high-cardinality text grouping,
+DISTINCT bucket, join COUNT, join grouping, NULL-filter COUNT and grouped HAVING.
+The log's `milestone54` labels identify the reused harness, not historical M54
+measurements. The new entry point prints the current baseline SHA.
+
+The added reads have independently computed expected results from the seed
+model: ordered maps for group counts, explicit row sorting, and counted matching
+rows. DISTINCT and HAVING queries explicitly request NULLS FIRST. A normal
+24-row test covers all eight models. Reads verify unchanged database bytes,
+empty WAL, unchanged rows, page checksums and zero recorded WAL work. Recorder
+on/off results independently match the same model and initial database bytes.
+The reused write matrix also checks row IDs/counters, reopen, both remaining
+indexes, page checksums and recorder-on/off result/database-byte identity.
+Its no-bucket-index control remains diagnostic only.
+
+Apple M5, rustc 1.100.0, release-test build, durable syncs, seed 0x3100, both user
+indexes and four indexed label rows. Two isolated passes cover 25 workloads at
+1k/10k/100k rows, three paired fresh copies per workload/size, alternating
+recorder order. Reads warm with their own query; writes warm with COUNT. Each
+pass times 450 statements (900 total), with correctness work outside timing.
+These are warm runs and only three samples per arm, not cold-start or tail
+latency estimates. Workload order is fixed, so host/time drift can affect
+cross-workload comparisons. Do not subtract historical M54 results to claim a
+cumulative optimization gain.
+
+### Current 100k-row medians
+
+Recorder-off medians in milliseconds; all sizes, ranges and raw samples are
+retained with the evidence.
+
+| Workload | Pass 1 | Pass 2 |
+| --- | ---: | ---: |
+| DELETE all | 79.723 | 76.741 |
+| DELETE alternating | 74.279 | 72.770 |
+| DELETE half | 64.585 | 63.669 |
+| UPDATE scan | 57.190 | 58.798 |
+| DELETE ten | 24.347 | 23.317 |
+| Text GROUP BY | 23.060 | 22.456 |
+| DELETE ten, bucket index removed | 20.596 | 19.497 |
+| DELETE one | 14.519 | 14.974 |
+| UPDATE indexed | 13.684 | 12.482 |
+| INSERT one | 13.146 | 13.410 |
+| INSERT batch | 13.064 | 12.889 |
+| Text ORDER BY/LIMIT 10 | 6.997 | 7.069 |
+| Join GROUP BY | 6.387 | 6.527 |
+| GROUP BY/HAVING | 4.467 | 4.473 |
+| GROUP BY bucket | 4.437 | 4.574 |
+| Join COUNT | 4.395 | 4.531 |
+| Materialized join | 3.953 | 3.984 |
+| DISTINCT bucket | 3.227 | 3.238 |
+| Text-filter COUNT | 2.846 | 2.822 |
+| COUNT all | 2.104 | 2.113 |
+| SELECT scan | 1.762 | 1.735 |
+| NULL-filter COUNT | 0.861 | 0.894 |
+| ID ORDER BY/LIMIT 10 | 0.538 | 0.580 |
+| Indexed ten-row range | 0.012 | 0.013 |
+| Indexed point SELECT | 0.009 | 0.009 |
+
+Result cardinalities differ: text grouping returns 90,911 groups at 100k,
+whereas text sort returns ten rows. The slowest wall time alone is not proof of
+waste. Broad writes include durable storage costs; those costs do not authorize
+weakening syncs. The second-pass scan UPDATE has a retained 148.801 ms outlier
+(range 55.893–148.801 ms). No samples were removed.
+
+### Selected investigation: bounded selection for text ORDER BY/LIMIT
+
+New test-only timers split plain single-table SELECT into row-reference
+collection, sorting and projection. They are nested in memory execution and
+compile out of production. They do not instrument aggregate, DISTINCT or join
+implementations; zero fields for those paths do not mean no sorting occurred.
+Binding/index-path setup and final result construction are outside these stages.
+
+For `SELECT id, name FROM users ORDER BY name, id LIMIT 10` at 100k:
+
+| Recorded median | Pass 1 | Pass 2 |
+| --- | ---: | ---: |
+| Wall | 6.944 ms | 7.152 ms |
+| Collect row references | 0.161 ms | 0.162 ms |
+| Sort references | 6.756 ms | 6.958 ms |
+| Project ten rows | 0.0011 ms | 0.0015 ms |
+
+Sorting is about 97% of recorded wall time. These are separate medians, not an
+exact additive accounting identity. Recorder-off text-sort ranges are
+6.967–7.104 ms and 6.903–7.245 ms. The close on/off values do not establish zero
+instrumentation overhead; other workload pairs show variability in both directions.
+
+Source inspection confirms that query_table collects borrowed references to all
+matching rows, performs a full stable sort, truncates to LIMIT, then projects.
+It already avoids projecting the discarded rows. The next candidate should
+reduce sorting work for a small limit, not claim to remove nonexistent full-row
+projection copies. An ID sort on the already ordered fixture is much cheaper,
+so it must remain a control rather than a promised winner.
+
+Recommended next step: compare bounded top-N selection with the original full
+stable sort for plain single-table ORDER BY/LIMIT. Require exact tie order,
+multiple keys, ASC/DESC, NULLS FIRST/LAST, duplicate keys, small/zero/oversized
+limits, and existing error behavior (including evaluating later predicates).
+Retain a full-sort fallback where equivalence is not proven, and compare small
+and large limits before merging. This survey does not prove a speedup or the
+correctness of such an implementation; no selection algorithm is changed here.
+
+### Validation and report correction
+
+Formatting, strict Clippy, all-target locked build and full locked tests pass:
+642 passed, 0 failed, 57 ignored, including one doctest. Both release passes
+pass all model, immutability, recording, reopen/index and page checks. No page or
+WAL format, mutation algorithm or recovery guarantee changes.
+
+The M59 report's delete-all description is corrected: its SQL is
+`DELETE FROM users WHERE TRUE OR id = 0`, not an absent predicate. Eager
+evaluation still evaluates the integer comparison. The original timing samples
+and the text-comparison merge rationale are unchanged; this corrects only the
+prior workload interpretation.
+
+```sh
+cargo test --locked --lib milestone60_read_models_match_engine
+cargo test --release --locked --lib executor::tests::profile_milestone60 -- --ignored --nocapture --exact
+```
