@@ -6,12 +6,42 @@
 //! a column reference keeps the column's declared type even when the stored
 //! value is null.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use crate::ast::{AggregateCall, BinOp, Expr, SelectColumn};
 use crate::error::DbError;
 use crate::table::Table;
 use crate::value::{self, DataType, Value};
+
+#[cfg(test)]
+thread_local! {
+    static OWNED_OPERANDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) struct OwnedOperands(bool);
+#[cfg(test)]
+impl OwnedOperands {
+    pub(crate) fn new() -> Self {
+        Self(OWNED_OPERANDS.with(|flag| flag.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for OwnedOperands {
+    fn drop(&mut self) {
+        OWNED_OPERANDS.with(|flag| flag.set(self.0));
+    }
+}
+fn owned_operands_forced() -> bool {
+    #[cfg(test)]
+    {
+        OWNED_OPERANDS.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
 
 /// One input of a statement, in the order its columns occupy in a joined row.
 struct Relation {
@@ -411,8 +441,8 @@ enum FlatRow<'a> {
     Two(&'a [Value], &'a [Value]),
 }
 
-impl FlatRow<'_> {
-    fn get(&self, index: usize) -> Option<&Value> {
+impl<'a> FlatRow<'a> {
+    fn get(&self, index: usize) -> Option<&'a Value> {
         match self {
             Self::One(row) => row.get(index),
             Self::Two(outer, inner) => {
@@ -438,10 +468,29 @@ fn eval_in(expr: &BoundExpr, row: &FlatRow<'_>) -> Result<Value, DbError> {
         BoundExpr::IsNull(inner) => Ok(Value::Boolean(eval_in(inner, row)?.is_null())),
         BoundExpr::IsNotNull(inner) => Ok(Value::Boolean(!eval_in(inner, row)?.is_null())),
         BoundExpr::Binary { left, op, right } => {
-            let left = eval_in(left, row)?;
-            let right = eval_in(right, row)?;
+            if owned_operands_forced() {
+                let left = eval_in(left, row)?;
+                let right = eval_in(right, row)?;
+                return eval_binary(*op, &left, &right);
+            }
+            // Evaluate both sides in the original order. Borrow leaf values;
+            // recursive expressions still produce owned intermediate results.
+            let left = eval_operand(left, row)?;
+            let right = eval_operand(right, row)?;
             eval_binary(*op, &left, &right)
         }
+    }
+}
+
+fn eval_operand<'a>(expr: &'a BoundExpr, row: &FlatRow<'a>) -> Result<Cow<'a, Value>, DbError> {
+    match expr {
+        BoundExpr::Literal(value) => Ok(Cow::Borrowed(value)),
+        BoundExpr::Column(index) => row.get(*index).map(Cow::Borrowed).ok_or_else(|| {
+            DbError::Internal(format!(
+                "evaluation column index {index} is outside the row"
+            ))
+        }),
+        _ => eval_in(expr, row).map(Cow::Owned),
     }
 }
 
@@ -667,6 +716,136 @@ fn or(left: Option<bool>, right: Option<bool>) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "release expression evaluation and row-iteration attribution"]
+    fn profile_milestone59_expression() {
+        let rows: Vec<_> = (0..100_000)
+            .map(|i| vec![Value::Integer(i), Value::Text(format!("{:064}", i % 100))])
+            .collect();
+        let int = BoundExpr::Binary {
+            left: Box::new(BoundExpr::Column(0)),
+            op: BinOp::GtEq,
+            right: Box::new(literal(Value::Integer(50_000))),
+        };
+        let text = BoundExpr::Binary {
+            left: Box::new(BoundExpr::Column(1)),
+            op: BinOp::Eq,
+            right: Box::new(literal(Value::Text(format!("{:064}", 50)))),
+        };
+        for (name, expression, expected) in [("integer", int, 50_000), ("text64", text, 1_000)] {
+            for sample in 0..5 {
+                for owned in if sample % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    let _guard = owned.then(OwnedOperands::new);
+                    let started = std::time::Instant::now();
+                    let mut matched = 0;
+                    for row in std::hint::black_box(&rows) {
+                        matched += usize::from(
+                            row_matches(Some(std::hint::black_box(&expression)), row).unwrap(),
+                        );
+                    }
+                    println!(
+                        "milestone59_expression kind={name} sample={sample} owned={owned} elapsed_ns={} matched={matched}",
+                        started.elapsed().as_nanos()
+                    );
+                    assert_eq!(matched, expected);
+                }
+            }
+        }
+        let started = std::time::Instant::now();
+        let cells: usize = std::hint::black_box(&rows)
+            .iter()
+            .map(|r| std::hint::black_box(r).len())
+            .sum();
+        println!(
+            "milestone59_walk elapsed_ns={} cells={cells}",
+            started.elapsed().as_nanos()
+        );
+        assert_eq!(cells, 200_000);
+    }
+
+    #[test]
+    fn borrowed_operands_match_owned_values_errors_and_join_splits() {
+        fn operand(n: usize) -> BoundExpr {
+            match n {
+                0 => literal(Value::Null),
+                1 => literal(Value::Boolean(false)),
+                2 => literal(Value::Boolean(true)),
+                3 => literal(Value::Integer(i64::MIN)),
+                4 => literal(Value::Integer(i64::MAX)),
+                5 => literal(Value::Text("héllo\0世界".into())),
+                6 => literal(Value::Text("x".repeat(4096))),
+                7..=10 => BoundExpr::Column(n - 7),
+                11 => BoundExpr::Column(99),
+                12 => BoundExpr::Not(Box::new(BoundExpr::Column(0))),
+                13 => BoundExpr::IsNull(Box::new(BoundExpr::Column(1))),
+                14 => BoundExpr::IsNotNull(Box::new(literal(Value::Null))),
+                _ => BoundExpr::Binary {
+                    left: Box::new(BoundExpr::Column(2)),
+                    op: BinOp::Eq,
+                    right: Box::new(literal(Value::Null)),
+                },
+            }
+        }
+        for row in [
+            vec![],
+            vec![Value::Null],
+            vec![
+                Value::Boolean(false),
+                Value::Text("héllo\0世界".into()),
+                Value::Integer(0),
+                Value::Null,
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Null,
+                Value::Boolean(true),
+                Value::Text("x".repeat(4096)),
+            ],
+        ] {
+            for op in [
+                BinOp::Eq,
+                BinOp::NotEq,
+                BinOp::Lt,
+                BinOp::Gt,
+                BinOp::LtEq,
+                BinOp::GtEq,
+                BinOp::And,
+                BinOp::Or,
+            ] {
+                for left in 0..16 {
+                    for right in 0..16 {
+                        let expression = BoundExpr::Binary {
+                            left: Box::new(operand(left)),
+                            op,
+                            right: Box::new(operand(right)),
+                        };
+                        let actual = eval(&expression, &row).map_err(|e| e.to_string());
+                        let expected = {
+                            let _guard = OwnedOperands::new();
+                            eval(&expression, &row).map_err(|e| e.to_string())
+                        };
+                        assert_eq!(actual, expected, "{expression:?}");
+                        for split in 0..=row.len() {
+                            let paired = eval_pair(&expression, &row[..split], &row[split..])
+                                .map_err(|e| e.to_string());
+                            assert_eq!(paired, actual);
+                            let expected = {
+                                let _guard = OwnedOperands::new();
+                                eval_pair(&expression, &row[..split], &row[split..])
+                                    .map_err(|e| e.to_string())
+                            };
+                            assert_eq!(paired, expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn literal(value: Value) -> BoundExpr {
         BoundExpr::Literal(value)

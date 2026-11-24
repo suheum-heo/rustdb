@@ -3143,3 +3143,130 @@ cargo test --release --locked --lib executor::tests::profile_milestone58_fresh -
 Next: investigate predicate filtering only after breaking down expression and
 row-walk costs. The remaining record-size audit stays intact; do not trade
 corruption detection or durable syncs for timing gains.
+
+## Milestone 59 — borrow binary expression operands
+
+Decision: merge for the repeatable text-comparison benefit. Integer SQL results
+are mixed and are not presented as a universal speedup. Baseline: M58 merge
+`4a828a72b0325e1a07336669fdc1fa4a388e7531` (PR #54).
+
+### Attribution and implementation
+
+Before changing evaluation, a release probe of 100k rows measured medians of
+0.969 ms for integer comparisons and 5.216 ms for 64-byte text comparisons.
+A row-iteration control summing row widths took 0.032 ms. This control does
+less work and is not an exact subtraction-based CPU attribution. Code inspection
+showed each binary operation cloning both leaf operands, allocating even for
+text comparisons that only need references.
+
+The candidate borrows column and literal operands with Cow<Value>. Recursive
+expressions still return owned intermediate values. FlatRow exposes references
+with the lifetime of its input slices, including joined inputs, without copying
+or flattening rows. Public/internal scalar evaluation results remain owned.
+
+Both operands are evaluated left-to-right before the binary operation, exactly
+as before. There is no boolean short-circuit, skipped invalid column, reordered
+error, altered SQL NULL logic, changed collation or unchecked type assumption.
+Unary operators are unchanged. The old evaluator is retained behind a test-only
+guard. Page/WAL formats, index layouts, publication, durable syncs and recovery
+protocol are unchanged. No rejected experiment is restored.
+
+### Correctness and validation
+
+A differential test covers 8,192 binary-expression/row combinations across all
+eight operators, NULL/booleans/extreme integers/text (including Unicode, NUL and
+4 KiB strings), columns, invalid columns, and nested unary/binary expressions.
+It compares values and exact errors with the owned evaluator. Another 26,624
+joined-row splits are checked against both flat evaluation and the old joined
+evaluator, including empty sides and out-of-range references. These cases also
+exercise eager logical evaluation and left-before-right errors.
+
+Formatting, strict Clippy, all-target locked build and the full locked suite
+pass: 641 passed, 0 failed, 56 ignored, including one doctest. Existing join,
+query, mutation, corruption, rollback and recovery tests run on the candidate.
+The sequence harness independently filters seed rows and compares both indexes,
+exact database bytes, reopen and all page checksums. Fresh SQL controls compare
+results, rows, indexes, bytes and reopen/checksums in both arms.
+
+### Paired expression probe
+
+Apple M5, rustc 1.100.0, release-test build. Five paired samples per expression,
+alternating arm order, 100k rows and checked match counts. Black-box inputs
+prevent constant-folding the workload. No build/test jobs overlap timing.
+
+| Expression | Borrowed median | Owned median |
+| --- | ---: | ---: |
+| Integer comparison | 0.803 ms | 1.074 ms |
+| 64-byte text equality | 0.871 ms | 4.700 ms |
+
+These are expression costs, not whole-query latencies. The independent baseline
+probe and this paired probe are retained separately; cross-run differences are
+not attributed entirely to the code change.
+
+### Durable sustained integer DELETE controls
+
+Three fresh paired copies per size (10k/100k), 50 consecutive ten-row deletes,
+COUNT warmup and alternating arm order. Two isolated passes disable phase
+recording. A third records phases. `separate=true` in SQL logs selects owned
+operands; false selects borrowed operands. Sequence statements are correlated.
+
+| 100k pair | Pass 1 borrowed / owned | Pass 2 borrowed / owned |
+| --- | ---: | ---: |
+| 0 | 824.446 / 816.812 ms | 804.579 / 844.550 ms |
+| 1 | 832.754 / 870.999 ms | 819.259 / 872.903 ms |
+| 2 | 828.887 / 841.390 ms | 824.533 / 809.443 ms |
+
+Four totals improve, two worsen by 0.9% and 1.9%. 10k results are also mixed;
+one first-pass owned total is 920.578 ms versus 629.470 ms borrowed, while two
+second-pass pairs favor owned slightly. Raw samples are retained, without
+outlier removal or claims about their cause. The recorded 100k filter median
+falls from 2.323 to 1.950 ms; survivor installation is 1.293 versus 1.298 ms.
+Recorded phases support reduced expression work but are not substituted for
+recorder-off end-to-end evidence. Integer-delete gains remain modest/variable.
+
+### Fresh SQL controls, two passes
+
+100k-row mixed-width user fixture (most names short, every eleventh name 80
+bytes), normal durable syncs for writes, five alternating pairs per workload,
+recording off. Table entries are borrowed / owned medians in milliseconds.
+
+| Workload | Pass 1 | Pass 2 |
+| --- | ---: | ---: |
+| DELETE one | 15.767 / 15.958 | 15.551 / 15.698 |
+| DELETE ten | 23.398 / 24.412 | 23.278 / 24.342 |
+| DELETE half | 62.555 / 64.125 | 65.523 / 64.722 |
+| DELETE alternating | 77.276 / 72.775 | 73.946 / 73.308 |
+| DELETE all | 77.676 / 80.592 | 76.607 / 75.427 |
+| DELETE no match (integer) | 13.841 / 14.102 | 14.392 / 14.315 |
+| UPDATE one | 12.692 / 12.600 | 13.285 / 12.778 |
+| UPDATE half | 36.942 / 38.797 | 39.784 / 39.197 |
+| UPDATE no match (integer) | 1.159 / 1.325 | 1.273 / 1.286 |
+| COUNT with text predicate | 2.893 / 6.208 | 2.913 / 6.152 |
+| DELETE no match (text) | 14.062 / 17.051 | 13.932 / 16.805 |
+| UPDATE no match (text) | 1.300 / 4.246 | 1.272 / 4.254 |
+
+The repeat was prompted by the first alternating-delete regression (6.2%); it
+narrows to 0.9% but is retained, not declared eliminated. Several other controls
+change direction. Do not claim zero regression for every workload. Delete-all
+has no predicate and cannot substantiate an expression benefit. Point UPDATE
+shows small slower medians in both passes. Additional workloads or hosts may
+have different tradeoffs.
+
+The decisive repeatable wins are text COUNT (~53%), text no-match DELETE
+(~17%), and text no-match UPDATE (~69–70%), with unchanged results and bytes.
+The scope and merge rationale are avoiding text operand copies, not replacing
+the planner or promising broad mutation acceleration. Three sequence passes
+cover 1,800 timed statements; two fresh passes add 240. All correctness checks
+pass, as do baseline and paired expression probes.
+
+```sh
+cargo test --locked
+cargo test --release --locked --lib expr::tests::profile_milestone59_expression -- --ignored --nocapture --exact
+cargo test --release --locked --lib executor::tests::profile_milestone59 -- --ignored --nocapture --exact
+RUSTDB_PROFILE_ENABLED=1 cargo test --release --locked --lib executor::tests::profile_milestone59 -- --ignored --nocapture --exact
+cargo test --release --locked --lib executor::tests::profile_milestone59_fresh -- --ignored --nocapture --exact
+```
+
+Next: broaden workload profiling before further tuning. Preserve eager error
+semantics and test joined expressions whenever changing the shared evaluator;
+do not chase small storage-timing differences by weakening validation or syncs.
