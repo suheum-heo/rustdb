@@ -454,7 +454,9 @@ impl Database {
         drop(collect_timer);
         #[cfg(test)]
         let sort_timer = crate::storage::Timer::new(|p| &mut p.select_sort);
-        if !prepared.sort_keys.is_empty() {
+        if !prepared.sort_keys.is_empty()
+            && !bounded_text_top_n(&mut rows, &prepared.sort_keys, tail.limit)
+        {
             rows.sort_by(|left, right| compare_rows(left, right, &prepared.sort_keys));
         }
         #[cfg(test)]
@@ -6196,6 +6198,140 @@ fn finish_rows(
         columns: output_names,
         rows: projected,
     }))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FULL_TABLE_SORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+struct FullTableSort(bool);
+#[cfg(test)]
+impl FullTableSort {
+    fn new() -> Self {
+        Self(FULL_TABLE_SORT.with(|flag| flag.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for FullTableSort {
+    fn drop(&mut self) {
+        FULL_TABLE_SORT.with(|flag| flag.set(self.0));
+    }
+}
+fn full_table_sort_forced() -> bool {
+    #[cfg(test)]
+    {
+        FULL_TABLE_SORT.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Select only small text top-N results after the complete predicate walk.
+/// Original ordinals make equal sort keys behave like the stable full sort.
+/// The input reference vector is retained; this bounds selection scratch, not
+/// the memory used by row discovery. Other query paths keep their own sorting.
+fn bounded_text_top_n(rows: &mut Vec<&[Value]>, keys: &[SortKey], limit: Option<u64>) -> bool {
+    if full_table_sort_forced() || rows.len() < 1024 || keys.is_empty() {
+        return false;
+    }
+    let Some(k) = limit
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| (1..=64).contains(n))
+    else {
+        return false;
+    };
+    let first = keys[0].index;
+    if !matches!(
+        rows.iter()
+            .take(33)
+            .filter_map(|r| r.get(first))
+            .find(|v| !v.is_null()),
+        Some(Value::Text(_))
+    ) {
+        return false;
+    }
+    // An all-NULL leading window also stays on the full-sort path.
+    // Stable sorting is already cheap for monotone input. Conservatively keep
+    // that path when its first 33 primary text keys are monotone (including ties).
+    let mut ascending = true;
+    let mut descending = true;
+    for pair in rows.windows(2).take(32) {
+        let (Some(Value::Text(a)), Some(Value::Text(b))) = (pair[0].get(first), pair[1].get(first))
+        else {
+            ascending = false;
+            descending = false;
+            break;
+        };
+        ascending &= a <= b;
+        descending &= a >= b;
+    }
+    if ascending || descending {
+        return false;
+    }
+    // Missing/mixed/ratio cells can make the legacy comparator non-total.
+    // Do not change its behavior: use the original full sort in those cases.
+    for key in keys {
+        let mut kind = None;
+        for row in rows.iter() {
+            let Some(value) = row.get(key.index) else {
+                return false;
+            };
+            if value.is_null() {
+                continue;
+            }
+            if matches!(value, Value::Ratio { .. }) {
+                return false;
+            }
+            let actual = std::mem::discriminant(value);
+            if kind.is_some_and(|expected| expected != actual) {
+                return false;
+            }
+            kind = Some(actual);
+        }
+    }
+    let mut heap: Vec<_> = rows.iter().copied().take(k).enumerate().collect();
+    for root in (0..k / 2).rev() {
+        top_n_sift_down(&mut heap, root, keys);
+    }
+    for candidate in rows.iter().copied().enumerate().skip(k) {
+        if top_n_cmp(candidate, heap[0], keys) == Ordering::Less {
+            heap[0] = candidate;
+            top_n_sift_down(&mut heap, 0, keys);
+        }
+    }
+    heap.sort_unstable_by(|a, b| top_n_cmp(*a, *b, keys));
+    rows.clear();
+    rows.extend(heap.into_iter().map(|(_, row)| row));
+    true
+}
+
+fn top_n_cmp(a: (usize, &[Value]), b: (usize, &[Value]), keys: &[SortKey]) -> Ordering {
+    compare_rows(a.1, b.1, keys).then(a.0.cmp(&b.0))
+}
+
+fn top_n_sift_down(heap: &mut [(usize, &[Value])], mut root: usize, keys: &[SortKey]) {
+    loop {
+        let left = root * 2 + 1;
+        if left >= heap.len() {
+            break;
+        }
+        let right = left + 1;
+        let larger = if right < heap.len()
+            && top_n_cmp(heap[right], heap[left], keys) == Ordering::Greater
+        {
+            right
+        } else {
+            left
+        };
+        if top_n_cmp(heap[root], heap[larger], keys) != Ordering::Less {
+            break;
+        }
+        heap.swap(root, larger);
+        root = larger;
+    }
 }
 
 fn compare_rows(left: &[Value], right: &[Value], keys: &[SortKey]) -> Ordering {
@@ -26178,6 +26314,250 @@ mod tests {
         for rows in [1_000, 10_000, 100_000] {
             milestone54_survey(rows, 3);
             milestone60_reads(rows, 3);
+        }
+    }
+
+    #[test]
+    fn top_n_matches_stable_sort_for_ties_nulls_and_limits() {
+        let data: Vec<_> = (0..2048)
+            .map(|i| {
+                vec![
+                    if i % 19 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Text(format!("k{:02}", (i * 37) % 31))
+                    },
+                    Value::Integer(i),
+                    Value::Boolean(i % 2 == 0),
+                ]
+            })
+            .collect();
+        for ascending in [true, false] {
+            for nulls_first in [true, false] {
+                for secondary in [false, true] {
+                    let mut keys = vec![SortKey {
+                        index: 0,
+                        ascending,
+                        nulls_first,
+                    }];
+                    if secondary {
+                        keys.push(SortKey {
+                            index: 2,
+                            ascending: !ascending,
+                            nulls_first,
+                        });
+                    }
+                    for limit in [0, 1, 2, 10, 32, 64, 65, 2048, u64::MAX] {
+                        let mut expected: Vec<_> = data.iter().map(Vec::as_slice).collect();
+                        expected.sort_by(|a, b| compare_rows(a, b, &keys));
+                        expected.truncate(
+                            usize::try_from(limit)
+                                .unwrap_or(usize::MAX)
+                                .min(expected.len()),
+                        );
+                        let mut actual: Vec<_> = data.iter().map(Vec::as_slice).collect();
+                        let selected = bounded_text_top_n(&mut actual, &keys, Some(limit));
+                        assert_eq!(selected, (1..=64).contains(&limit));
+                        if !selected {
+                            actual.sort_by(|a, b| compare_rows(a, b, &keys));
+                        }
+                        actual.truncate(
+                            usize::try_from(limit)
+                                .unwrap_or(usize::MAX)
+                                .min(actual.len()),
+                        );
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
+        for seed in 0..64_u64 {
+            let mut shuffled = data.clone();
+            let mut state = seed + 1;
+            for i in (1..shuffled.len()).rev() {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                shuffled.swap(i, state as usize % (i + 1));
+            }
+            let keys = [
+                SortKey {
+                    index: 0,
+                    ascending: seed % 2 == 0,
+                    nulls_first: seed % 3 == 0,
+                },
+                SortKey {
+                    index: 2,
+                    ascending: seed % 5 == 0,
+                    nulls_first: false,
+                },
+            ];
+            let limit = 1 + seed as usize;
+            let mut expected: Vec<_> = shuffled.iter().map(Vec::as_slice).collect();
+            expected.sort_by(|a, b| compare_rows(a, b, &keys));
+            expected.truncate(limit);
+            let mut actual: Vec<_> = shuffled.iter().map(Vec::as_slice).collect();
+            assert!(bounded_text_top_n(&mut actual, &keys, Some(limit as u64)));
+            assert_eq!(actual, expected);
+        }
+        let keys = [SortKey {
+            index: 0,
+            ascending: true,
+            nulls_first: false,
+        }];
+        for mode in 0..7 {
+            let mut altered = data.clone();
+            match mode {
+                0 => altered[2047][0] = Value::Integer(5),
+                1 => altered[2047].clear(),
+                2 => altered[2047][0] = Value::ratio(1, 2),
+                3 => {
+                    altered.truncate(1023);
+                }
+                4 => {
+                    for (i, row) in altered.iter_mut().enumerate() {
+                        row[0] = Value::Text(format!("{i:04}"));
+                    }
+                }
+                5 => {
+                    for (i, row) in altered.iter_mut().enumerate() {
+                        row[0] = Value::Text(format!("{:04}", 2048 - i));
+                    }
+                }
+                _ => {
+                    for row in &mut altered {
+                        row[0] = Value::Null;
+                    }
+                }
+            }
+            let mut refs: Vec<_> = altered.iter().map(Vec::as_slice).collect();
+            let before = refs.clone();
+            assert!(!bounded_text_top_n(&mut refs, &keys, Some(10)));
+            assert_eq!(refs, before);
+        }
+    }
+
+    #[test]
+    fn top_n_sql_matches_full_sort_and_keeps_late_errors() {
+        let (_dir, path) = seed_delete_db("m61-correct", 2048, 0x3100);
+        let mut db = Database::open(&path).unwrap();
+        db.execute("UPDATE users SET name = NULL WHERE id <= 30;")
+            .unwrap();
+        let bytes = db_file(&path);
+        for sql in [
+            "SELECT id, name FROM users ORDER BY name LIMIT 10;",
+            "SELECT id, name FROM users ORDER BY name DESC NULLS LAST LIMIT 64;",
+            "SELECT id, name FROM users ORDER BY name NULLS FIRST, active DESC, id DESC LIMIT 32;",
+            "SELECT id FROM users WHERE id >= 1000 ORDER BY name DESC LIMIT 10;",
+            "SELECT id FROM users ORDER BY name LIMIT 0;",
+            "SELECT id FROM users ORDER BY name LIMIT 65;",
+            "SELECT id FROM users ORDER BY name LIMIT 999999;",
+            "SELECT id FROM users ORDER BY id DESC LIMIT 10;",
+            "SELECT DISTINCT name FROM users ORDER BY name LIMIT 10;",
+        ] {
+            let actual = db.execute(sql).unwrap();
+            let expected = {
+                let _guard = FullTableSort::new();
+                db.execute(sql).unwrap()
+            };
+            assert_eq!(actual, expected, "{sql}");
+            assert_eq!(db_file(&path), bytes);
+            assert_eq!(wal_len(&path), 0);
+        }
+        replace_cell(&mut db, "users", 2047, 2, Value::Text("bad boolean".into()));
+        for limit in [0, 1, 10] {
+            let sql =
+                format!("SELECT id FROM users WHERE active = TRUE ORDER BY name LIMIT {limit};");
+            let actual = db.execute(&sql).unwrap_err().to_string();
+            let expected = {
+                let _guard = FullTableSort::new();
+                db.execute(&sql).unwrap_err().to_string()
+            };
+            assert_eq!(actual, expected);
+            assert_eq!(db_file(&path), bytes);
+        }
+        assert_checksums(&path);
+    }
+
+    #[test]
+    #[ignore = "release paired bounded text top-N and full-sort controls"]
+    fn profile_milestone61() {
+        println!(
+            "milestone61 cpu={} rustc={} samples=5 warmup=1",
+            profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]),
+            profile_command("rustc", &["--version"])
+        );
+        for rows in [1_000, 10_000, 100_000] {
+            let (_dir, base) = seed_delete_db("m61-base", rows, 0x3100);
+            let base_bytes = db_file(&base);
+            for (kind, sql) in [
+                (
+                    "text10",
+                    "SELECT id, name FROM users ORDER BY name, id LIMIT 10;",
+                ),
+                ("text1", "SELECT id, name FROM users ORDER BY name LIMIT 1;"),
+                (
+                    "text64-desc",
+                    "SELECT id, name FROM users ORDER BY name DESC LIMIT 64;",
+                ),
+                (
+                    "text65",
+                    "SELECT id, name FROM users ORDER BY name LIMIT 65;",
+                ),
+                ("text-all", "SELECT id, name FROM users ORDER BY name;"),
+                (
+                    "id10",
+                    "SELECT id, name FROM users ORDER BY id DESC LIMIT 10;",
+                ),
+                (
+                    "text-filter",
+                    "SELECT id, name FROM users WHERE active = TRUE ORDER BY name LIMIT 10;",
+                ),
+                (
+                    "text-equal",
+                    "SELECT id, name FROM users ORDER BY name LIMIT 10;",
+                ),
+                (
+                    "text-null",
+                    "SELECT id, name FROM users ORDER BY name NULLS FIRST LIMIT 10;",
+                ),
+                ("zero", "SELECT id, name FROM users ORDER BY name LIMIT 0;"),
+            ] {
+                for sample in 0..5 {
+                    let run = |full: bool| {
+                        let (_dir, path, mut db) =
+                            open_copy(&base, &format!("m61-{kind}-{sample}-{full}"));
+                        let expected_bytes = if matches!(kind, "text-equal" | "text-null") {
+                            db.execute(if kind == "text-equal" {
+                                "UPDATE users SET name = 'same';"
+                            } else {
+                                "UPDATE users SET name = NULL;"
+                            })
+                            .unwrap();
+                            db_file(&path)
+                        } else {
+                            base_bytes.clone()
+                        };
+                        let _guard = full.then(FullTableSort::new);
+                        db.execute(sql).unwrap();
+                        let started = std::time::Instant::now();
+                        let result = db.execute(sql).unwrap();
+                        let wall = started.elapsed().as_nanos();
+                        println!(
+                            "milestone61 kind={kind} rows={rows} sample={sample} full={full} wall_ns={wall}"
+                        );
+                        assert_eq!(db_file(&path), expected_bytes);
+                        assert_eq!(wal_len(&path), 0);
+                        assert_checksums(&path);
+                        result
+                    };
+                    let (fast, old) = if sample % 2 == 0 {
+                        (run(false), run(true))
+                    } else {
+                        let old = run(true);
+                        (run(false), old)
+                    };
+                    assert_eq!(fast, old, "{kind}");
+                }
+            }
         }
     }
 
