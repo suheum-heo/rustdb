@@ -3399,3 +3399,113 @@ prior workload interpretation.
 cargo test --locked --lib milestone60_read_models_match_engine
 cargo test --release --locked --lib executor::tests::profile_milestone60 -- --ignored --nocapture --exact
 ```
+
+## Milestone 61 — bounded text top-N selection
+
+Decision: merge the scoped selector. Baseline: M60 merge
+`9ccb1a1f738e6fd077665e80ec0f695613e03d2b` (PR #56). M60 independently measured
+about 7 ms for text ORDER BY/LIMIT 10 at 100k rows, with roughly 97% in full
+stable sorting. The implementation targets that measured case.
+
+### Scope and semantics
+
+Only plain single-table SELECT is eligible; DISTINCT, aggregation and joins
+retain their existing paths. Selection runs after the complete predicate walk
+and row-reference collection. It requires at least 1,024 matching rows, a limit
+from 1 through 64, and a non-null text primary key found in the first 33 rows.
+A monotone primary-text prefix (including equal keys) keeps the full stable sort.
+This is a conservative eligibility heuristic: it may decline useful cases, but
+never changes results. An all-NULL leading window also falls back without a
+full-table type-discovery scan.
+
+Before selecting, every sort-key cell is checked for presence and homogeneous
+non-null scalar type. Missing, mixed-type or ratio sort cells use the untouched
+full-sort path because the legacy comparator need not be total on such inputs.
+This precheck emits no new errors and does not mutate the reference vector.
+Other limits, integer primary keys and small tables also retain full sorting.
+
+A max-heap holds at most LIMIT candidates. Each candidate carries its original
+position in the collected sequence. Comparisons use the existing key comparator,
+then that ordinal, preserving the original stable sort's tie order regardless
+of ASC/DESC or NULL placement. The final retained candidates are sorted with
+the same total comparison before projection. Row IDs are not used as tie-breakers.
+
+The existing vector of all matching references remains allocated; only selection
+scratch is bounded. This is not an O(LIMIT) total-memory claim or a streaming
+scan. Every predicate is still evaluated, including later errors with LIMIT 0.
+Projection remains after ordering/truncation. Page/WAL formats, mutation paths,
+commit syncs and recovery protocol are unchanged. No rejected experiment returns.
+
+### Correctness
+
+Differential tests compare against the original stable sort for text ties,
+NULLS FIRST/LAST, ASC/DESC, secondary keys and limits 0, 1, 2, 10, 32, 64, 65,
+row count and u64::MAX. The 72 fixed combinations are supplemented by 64 seeded
+shuffles with varying limits and directions. Seven fallback cases verify that
+mixed types, missing cells, ratios, small input, ascending/descending prefixes
+and all-NULL input return without modifying the reference sequence.
+
+SQL tests compare complete results with the forced original sort, covering
+NULL names, descending ties, multiple keys, indexed filtering, zero/large limits,
+integer sorting and DISTINCT. Late malformed predicate values produce the same
+error for limits 0, 1 and 10. Database bytes/WAL remain unchanged. The original
+sort is selectable only with a test guard.
+
+Final formatting, strict Clippy, all-target locked build and full locked suite
+pass: 644 passed, 0 failed, 58 ignored, including one doctest. Existing query,
+join, mutation, corruption and recovery tests also pass on the new default.
+
+### Final isolated release measurements
+
+Apple M5, rustc 1.100.0, release-test build, phase recording disabled. Two
+sequential passes cover ten workloads at 1k/10k/100k rows with five paired fresh
+copies, alternating arm order and one warmup query. Equal-key and all-NULL
+controls update names before timing and capture their resulting baseline bytes.
+Every pair checks complete query results against full sorting; every read
+checks unchanged database bytes, empty WAL and page checksums. There are 300
+timed queries per pass, 600 total. Setup writes are outside timing.
+
+At 100k rows, milliseconds (candidate / original stable sort):
+
+| Workload | Pass 1 | Pass 2 |
+| --- | ---: | ---: |
+| Text + ID, LIMIT 10 | 0.783 / 7.098 | 0.924 / 7.365 |
+| Text, LIMIT 1 | 0.770 / 6.732 | 0.779 / 6.557 |
+| Text DESC, LIMIT 64 | 0.709 / 7.587 | 0.749 / 7.646 |
+| Text with active filter, LIMIT 10 | 0.906 / 3.880 | 0.888 / 3.789 |
+| Text, LIMIT 65 (fallback) | 6.619 / 6.742 | 6.703 / 6.963 |
+| Text, no LIMIT (fallback) | 8.769 / 8.807 | 9.358 / 9.209 |
+| Integer ID DESC, LIMIT 10 (fallback) | 0.619 / 0.586 | 0.620 / 0.622 |
+| Equal text keys (fallback) | 0.673 / 0.665 | 0.690 / 0.659 |
+| All-NULL keys (fallback) | 0.496 / 0.534 | 0.457 / 0.501 |
+| LIMIT 0 (fallback) | 6.440 / 6.721 | 6.630 / 6.550 |
+
+The primary target improves 87.5–89.0%; the 64-row descending case improves
+90.2–90.7%. Filtered text improves 76.6–76.7%. At 10k, text top-10 improves
+84.4–84.9%, and the filtered case 68.2–69.6%. These wins are not extrapolated to
+larger limits, other query paths or arbitrary distributions.
+
+Fallback controls are not universally faster. For example the 100k integer
+control is 5.6% slower in pass 1 and roughly flat in pass 2; equal text is
+1.3–4.7% slower. At 1k, where selection is disabled, text top-10 measures
+0.098 / 0.084 ms and 0.065 / 0.058 ms. Those slower samples are retained; their
+cause was not isolated, and no zero-overhead claim is made for fallback checks.
+Other controls change direction between passes. All sizes, ranges and raw
+samples are retained rather than selecting only wins.
+
+Initial passes preceded the bounded 33-row type probe and all-NULL control;
+they are labeled initial in the evidence and excluded from the final table.
+The final passes use identical finished source and run after all other builds
+and tests. Warm queries and five samples do not establish cold-cache or tail
+latency behavior. The merge is justified by large, repeatable gains in the
+measured text cases, conservative eligibility and exact-result comparisons,
+not by claiming every sorting workload improves.
+
+```sh
+cargo test --locked --lib top_n_
+cargo test --release --locked --lib executor::tests::profile_milestone61 -- --ignored --nocapture --exact
+```
+
+Next: profile high-cardinality grouping from M60 before choosing another change.
+Do not broaden top-N eligibility or replace the full-sort fallback without new
+correctness and performance evidence for the additional cases.
