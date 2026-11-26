@@ -59,6 +59,14 @@ pub(crate) struct Profile {
     pub select_sort: Duration,
     #[cfg(test)]
     pub select_project: Duration,
+    #[cfg(test)]
+    pub group_collect: Duration,
+    #[cfg(test)]
+    pub group_materialize: Duration,
+    #[cfg(test)]
+    pub result_sort: Duration,
+    #[cfg(test)]
+    pub result_project: Duration,
     pub wal_write: Duration,
     pub wal_sync: Duration,
     pub db_write: Duration,
@@ -253,6 +261,10 @@ thread_local! {
         select_collect: Duration::ZERO,
         select_sort: Duration::ZERO,
         select_project: Duration::ZERO,
+        group_collect: Duration::ZERO,
+        group_materialize: Duration::ZERO,
+        result_sort: Duration::ZERO,
+        result_project: Duration::ZERO,
         wal_write: Duration::ZERO,
         wal_sync: Duration::ZERO,
         db_write: Duration::ZERO,
