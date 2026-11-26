@@ -3808,9 +3808,13 @@ fn collect_groups(
     positions: Option<&[usize]>,
     plan: &AggPlan,
 ) -> Result<Vec<Vec<Value>>, DbError> {
+    #[cfg(test)]
+    let collect_timer = crate::storage::Timer::new(|p| &mut p.group_collect);
     let mut sink = GroupSink::new(plan);
     let mut visit = |row: &[Value]| sink.push(InputRow::One(row));
     visit_filtered(rows, positions, plan.filter.as_ref(), &mut visit)?;
+    #[cfg(test)]
+    drop(collect_timer);
     sink.finish()
 }
 
@@ -3873,6 +3877,8 @@ impl<'a> GroupSink<'a> {
     }
 
     fn finish(self) -> Result<Vec<Vec<Value>>, DbError> {
+        #[cfg(test)]
+        let _timer = crate::storage::Timer::new(|p| &mut p.group_materialize);
         if let Some(acc) = self.scalar {
             return Ok(vec![materialize_group(&[], &acc)]);
         }
@@ -6174,6 +6180,33 @@ fn feed_kind(path: &JoinAccess) -> FeedKind {
     }
 }
 
+#[cfg(test)]
+thread_local! { static COPY_RESULT_PROJECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+struct CopyResultProjection(bool);
+#[cfg(test)]
+impl CopyResultProjection {
+    fn new() -> Self {
+        Self(COPY_RESULT_PROJECTION.with(|flag| flag.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for CopyResultProjection {
+    fn drop(&mut self) {
+        COPY_RESULT_PROJECTION.with(|flag| flag.set(self.0));
+    }
+}
+fn copy_result_projection_forced() -> bool {
+    #[cfg(test)]
+    {
+        COPY_RESULT_PROJECTION.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 fn finish_rows(
     mut rows: Vec<Vec<Value>>,
     sort_keys: &[SortKey],
@@ -6181,19 +6214,38 @@ fn finish_rows(
     output_indexes: &[usize],
     output_names: Vec<String>,
 ) -> Result<StatementResult, DbError> {
+    #[cfg(test)]
+    let sort_timer = crate::storage::Timer::new(|p| &mut p.result_sort);
     if !sort_keys.is_empty() {
         rows.sort_by(|left, right| compare_rows(left, right, sort_keys));
     }
+    #[cfg(test)]
+    drop(sort_timer);
     if let Some(limit) = limit {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         if rows.len() > limit {
             rows.truncate(limit);
         }
     }
-    let mut projected = Vec::with_capacity(rows.len());
-    for row in &rows {
-        projected.push(project_row(row, output_indexes)?);
-    }
+    #[cfg(test)]
+    let _project_timer = crate::storage::Timer::new(|p| &mut p.result_project);
+    // Only reuse complete rows in their original column order. Perform the
+    // shape proof after LIMIT, matching the original projection's error scope.
+    let projected = if !copy_result_projection_forced()
+        && output_indexes.iter().copied().eq(0..output_indexes.len())
+        && rows.iter().all(|row| row.len() == output_indexes.len())
+    {
+        // LIMIT may leave a large collection buffer behind a tiny result.
+        // Match the copying path's compact outer result allocation.
+        rows.shrink_to_fit();
+        rows
+    } else {
+        let mut projected = Vec::with_capacity(rows.len());
+        for row in &rows {
+            projected.push(project_row(row, output_indexes)?);
+        }
+        projected
+    };
     Ok(StatementResult::Query(QueryResult {
         columns: output_names,
         rows: projected,
@@ -26558,6 +26610,183 @@ mod tests {
                     assert_eq!(fast, old, "{kind}");
                 }
             }
+        }
+    }
+
+    fn milestone62_queries() -> [(&'static str, &'static str); 10] {
+        [
+            (
+                "hidden-having",
+                "SELECT name FROM users GROUP BY name HAVING COUNT(*) > 1 ORDER BY name;",
+            ),
+            (
+                "left-join-all",
+                "SELECT * FROM users LEFT JOIN labels ON users.bucket = labels.bucket ORDER BY users.id;",
+            ),
+            (
+                "text-group",
+                "SELECT name, COUNT(*) FROM users GROUP BY name ORDER BY name;",
+            ),
+            (
+                "text-group-limit",
+                "SELECT name, COUNT(*) FROM users GROUP BY name ORDER BY name LIMIT 10;",
+            ),
+            (
+                "text-group-reordered",
+                "SELECT COUNT(*), name FROM users GROUP BY name ORDER BY name;",
+            ),
+            (
+                "text-group-duplicate",
+                "SELECT name AS first_name, name AS other_name, COUNT(*) FROM users GROUP BY name ORDER BY first_name;",
+            ),
+            (
+                "bucket-group",
+                "SELECT bucket, COUNT(*) FROM users GROUP BY bucket ORDER BY bucket;",
+            ),
+            (
+                "having",
+                "SELECT name, COUNT(*) FROM users GROUP BY name HAVING COUNT(*) > 1 ORDER BY name;",
+            ),
+            (
+                "scalar",
+                "SELECT COUNT(*), SUM(id), AVG(id), MIN(name), MAX(name) FROM users;",
+            ),
+            (
+                "join-all",
+                "SELECT * FROM users JOIN labels ON users.bucket = labels.bucket ORDER BY users.id;",
+            ),
+        ]
+    }
+
+    fn milestone62_profile(rows: i64, samples: usize) {
+        let (_dir, base) = seed_delete_db("m62-base", rows, 0x3100);
+        let mut setup = Database::open(&base).unwrap();
+        setup.execute("CREATE TABLE labels (bucket INT, tag TEXT); INSERT INTO labels VALUES (0, 'a'),(1, 'b'),(2, 'c'),(3, 'd'); CREATE INDEX idx_labels_bucket ON labels(bucket);").unwrap();
+        drop(setup);
+        let bytes = db_file(&base);
+        let _phases = crate::storage::enable_phases();
+        let recording = std::env::var("RUSTDB_PROFILE_ENABLED").as_deref() == Ok("1");
+        let reference = milestone54_model("count", rows).0;
+        let expected_groups = milestone60_read_model("text-group", &reference).1;
+        for (kind, sql) in milestone62_queries() {
+            for sample in 0..samples {
+                let run = |copy: bool| {
+                    let _guard = copy.then(CopyResultProjection::new);
+                    crate::storage::set_phases_enabled(false);
+                    let (_dir, path, mut db) =
+                        open_copy(&base, &format!("m62-{kind}-{sample}-{copy}"));
+                    db.execute(sql).unwrap();
+                    crate::storage::reset_phases();
+                    crate::storage::set_phases_enabled(recording);
+                    let started = std::time::Instant::now();
+                    let result = db.execute(sql).unwrap();
+                    let wall = started.elapsed().as_nanos();
+                    let p = crate::storage::take_phases();
+                    if kind == "text-group" {
+                        let StatementResult::Query(query) = &result[0] else {
+                            panic!("expected query");
+                        };
+                        assert_eq!(query.rows, expected_groups);
+                    }
+                    crate::storage::set_phases_enabled(false);
+                    println!(
+                        "milestone62 kind={kind} rows={rows} sample={sample} copy={copy} recording={recording} wall_ns={wall} collect_ns={} materialize_ns={} sort_ns={} project_ns={}",
+                        p.group_collect.as_nanos(),
+                        p.group_materialize.as_nanos(),
+                        p.result_sort.as_nanos(),
+                        p.result_project.as_nanos()
+                    );
+                    assert_eq!(db_file(&path), bytes);
+                    assert_eq!(wal_len(&path), 0);
+                    assert_checksums(&path);
+                    if !recording {
+                        assert_eq!(p, crate::storage::Profile::default());
+                    }
+                    assert_eq!(p.wal_bytes, 0);
+                    result
+                };
+                let (fast, old) = if sample % 2 == 0 {
+                    (run(false), run(true))
+                } else {
+                    let old = run(true);
+                    (run(false), old)
+                };
+                assert_eq!(fast, old, "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn identity_projection_matches_copying_shapes_and_errors() {
+        let fixtures = [
+            vec![],
+            vec![vec![]],
+            vec![
+                vec![Value::Null, Value::Text("x".repeat(4096))],
+                vec![Value::Integer(7), Value::ratio(1, 2)],
+            ],
+            vec![
+                vec![Value::Integer(1), Value::Text("first".into())],
+                vec![Value::Integer(2)],
+                vec![Value::Null, Value::Null, Value::Boolean(true)],
+            ],
+        ];
+        for rows in fixtures {
+            for indexes in [
+                vec![],
+                vec![0],
+                vec![0, 1],
+                vec![1, 0],
+                vec![1, 1],
+                vec![0, 3],
+            ] {
+                for limit in [None, Some(0), Some(1), Some(u64::MAX)] {
+                    let names: Vec<_> = indexes.iter().map(|i| format!("c{i}")).collect();
+                    let actual = finish_rows(rows.clone(), &[], limit, &indexes, names.clone())
+                        .map_err(|e| e.to_string());
+                    let expected = {
+                        let _guard = CopyResultProjection::new();
+                        finish_rows(rows.clone(), &[], limit, &indexes, names)
+                            .map_err(|e| e.to_string())
+                    };
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+        for limit in [None, Some(0), Some(1)] {
+            let mut rows = Vec::with_capacity(4096);
+            for n in 0..3 {
+                rows.push(vec![Value::Integer(n)]);
+            }
+            let StatementResult::Query(result) =
+                finish_rows(rows, &[], limit, &[0], vec!["id".into()]).unwrap()
+            else {
+                panic!("expected query");
+            };
+            assert_eq!(result.rows.len(), limit.map_or(3, |n| n as usize));
+            assert_eq!(
+                result.rows.capacity(),
+                result.rows.len(),
+                "must not retain the oversized outer buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn milestone62_queries_match_copied_projection() {
+        milestone62_profile(24, 1);
+    }
+
+    #[test]
+    #[ignore = "release grouping attribution and result projection controls"]
+    fn profile_milestone62() {
+        println!(
+            "milestone62 cpu={} rustc={} samples=5 warmup=1",
+            profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]),
+            profile_command("rustc", &["--version"])
+        );
+        for rows in [1_000, 10_000, 100_000] {
+            milestone62_profile(rows, 5);
         }
     }
 

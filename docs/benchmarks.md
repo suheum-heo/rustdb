@@ -3509,3 +3509,133 @@ cargo test --release --locked --lib executor::tests::profile_milestone61 -- --ig
 Next: profile high-cardinality grouping from M60 before choosing another change.
 Do not broaden top-N eligibility or replace the full-sort fallback without new
 correctness and performance evidence for the additional cases.
+
+## Milestone 62 — reuse owned rows for complete result projections
+
+Decision: merge. When an owned aggregation/join result projects every column in
+its original order, return those rows directly instead of cloning every value
+into another row vector. Baseline: M61 merge
+`c5a5bc608876aa095d1ab9b4c55d54f3905e6586` (PR #57).
+
+### Independent attribution
+
+Before changing projection, test-only timers split single-table grouping
+collection, group materialization, result sorting and final projection. The
+100k text grouping baseline measured about 23.445 ms overall, with medians of
+11.972 ms collection, 5.300 ms materialization, 1.878 ms sorting and 2.029 ms
+projection. The result contains 90,911 groups. Final projection was cloning
+already-owned rows even for `SELECT name, COUNT(*) ... GROUP BY name`.
+
+These are separate nested measurements, not complete additive wall accounting.
+Some teardown lies outside the phase guards. Collection instrumentation covers
+the single-table collector; zero collection time on other paths does not imply
+zero work. All new timers compile out of production.
+
+### Change and semantic boundary
+
+After the existing sort and LIMIT truncation, check that output indexes are
+exactly 0..width and every retained row has that width. If so, trim unused outer-vector capacity and move the owned
+row vector into QueryResult. This prevents a small LIMIT result from retaining
+the large collection buffer. Otherwise execute the original projection loop.
+Output names, ordering and values are unchanged. Reordered/duplicated columns,
+subsets and hidden aggregate columns retain the copying path.
+
+The shape proof happens after LIMIT, matching which rows the original code
+projects. It emits no errors. A malformed retained row falls back to the
+original loop, preserving the original first projection error; malformed rows
+excluded by LIMIT still do not introduce an error. NULLs, ratios, empty results,
+empty projections and zero limits retain their existing semantics. Ordinary
+single-table SELECT borrows table rows through another path and is unchanged;
+this optimization only reuses rows already owned by finish_rows.
+
+Removing the duplicate buffer also removes its in-function destruction. Final
+result cleanup remains outside the query timer in both benchmark arms. This is
+not a zero-copy claim for aggregation or joins as a whole: collection and
+materialization still allocate/copy their intermediate data.
+
+No page/WAL format, index layout, mutation, sync or recovery protocol changes.
+No rejected experiment is restored. The old copying projection is selectable
+with a test-only guard.
+
+### Validation
+
+A direct differential test covers 96 combinations of row shapes, projection
+indexes and limits. It checks full/reordered/duplicated/subset/out-of-range
+projections, empty rows/results, NULLs, 4 KiB text, ratios, malformed later rows
+and LIMIT error boundaries, comparing complete results or exact errors. Three
+additional capacity cases verify compact outer buffers for full, one-row and
+zero-row results starting from an oversized allocation.
+
+The SQL matrix includes high-cardinality text groups, limited groups, reordered
+and aliased duplicate columns, low-cardinality groups, HAVING with visible or
+hidden aggregates, scalar COUNT/SUM/AVG/MIN/MAX, and full-row inner/left joins.
+The primary text-group result also matches the independent M60 seed model.
+Every timed pair compares complete results, unchanged database bytes, empty WAL
+and page checksums. The left-join control covers NULL-padded unmatched rows.
+
+Formatting, strict Clippy, all-target locked build and the full locked suite
+pass: 646 passed, 0 failed, 59 ignored, including one doctest. Existing query,
+join, mutation, corruption and recovery coverage also passes.
+
+### Paired release results
+
+Apple M5, rustc 1.100.0, release-test build. Two isolated passes disable phase
+recording; a third records phases. Each covers ten workloads at 1k/10k/100k rows,
+five paired fresh copies per workload, alternating arm order, with one warmup
+query. No builds or other tests overlap timing. Each candidate pass times 300
+queries (900 total); the independent eight-workload baseline adds 240.
+`copy=true` selects the old projection. Baseline arms both used the old code.
+
+100k-row wall medians, milliseconds (reuse / copy):
+
+| Workload | Pass 1 | Pass 2 |
+| --- | ---: | ---: |
+| Text GROUP BY, full output | 19.752 / 22.706 | 19.784 / 23.010 |
+| Text GROUP BY, LIMIT 10 | 20.946 / 22.451 | 20.937 / 21.194 |
+| Reordered grouped columns | 23.477 / 23.345 | 22.814 / 22.979 |
+| Duplicated grouped columns | 23.858 / 23.648 | 23.744 / 24.114 |
+| Bucket GROUP BY | 4.705 / 4.702 | 4.380 / 4.363 |
+| HAVING, visible COUNT | 19.551 / 19.399 | 19.258 / 19.335 |
+| HAVING, hidden COUNT | 19.076 / 19.001 | 18.504 / 18.673 |
+| Scalar aggregates | 3.757 / 3.759 | 3.791 / 3.782 |
+| Full-row inner join | 6.054 / 10.524 | 5.764 / 10.171 |
+| Full-row left join | 6.863 / 12.307 | 6.744 / 12.084 |
+
+High-cardinality grouping improves 13.0–14.0%; full-row inner joins improve
+42.5–43.3%, and left joins 44.2% in both passes. The benefit scales with returned owned
+rows, not just input cardinality. LIMIT 10 and five-group results save little.
+
+Recorded 100k text-group projection falls from 1.877 ms to 0.033 ms. Collection
+is 11.764 / 11.742 ms, materialization 5.170 / 4.982 ms, and sorting 1.808 /
+1.803 ms. These other phases are essentially unchanged work; their measurements
+vary. Recorded wall is 19.771 / 22.576 ms. Projection time alone does not account
+for the whole gain because duplicate source-row destruction also disappears.
+
+Small-result controls are not universally faster. Bucket grouping is 0.1–0.4%
+slower in the two unrecorded passes; scalar and other controls show smaller
+mixed differences. The independent baseline's identical text-group arms also
+varied (23.581 / 23.038 ms), illustrating measurement variability without proving
+the cause of any later difference. All samples and ranges are retained, and no
+zero-overhead fallback claim is made. Warm queries and five samples do not
+establish cold-cache or tail latency behavior.
+
+Initial candidate logs preceded the outer-buffer capacity fix and are retained
+with an initial label. The final table uses only the completed implementation;
+all final runs followed the final full test suite. The limited-result timing
+variation is not attributed solely to copying a handful of rows.
+
+The merge is justified by repeatable large-result gains, the narrow ownership
+proof and exact-result/error comparisons, not by claiming every aggregate is
+faster. Collection remains the largest measured text-group phase, followed by
+materialization; those costs were not optimized here.
+
+```sh
+cargo test --locked --lib identity_projection_matches_copying_shapes_and_errors
+cargo test --locked --lib milestone62_queries_match_copied_projection
+cargo test --release --locked --lib executor::tests::profile_milestone62 -- --ignored --nocapture --exact
+RUSTDB_PROFILE_ENABLED=1 cargo test --release --locked --lib executor::tests::profile_milestone62 -- --ignored --nocapture --exact
+```
+
+Next: investigate the remaining group-materialization cost, including whether
+owned group keys can be moved safely, and benchmark it independently before
+changing accumulator or grouping semantics.
