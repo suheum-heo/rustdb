@@ -3534,8 +3534,9 @@ zero work. All new timers compile out of production.
 ### Change and semantic boundary
 
 After the existing sort and LIMIT truncation, check that output indexes are
-exactly 0..width and every retained row has that width. If so, move the owned
-row vector into QueryResult. Otherwise execute the original projection loop.
+exactly 0..width and every retained row has that width. If so, trim unused outer-vector capacity and move the owned
+row vector into QueryResult. This prevents a small LIMIT result from retaining
+the large collection buffer. Otherwise execute the original projection loop.
 Output names, ordering and values are unchanged. Reordered/duplicated columns,
 subsets and hidden aggregate columns retain the copying path.
 
@@ -3561,7 +3562,9 @@ with a test-only guard.
 A direct differential test covers 96 combinations of row shapes, projection
 indexes and limits. It checks full/reordered/duplicated/subset/out-of-range
 projections, empty rows/results, NULLs, 4 KiB text, ratios, malformed later rows
-and LIMIT error boundaries, comparing complete results or exact errors.
+and LIMIT error boundaries, comparing complete results or exact errors. Three
+additional capacity cases verify compact outer buffers for full, one-row and
+zero-row results starting from an oversized allocation.
 
 The SQL matrix includes high-cardinality text groups, limited groups, reordered
 and aliased duplicate columns, low-cardinality groups, HAVING with visible or
@@ -3587,34 +3590,39 @@ queries (900 total); the independent eight-workload baseline adds 240.
 
 | Workload | Pass 1 | Pass 2 |
 | --- | ---: | ---: |
-| Text GROUP BY, full output | 20.232 / 23.202 | 20.474 / 23.971 |
-| Text GROUP BY, LIMIT 10 | 22.004 / 22.263 | 21.729 / 21.900 |
-| Reordered grouped columns | 23.237 / 23.671 | 23.276 / 23.236 |
-| Duplicated grouped columns | 24.049 / 24.420 | 24.458 / 24.214 |
-| Bucket GROUP BY | 4.826 / 4.727 | 4.565 / 4.485 |
-| HAVING, visible COUNT | 19.426 / 19.799 | 19.523 / 19.866 |
-| HAVING, hidden COUNT | 18.720 / 18.437 | 19.548 / 19.704 |
-| Scalar aggregates | 3.895 / 3.849 | 3.810 / 3.807 |
-| Full-row inner join | 5.899 / 10.263 | 5.761 / 10.482 |
-| Full-row left join | 6.521 / 11.819 | 7.032 / 12.532 |
+| Text GROUP BY, full output | 19.752 / 22.706 | 19.784 / 23.010 |
+| Text GROUP BY, LIMIT 10 | 20.946 / 22.451 | 20.937 / 21.194 |
+| Reordered grouped columns | 23.477 / 23.345 | 22.814 / 22.979 |
+| Duplicated grouped columns | 23.858 / 23.648 | 23.744 / 24.114 |
+| Bucket GROUP BY | 4.705 / 4.702 | 4.380 / 4.363 |
+| HAVING, visible COUNT | 19.551 / 19.399 | 19.258 / 19.335 |
+| HAVING, hidden COUNT | 19.076 / 19.001 | 18.504 / 18.673 |
+| Scalar aggregates | 3.757 / 3.759 | 3.791 / 3.782 |
+| Full-row inner join | 6.054 / 10.524 | 5.764 / 10.171 |
+| Full-row left join | 6.863 / 12.307 | 6.744 / 12.084 |
 
-High-cardinality grouping improves 12.8–14.6%; full-row inner joins improve
-42.5–45.0%, and left joins 43.9–44.8%. The benefit scales with returned owned
+High-cardinality grouping improves 13.0–14.0%; full-row inner joins improve
+42.5–43.3%, and left joins 44.2% in both passes. The benefit scales with returned owned
 rows, not just input cardinality. LIMIT 10 and five-group results save little.
 
-Recorded 100k text-group projection falls from 1.882 ms to 0.022 ms. Collection
-is 12.570 / 12.432 ms, materialization 5.099 / 5.086 ms, and sorting 1.844 /
-1.813 ms. These other phases are essentially unchanged work; their measurements
-vary. Recorded wall is 20.481 / 23.450 ms. Projection time alone does not account
+Recorded 100k text-group projection falls from 1.877 ms to 0.033 ms. Collection
+is 11.764 / 11.742 ms, materialization 5.170 / 4.982 ms, and sorting 1.808 /
+1.803 ms. These other phases are essentially unchanged work; their measurements
+vary. Recorded wall is 19.771 / 22.576 ms. Projection time alone does not account
 for the whole gain because duplicate source-row destruction also disappears.
 
-Small-result controls are not universally faster. Bucket grouping is 1.8–2.1%
+Small-result controls are not universally faster. Bucket grouping is 0.1–0.4%
 slower in the two unrecorded passes; scalar and other controls show smaller
 mixed differences. The independent baseline's identical text-group arms also
 varied (23.581 / 23.038 ms), illustrating measurement variability without proving
 the cause of any later difference. All samples and ranges are retained, and no
 zero-overhead fallback claim is made. Warm queries and five samples do not
 establish cold-cache or tail latency behavior.
+
+Initial candidate logs preceded the outer-buffer capacity fix and are retained
+with an initial label. The final table uses only the completed implementation;
+all final runs followed the final full test suite. The limited-result timing
+variation is not attributed solely to copying a handful of rows.
 
 The merge is justified by repeatable large-result gains, the narrow ownership
 proof and exact-result/error comparisons, not by claiming every aggregate is

@@ -6235,6 +6235,9 @@ fn finish_rows(
         && output_indexes.iter().copied().eq(0..output_indexes.len())
         && rows.iter().all(|row| row.len() == output_indexes.len())
     {
+        // LIMIT may leave a large collection buffer behind a tiny result.
+        // Match the copying path's compact outer result allocation.
+        rows.shrink_to_fit();
         rows
     } else {
         let mut projected = Vec::with_capacity(rows.len());
@@ -26749,6 +26752,23 @@ mod tests {
                     assert_eq!(actual, expected);
                 }
             }
+        }
+        for limit in [None, Some(0), Some(1)] {
+            let mut rows = Vec::with_capacity(4096);
+            for n in 0..3 {
+                rows.push(vec![Value::Integer(n)]);
+            }
+            let StatementResult::Query(result) =
+                finish_rows(rows, &[], limit, &[0], vec!["id".into()]).unwrap()
+            else {
+                panic!("expected query");
+            };
+            assert_eq!(result.rows.len(), limit.map_or(3, |n| n as usize));
+            assert_eq!(
+                result.rows.capacity(),
+                result.rows.len(),
+                "must not retain the oversized outer buffer"
+            );
         }
     }
 
