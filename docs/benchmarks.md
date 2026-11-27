@@ -3639,3 +3639,84 @@ RUSTDB_PROFILE_ENABLED=1 cargo test --release --locked --lib executor::tests::pr
 Next: investigate the remaining group-materialization cost, including whether
 owned group keys can be moved safely, and benchmark it independently before
 changing accumulator or grouping semantics.
+
+## Milestone 63 — move owned group keys and aggregate extrema
+
+Decision: merge. M62 was verified merged as PR #58 at
+`b260bd933879538be5067ce6a18876cc375a5554` before starting from clean main.
+M62's remaining group-materialization cost motivated this change; the current
+M63 benchmark compares directly with the M62 copying path in the same binary.
+
+GroupSink now consumes its completed group keys and accumulator values to build
+result rows. Text keys and MIN/MAX text values move instead of cloning. The key
+vector reserves room for aggregate values and shrinks before return, avoiding
+retention of spare key capacity. Scalar aggregates use the same conversion.
+COUNT, SUM, AVG and NULL conversion are unchanged. Hashing, equality, DISTINCT,
+accumulation and overflow checks still execute before materialization. HAVING,
+sorting and projection remain downstream. No page/WAL format, recovery or
+synchronization changes; no previously rejected experiment was reintroduced.
+
+A test-only scoped guard forces the original cloning implementation. Tests
+compare all contiguous slices of 14 representative accumulator states across
+three key shapes (360 comparisons), including empty groups, NULL, signed
+extremes, fractional AVG, long Unicode/NUL text and oversized key capacity.
+Twelve SQL workloads compare complete results, with an independent model for
+the primary text-group query. Every benchmark copy checks unchanged database
+bytes, page checksums and empty WAL outside the timed interval.
+
+Validation: formatting, strict all-target Clippy, locked all-target build, and
+full locked tests pass: **648 passed, 0 failed, 60 ignored**, including the
+doctest. The ignored release benchmark passed four times.
+
+Apple M5, rustc 1.100.0, release-test build. Three phase-disabled passes and one
+phase-recorded pass each cover 12 workloads at 1k/10k/100k input rows, five pairs
+of fresh database copies per workload, alternating arm order and warming each
+query once. Total: 1,440 timed queries. Builds/tests did not overlap timing.
+The third unrecorded pass was added to investigate inconsistent projection
+results; all passes are reported. These are warm-query measurements, not cold
+cache or tail-latency claims.
+
+100k-row wall medians in milliseconds, owned / copying:
+
+| Workload | Pass 1 | Pass 2 | Pass 3 |
+| --- | ---: | ---: | ---: |
+| text-extrema-distinct | 55.121 / 58.508 | 56.050 / 59.637 | 60.740 / 67.350 |
+| empty-scalar | 0.017 / 0.018 | 0.018 / 0.018 | 0.019 / 0.018 |
+| hidden-having | 18.755 / 19.484 | 20.521 / 20.797 | 18.887 / 19.947 |
+| left-join-all | 6.463 / 6.497 | 7.216 / 7.038 | 6.661 / 6.649 |
+| text-group | 19.245 / 20.050 | 20.129 / 21.705 | 19.648 / 20.070 |
+| text-group-limit | 20.786 / 21.551 | 21.448 / 22.018 | 20.519 / 21.180 |
+| text-group-reordered | 25.829 / 24.114 | 22.597 / 23.330 | 21.752 / 22.412 |
+| text-group-duplicate | 24.730 / 25.177 | 26.169 / 24.536 | 23.117 / 23.761 |
+| bucket-group | 5.097 / 4.949 | 4.515 / 4.474 | 4.691 / 4.767 |
+| having | 20.243 / 21.768 | 19.555 / 19.973 | 19.021 / 19.734 |
+| scalar | 3.814 / 3.878 | 3.849 / 3.816 | 3.831 / 3.784 |
+| join-all | 5.775 / 5.783 | 5.877 / 5.877 | 5.835 / 5.877 |
+
+Text extrema with DISTINCT aggregates improve 5.8–9.8%; ordinary text grouping
+improves 2.1–7.3%; LIMIT 10 grouping improves 2.6–3.6%. Reordered and duplicated
+projections have mixed results, including 7.1% and 6.7% slower medians in one
+pass each; the third pass improves both by roughly 3%. Bucket, scalar and join
+controls show small mixed differences. This does not establish universal gains
+or zero overhead for small results. In particular, scalar aggregation saves
+little, and its last two pass medians are 0.9–1.2% slower.
+
+Recorded text-group materialization is 4.467 / 5.192 ms (14.0% lower). Collection
+is 12.059 / 12.385 ms, sorting 1.799 / 1.820 ms, and projection 0.033 / 0.033 ms.
+Wall is 19.251 / 20.288 ms. Phase medians are attribution evidence, not an
+additive accounting of the wall median. Collection remains the dominant cost.
+
+The narrow ownership change, exact comparisons and repeated target-workload
+gains justify merging despite the limited and noisy control results. Raw
+samples and all-size median/range summaries accompany the external report.
+
+```sh
+cargo test --locked --lib owned_materialization_matches_clones_for_all_accumulators
+cargo test --locked --lib milestone63_queries_match_cloned_materialization
+cargo test --release --locked --lib executor::tests::profile_milestone63 -- --ignored --nocapture --exact
+RUSTDB_PROFILE_ENABLED=1 cargo test --release --locked --lib executor::tests::profile_milestone63 -- --ignored --nocapture --exact
+```
+
+Next: profile high-cardinality group collection separately, including key
+construction and hash lookup, before choosing another optimization. Do not
+change group equality or aggregate semantics merely to reduce allocations.
