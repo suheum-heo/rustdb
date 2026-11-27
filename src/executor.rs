@@ -3880,12 +3880,12 @@ impl<'a> GroupSink<'a> {
         #[cfg(test)]
         let _timer = crate::storage::Timer::new(|p| &mut p.group_materialize);
         if let Some(acc) = self.scalar {
-            return Ok(vec![materialize_group(&[], &acc)]);
+            return Ok(vec![materialize_owned_group(Vec::new(), acc)]);
         }
         Ok(self
             .groups
             .into_iter()
-            .map(|group| materialize_group(&group.key, &group.acc))
+            .map(|group| materialize_owned_group(group.key, group.acc))
             .collect())
     }
 }
@@ -4320,6 +4320,59 @@ fn update_plain(acc: &mut [AccValue], row: InputRow<'_>, aggs: &[AggFn]) -> Resu
 fn cell(row: InputRow<'_>, ordinal: usize) -> Result<&Value, DbError> {
     row.get(ordinal)
         .ok_or_else(|| DbError::Internal("aggregate column is outside the row".to_string()))
+}
+
+#[cfg(test)]
+thread_local! { static COPY_GROUP_MATERIALIZATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+struct CopyGroupMaterialization(bool);
+#[cfg(test)]
+impl CopyGroupMaterialization {
+    fn new() -> Self {
+        Self(COPY_GROUP_MATERIALIZATION.with(|flag| flag.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for CopyGroupMaterialization {
+    fn drop(&mut self) {
+        COPY_GROUP_MATERIALIZATION.with(|flag| flag.set(self.0));
+    }
+}
+fn copy_group_materialization_forced() -> bool {
+    #[cfg(test)]
+    {
+        COPY_GROUP_MATERIALIZATION.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn materialize_owned_group(mut key: Vec<Value>, acc: Vec<AccValue>) -> Vec<Value> {
+    if copy_group_materialization_forced() {
+        return materialize_group(&key, &acc);
+    }
+    // GroupSink has finished updating these values. Reuse their ownership
+    // rather than cloning text keys and extrema into another allocation.
+    key.reserve_exact(acc.len());
+    for value in acc {
+        key.push(match value {
+            AccValue::Count(count) => Value::Integer(count),
+            AccValue::Sum(total) => total.map(Value::Integer).unwrap_or(Value::Null),
+            AccValue::Avg { sum, count } => {
+                if count > 0 {
+                    Value::ratio(sum, count)
+                } else {
+                    Value::Null
+                }
+            }
+            AccValue::Extreme(value) => value.unwrap_or(Value::Null),
+        });
+    }
+    // Do not retain spare group-key capacity in the returned result.
+    key.shrink_to_fit();
+    key
 }
 
 fn materialize_group(key: &[Value], acc: &[AccValue]) -> Vec<Value> {
@@ -26787,6 +26840,178 @@ mod tests {
         );
         for rows in [1_000, 10_000, 100_000] {
             milestone62_profile(rows, 5);
+        }
+    }
+
+    fn milestone63_queries() -> [(&'static str, &'static str); 12] {
+        [
+            (
+                "text-extrema-distinct",
+                "SELECT name, MIN(name), MAX(name), AVG(id), COUNT(DISTINCT bucket), SUM(DISTINCT id) FROM users GROUP BY name ORDER BY name;",
+            ),
+            (
+                "empty-scalar",
+                "SELECT COUNT(*), SUM(id), AVG(id), MIN(name), MAX(name) FROM users WHERE id < 0;",
+            ),
+            (
+                "hidden-having",
+                "SELECT name FROM users GROUP BY name HAVING COUNT(*) > 1 ORDER BY name;",
+            ),
+            (
+                "left-join-all",
+                "SELECT * FROM users LEFT JOIN labels ON users.bucket = labels.bucket ORDER BY users.id;",
+            ),
+            (
+                "text-group",
+                "SELECT name, COUNT(*) FROM users GROUP BY name ORDER BY name;",
+            ),
+            (
+                "text-group-limit",
+                "SELECT name, COUNT(*) FROM users GROUP BY name ORDER BY name LIMIT 10;",
+            ),
+            (
+                "text-group-reordered",
+                "SELECT COUNT(*), name FROM users GROUP BY name ORDER BY name;",
+            ),
+            (
+                "text-group-duplicate",
+                "SELECT name AS first_name, name AS other_name, COUNT(*) FROM users GROUP BY name ORDER BY first_name;",
+            ),
+            (
+                "bucket-group",
+                "SELECT bucket, COUNT(*) FROM users GROUP BY bucket ORDER BY bucket;",
+            ),
+            (
+                "having",
+                "SELECT name, COUNT(*) FROM users GROUP BY name HAVING COUNT(*) > 1 ORDER BY name;",
+            ),
+            (
+                "scalar",
+                "SELECT COUNT(*), SUM(id), AVG(id), MIN(name), MAX(name) FROM users;",
+            ),
+            (
+                "join-all",
+                "SELECT * FROM users JOIN labels ON users.bucket = labels.bucket ORDER BY users.id;",
+            ),
+        ]
+    }
+
+    fn milestone63_profile(rows: i64, samples: usize) {
+        let (_dir, base) = seed_delete_db("m63-base", rows, 0x3100);
+        let mut setup = Database::open(&base).unwrap();
+        setup.execute("CREATE TABLE labels (bucket INT, tag TEXT); INSERT INTO labels VALUES (0, 'a'),(1, 'b'),(2, 'c'),(3, 'd'); CREATE INDEX idx_labels_bucket ON labels(bucket);").unwrap();
+        drop(setup);
+        let bytes = db_file(&base);
+        let _phases = crate::storage::enable_phases();
+        let recording = std::env::var("RUSTDB_PROFILE_ENABLED").as_deref() == Ok("1");
+        let reference = milestone54_model("count", rows).0;
+        let expected_groups = milestone60_read_model("text-group", &reference).1;
+        for (kind, sql) in milestone63_queries() {
+            for sample in 0..samples {
+                let run = |copy: bool| {
+                    let _guard = copy.then(CopyGroupMaterialization::new);
+                    crate::storage::set_phases_enabled(false);
+                    let (_dir, path, mut db) =
+                        open_copy(&base, &format!("m63-{kind}-{sample}-{copy}"));
+                    db.execute(sql).unwrap();
+                    crate::storage::reset_phases();
+                    crate::storage::set_phases_enabled(recording);
+                    let started = std::time::Instant::now();
+                    let result = db.execute(sql).unwrap();
+                    let wall = started.elapsed().as_nanos();
+                    let p = crate::storage::take_phases();
+                    if kind == "text-group" {
+                        let StatementResult::Query(query) = &result[0] else {
+                            panic!("expected query");
+                        };
+                        assert_eq!(query.rows, expected_groups);
+                    }
+                    crate::storage::set_phases_enabled(false);
+                    println!(
+                        "milestone63 kind={kind} rows={rows} sample={sample} copy={copy} recording={recording} wall_ns={wall} collect_ns={} materialize_ns={} sort_ns={} project_ns={}",
+                        p.group_collect.as_nanos(),
+                        p.group_materialize.as_nanos(),
+                        p.result_sort.as_nanos(),
+                        p.result_project.as_nanos()
+                    );
+                    assert_eq!(db_file(&path), bytes);
+                    assert_eq!(wal_len(&path), 0);
+                    assert_checksums(&path);
+                    if !recording {
+                        assert_eq!(p, crate::storage::Profile::default());
+                    }
+                    assert_eq!(p.wal_bytes, 0);
+                    result
+                };
+                let (fast, old) = if sample % 2 == 0 {
+                    (run(false), run(true))
+                } else {
+                    let old = run(true);
+                    (run(false), old)
+                };
+                assert_eq!(fast, old, "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn owned_materialization_matches_clones_for_all_accumulators() {
+        let states = vec![
+            AccValue::Count(0),
+            AccValue::Count(i64::MAX),
+            AccValue::Sum(None),
+            AccValue::Sum(Some(i64::MIN)),
+            AccValue::Sum(Some(i64::MAX)),
+            AccValue::Avg { sum: 0, count: 0 },
+            AccValue::Avg { sum: 10, count: 3 },
+            AccValue::Avg { sum: -10, count: 3 },
+            AccValue::Avg {
+                sum: i128::MAX,
+                count: i64::MAX,
+            },
+            AccValue::Extreme(None),
+            AccValue::Extreme(Some(Value::Null)),
+            AccValue::Extreme(Some(Value::Integer(i64::MIN))),
+            AccValue::Extreme(Some(Value::Text("héllo\0世界".repeat(1000)))),
+            AccValue::Extreme(Some(Value::Boolean(false))),
+        ];
+        for key in [
+            vec![],
+            vec![Value::Null],
+            vec![Value::Text("key".repeat(1000)), Value::Integer(7)],
+        ] {
+            for start in 0..=states.len() {
+                for end in start..=states.len() {
+                    let acc = states[start..end].to_vec();
+                    let expected = materialize_group(&key, &acc);
+                    let actual = materialize_owned_group(key.clone(), acc);
+                    assert_eq!(actual, expected);
+                    assert_eq!(actual.capacity(), actual.len());
+                }
+            }
+        }
+        let mut oversized = Vec::with_capacity(4096);
+        oversized.push(Value::Text("small".into()));
+        let actual = materialize_owned_group(oversized, vec![AccValue::Count(1)]);
+        assert_eq!(actual, vec![Value::Text("small".into()), Value::Integer(1)]);
+        assert_eq!(actual.capacity(), 2);
+    }
+
+    #[test]
+    fn milestone63_queries_match_cloned_materialization() {
+        milestone63_profile(24, 1);
+    }
+
+    #[test]
+    #[ignore = "release owned group materialization comparison"]
+    fn profile_milestone63() {
+        println!(
+            "milestone63 cpu={} rustc={} samples=5 warmup=1",
+            profile_command("sysctl", &["-n", "machdep.cpu.brand_string"]),
+            profile_command("rustc", &["--version"])
+        );
+        for rows in [1_000, 10_000, 100_000] {
+            milestone63_profile(rows, 5);
         }
     }
 
