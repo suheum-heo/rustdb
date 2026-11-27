@@ -3720,3 +3720,81 @@ RUSTDB_PROFILE_ENABLED=1 cargo test --release --locked --lib executor::tests::pr
 Next: profile high-cardinality group collection separately, including key
 construction and hash lookup, before choosing another optimization. Do not
 change group equality or aggregate semantics merely to reduce allocations.
+
+## Milestone 64 — inline singleton group buckets
+
+Decision: merge the inline bucket change. Baseline M63 was verified merged as
+PR #59 at `6c11fe42000dc50e07738b14dee91f55f8fa8567`; local main was clean and
+matched origin/main. M63 measured collection as the largest remaining text-group
+phase. Inspection identified a separate Vec allocation for every fingerprint,
+even when it identifies only one group.
+
+Store a singleton group index inline. Promote it to a Vec only when another
+unequal key has the same fingerprint, preserving insertion order. Full key
+comparison remains mandatory on every lookup. Group keys, hashing, aggregates,
+DISTINCT, error staging and output ordering are unchanged. Scalar aggregates
+bypass buckets. Page/WAL formats and recovery guarantees are unchanged; no
+rejected storage experiment is reintroduced.
+
+A test-only scoped guard selects the original HashMap<u64, Vec<usize>>, including
+its original entry size and allocations, in the same binary. Production has
+only the inline implementation. Twelve SQL workloads compare complete results
+with both normal and forced-collision hashing. Existing collision tests cover
+multi-column keys, NULLs, booleans, repeated keys and encounter ordering;
+existing allocation-budget/overflow tests still exercise failure staging.
+The benchmark checks its primary text-group query against an independent model.
+Each copy verifies unchanged database bytes, valid page checksums and empty WAL
+outside timing.
+
+Validation: formatting, strict all-target Clippy, locked all-target build and
+full locked tests passed: **649 passed, 0 failed, 61 ignored**, including the
+doctest. All three ignored release benchmark runs passed.
+
+Apple M5, rustc 1.100.0, release-test build. Two phase-disabled passes and one
+recorded pass each run 12 workloads at 1k/10k/100k inputs, five alternating pairs
+of fresh database copies, one warmup per copy: 1,080 timed queries. No build or
+other test overlaps measurements. The old arm is the directly paired current
+baseline; the prior milestone's timing is not used to calculate improvement.
+
+100k-row wall medians in milliseconds, inline / original:
+
+| Workload | Pass 1 | Pass 2 |
+| --- | ---: | ---: |
+| text-extrema-distinct | 54.819 / 81.354 | 52.070 / 54.128 |
+| empty-scalar | 0.020 / 0.021 | 0.019 / 0.019 |
+| hidden-having | 17.278 / 18.795 | 17.243 / 19.971 |
+| left-join-all | 6.741 / 6.589 | 6.966 / 6.999 |
+| text-group | 16.962 / 20.052 | 17.872 / 19.555 |
+| text-group-limit | 18.966 / 21.031 | 20.012 / 23.179 |
+| text-group-reordered | 22.138 / 24.072 | 21.282 / 23.465 |
+| text-group-duplicate | 23.415 / 24.451 | 21.909 / 24.156 |
+| bucket-group | 4.545 / 4.616 | 4.379 / 4.570 |
+| having | 17.216 / 19.379 | 17.320 / 19.389 |
+| scalar | 4.324 / 4.472 | 3.958 / 3.896 |
+| join-all | 6.498 / 6.380 | 5.863 / 5.971 |
+
+Text grouping improves 8.6–15.4%, LIMIT 10 grouping 9.8–13.7%, reordered output
+8.0–9.3%, and duplicated output 4.2–9.3%. The first text-extrema/DISTINCT pass
+shows an unusually large 32.6% difference versus 3.8% in pass two; this noisy
+result is not the basis for the merge or a reliable estimate of that workload's
+gain. Scalar and full-row join controls show mixed differences, including slower
+candidate medians. Small/control queries have no guaranteed speedup.
+
+Recorded text-group collection is 11.124 / 13.146 ms (15.4% lower), materialization
+4.586 / 4.832 ms, sorting 1.853 / 1.957 ms and projection 0.036 / 0.037 ms.
+Wall is 17.654 / 21.392 ms. Phase medians do not add to the wall median, and
+bucket destruction occurs outside collection timing. The experiment isolates
+bucket representation, not every source of collection cost. Reduced collection
+time and repeatable target-workload wall improvements justify the narrow change.
+Map representation and allocation layout differ; no total-memory or tail-latency
+claim is made. Raw samples and all-size ranges accompany the external report.
+
+```sh
+cargo test --locked --lib milestone64_queries_match_original_buckets
+cargo test --release --locked --lib executor::tests::profile_milestone64 -- --ignored --nocapture --exact
+RUSTDB_PROFILE_ENABLED=1 cargo test --release --locked --lib executor::tests::profile_milestone64 -- --ignored --nocapture --exact
+```
+
+Next: attribute remaining collection cost between key construction, map lookup
+and staged accumulator updates. Preserve row-update atomicity and DISTINCT
+failure guarantees in any subsequent experiment.

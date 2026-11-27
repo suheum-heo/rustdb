@@ -3840,12 +3840,91 @@ impl<'a> InputRow<'a> {
     }
 }
 
+#[cfg(test)]
+thread_local! { static ORIGINAL_GROUP_BUCKETS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+struct OriginalGroupBuckets(bool);
+#[cfg(test)]
+impl OriginalGroupBuckets {
+    fn new() -> Self {
+        Self(ORIGINAL_GROUP_BUCKETS.with(|flag| flag.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for OriginalGroupBuckets {
+    fn drop(&mut self) {
+        ORIGINAL_GROUP_BUCKETS.with(|flag| flag.set(self.0));
+    }
+}
+
+enum GroupSlots {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl GroupSlots {
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::One(slot) => std::slice::from_ref(slot),
+            Self::Many(slots) => slots,
+        }
+    }
+
+    fn push(&mut self, slot: usize) {
+        match self {
+            Self::One(first) => *self = Self::Many(vec![*first, slot]),
+            Self::Many(slots) => slots.push(slot),
+        }
+    }
+}
+
+// Most fingerprints identify one group. Allocate a list only on collision;
+// retain insertion order and compare full keys for every candidate.
+enum GroupBuckets {
+    Inline(HashMap<u64, GroupSlots>),
+    #[cfg(test)]
+    Original(HashMap<u64, Vec<usize>>),
+}
+
+impl GroupBuckets {
+    fn new() -> Self {
+        #[cfg(test)]
+        if ORIGINAL_GROUP_BUCKETS.with(std::cell::Cell::get) {
+            return Self::Original(HashMap::new());
+        }
+        Self::Inline(HashMap::new())
+    }
+
+    fn get(&self, hash: &u64) -> Option<&[usize]> {
+        match self {
+            Self::Inline(map) => map.get(hash).map(GroupSlots::as_slice),
+            #[cfg(test)]
+            Self::Original(map) => map.get(hash).map(Vec::as_slice),
+        }
+    }
+
+    fn push(&mut self, hash: u64, slot: usize) {
+        match self {
+            Self::Inline(map) => match map.entry(hash) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(GroupSlots::One(slot));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().push(slot)
+                }
+            },
+            #[cfg(test)]
+            Self::Original(map) => map.entry(hash).or_default().push(slot),
+        }
+    }
+}
+
 struct GroupSink<'a> {
     plan: &'a AggPlan,
     scalar: Option<Vec<AccValue>>,
     scalar_seen: Vec<Option<DistinctSet>>,
     groups: Vec<AggGroup>,
-    buckets: HashMap<u64, Vec<usize>>,
+    buckets: GroupBuckets,
 }
 
 impl<'a> GroupSink<'a> {
@@ -3865,7 +3944,7 @@ impl<'a> GroupSink<'a> {
             scalar,
             scalar_seen,
             groups: Vec::new(),
-            buckets: HashMap::new(),
+            buckets: GroupBuckets::new(),
         }
     }
 
@@ -3894,7 +3973,7 @@ fn absorb_row(
     row: InputRow<'_>,
     plan: &AggPlan,
     groups: &mut Vec<AggGroup>,
-    buckets: &mut HashMap<u64, Vec<usize>>,
+    buckets: &mut GroupBuckets,
 ) -> Result<(), DbError> {
     let hash = hash_group(row, &plan.group_ordinals)?;
     let mut matched = None;
@@ -3919,7 +3998,7 @@ fn absorb_row(
     update_acc(&mut acc, &mut seen, row, &plan.aggs)?;
     let slot = groups.len();
     groups.push(AggGroup { key, acc, seen });
-    buckets.entry(hash).or_default().push(slot);
+    buckets.push(hash, slot);
     Ok(())
 }
 
@@ -13764,7 +13843,7 @@ mod tests {
         assert!(!seen[0].as_ref().unwrap().contains(&Value::Integer(20)));
 
         let mut groups = Vec::new();
-        let mut buckets = std::collections::HashMap::new();
+        let mut buckets = GroupBuckets::new();
         let plan = AggPlan {
             group_ordinals: vec![1],
             group_labels: vec!["name".to_string()],
@@ -27012,6 +27091,133 @@ mod tests {
         );
         for rows in [1_000, 10_000, 100_000] {
             milestone63_profile(rows, 5);
+        }
+    }
+
+    fn milestone64_queries() -> [(&'static str, &'static str); 12] {
+        [
+            (
+                "text-extrema-distinct",
+                "SELECT name, MIN(name), MAX(name), AVG(id), COUNT(DISTINCT bucket), SUM(DISTINCT id) FROM users GROUP BY name ORDER BY name;",
+            ),
+            (
+                "empty-scalar",
+                "SELECT COUNT(*), SUM(id), AVG(id), MIN(name), MAX(name) FROM users WHERE id < 0;",
+            ),
+            (
+                "hidden-having",
+                "SELECT name FROM users GROUP BY name HAVING COUNT(*) > 1 ORDER BY name;",
+            ),
+            (
+                "left-join-all",
+                "SELECT * FROM users LEFT JOIN labels ON users.bucket = labels.bucket ORDER BY users.id;",
+            ),
+            (
+                "text-group",
+                "SELECT name, COUNT(*) FROM users GROUP BY name ORDER BY name;",
+            ),
+            (
+                "text-group-limit",
+                "SELECT name, COUNT(*) FROM users GROUP BY name ORDER BY name LIMIT 10;",
+            ),
+            (
+                "text-group-reordered",
+                "SELECT COUNT(*), name FROM users GROUP BY name ORDER BY name;",
+            ),
+            (
+                "text-group-duplicate",
+                "SELECT name AS first_name, name AS other_name, COUNT(*) FROM users GROUP BY name ORDER BY first_name;",
+            ),
+            (
+                "bucket-group",
+                "SELECT bucket, COUNT(*) FROM users GROUP BY bucket ORDER BY bucket;",
+            ),
+            (
+                "having",
+                "SELECT name, COUNT(*) FROM users GROUP BY name HAVING COUNT(*) > 1 ORDER BY name;",
+            ),
+            (
+                "scalar",
+                "SELECT COUNT(*), SUM(id), AVG(id), MIN(name), MAX(name) FROM users;",
+            ),
+            (
+                "join-all",
+                "SELECT * FROM users JOIN labels ON users.bucket = labels.bucket ORDER BY users.id;",
+            ),
+        ]
+    }
+
+    fn milestone64_profile(rows: i64, samples: usize) {
+        let (_dir, base) = seed_delete_db("m64-base", rows, 0x3100);
+        let mut setup = Database::open(&base).unwrap();
+        setup.execute("CREATE TABLE labels (bucket INT, tag TEXT); INSERT INTO labels VALUES (0, 'a'),(1, 'b'),(2, 'c'),(3, 'd'); CREATE INDEX idx_labels_bucket ON labels(bucket);").unwrap();
+        drop(setup);
+        let bytes = db_file(&base);
+        let _phases = crate::storage::enable_phases();
+        let recording = std::env::var("RUSTDB_PROFILE_ENABLED").as_deref() == Ok("1");
+        let reference = milestone54_model("count", rows).0;
+        let expected_groups = milestone60_read_model("text-group", &reference).1;
+        for (kind, sql) in milestone64_queries() {
+            for sample in 0..samples {
+                let run = |copy: bool| {
+                    let _guard = copy.then(OriginalGroupBuckets::new);
+                    crate::storage::set_phases_enabled(false);
+                    let (_dir, path, mut db) =
+                        open_copy(&base, &format!("m64-{kind}-{sample}-{copy}"));
+                    db.execute(sql).unwrap();
+                    crate::storage::reset_phases();
+                    crate::storage::set_phases_enabled(recording);
+                    let started = std::time::Instant::now();
+                    let result = db.execute(sql).unwrap();
+                    let wall = started.elapsed().as_nanos();
+                    let p = crate::storage::take_phases();
+                    if kind == "text-group" {
+                        let StatementResult::Query(query) = &result[0] else {
+                            panic!("expected query");
+                        };
+                        assert_eq!(query.rows, expected_groups);
+                    }
+                    crate::storage::set_phases_enabled(false);
+                    println!(
+                        "milestone64 kind={kind} rows={rows} sample={sample} copy={copy} recording={recording} wall_ns={wall} collect_ns={} materialize_ns={} sort_ns={} project_ns={}",
+                        p.group_collect.as_nanos(),
+                        p.group_materialize.as_nanos(),
+                        p.result_sort.as_nanos(),
+                        p.result_project.as_nanos()
+                    );
+                    assert_eq!(db_file(&path), bytes);
+                    assert_eq!(wal_len(&path), 0);
+                    assert_checksums(&path);
+                    if !recording {
+                        assert_eq!(p, crate::storage::Profile::default());
+                    }
+                    assert_eq!(p.wal_bytes, 0);
+                    result
+                };
+                let (fast, old) = if sample % 2 == 0 {
+                    (run(false), run(true))
+                } else {
+                    let old = run(true);
+                    (run(false), old)
+                };
+                assert_eq!(fast, old, "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn milestone64_queries_match_original_buckets() {
+        milestone64_profile(24, 1);
+        let _collision = ForceHashCollision::new();
+        milestone64_profile(24, 1);
+    }
+
+    #[test]
+    #[ignore = "release inline group bucket comparison"]
+    fn profile_milestone64() {
+        println!("milestone64 samples=5 warmup=1");
+        for rows in [1_000, 10_000, 100_000] {
+            milestone64_profile(rows, 5);
         }
     }
 
