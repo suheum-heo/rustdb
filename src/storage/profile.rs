@@ -60,6 +60,16 @@ pub(crate) struct Profile {
     #[cfg(test)]
     pub select_project: Duration,
     #[cfg(test)]
+    pub group_hash: Duration,
+    #[cfg(test)]
+    pub group_lookup: Duration,
+    #[cfg(test)]
+    pub group_prepare: Duration,
+    #[cfg(test)]
+    pub group_update: Duration,
+    #[cfg(test)]
+    pub group_publish: Duration,
+    #[cfg(test)]
     pub group_collect: Duration,
     #[cfg(test)]
     pub group_materialize: Duration,
@@ -261,6 +271,11 @@ thread_local! {
         select_collect: Duration::ZERO,
         select_sort: Duration::ZERO,
         select_project: Duration::ZERO,
+        group_hash: Duration::ZERO,
+        group_lookup: Duration::ZERO,
+        group_prepare: Duration::ZERO,
+        group_update: Duration::ZERO,
+        group_publish: Duration::ZERO,
         group_collect: Duration::ZERO,
         group_materialize: Duration::ZERO,
         result_sort: Duration::ZERO,

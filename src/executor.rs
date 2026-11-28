@@ -3975,7 +3975,13 @@ fn absorb_row(
     groups: &mut Vec<AggGroup>,
     buckets: &mut GroupBuckets,
 ) -> Result<(), DbError> {
+    #[cfg(test)]
+    let timer = crate::storage::Timer::new(|p| &mut p.group_hash);
     let hash = hash_group(row, &plan.group_ordinals)?;
+    #[cfg(test)]
+    drop(timer);
+    #[cfg(test)]
+    let timer = crate::storage::Timer::new(|p| &mut p.group_lookup);
     let mut matched = None;
     if let Some(slots) = buckets.get(&hash) {
         for &slot in slots {
@@ -3985,17 +3991,31 @@ fn absorb_row(
             }
         }
     }
+    #[cfg(test)]
+    drop(timer);
     if let Some(slot) = matched {
+        #[cfg(test)]
+        let _timer = crate::storage::Timer::new(|p| &mut p.group_update);
         let group = &mut groups[slot];
         return update_acc(&mut group.acc, &mut group.seen, row, &plan.aggs);
     }
+    #[cfg(test)]
+    let timer = crate::storage::Timer::new(|p| &mut p.group_prepare);
     let mut key = Vec::with_capacity(plan.group_ordinals.len());
     for &ordinal in &plan.group_ordinals {
         key.push(cell(row, ordinal)?.clone());
     }
     let mut acc = fresh_acc(&plan.aggs);
     let mut seen = fresh_seen(&plan.aggs);
+    #[cfg(test)]
+    drop(timer);
+    #[cfg(test)]
+    let timer = crate::storage::Timer::new(|p| &mut p.group_update);
     update_acc(&mut acc, &mut seen, row, &plan.aggs)?;
+    #[cfg(test)]
+    drop(timer);
+    #[cfg(test)]
+    let _timer = crate::storage::Timer::new(|p| &mut p.group_publish);
     let slot = groups.len();
     groups.push(AggGroup { key, acc, seen });
     buckets.push(hash, slot);
@@ -4068,6 +4088,33 @@ enum Ready {
     },
 }
 
+#[cfg(test)]
+thread_local! { static VEC_STAGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+struct VecStaging(bool);
+#[cfg(test)]
+impl VecStaging {
+    fn new() -> Self {
+        Self(VEC_STAGING.with(|flag| flag.replace(true)))
+    }
+}
+#[cfg(test)]
+impl Drop for VecStaging {
+    fn drop(&mut self) {
+        VEC_STAGING.with(|flag| flag.set(self.0));
+    }
+}
+fn vec_staging_forced() -> bool {
+    #[cfg(test)]
+    {
+        VEC_STAGING.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 fn update_acc(
     acc: &mut [AccValue],
     seen: &mut [Option<DistinctSet>],
@@ -4078,6 +4125,17 @@ fn update_acc(
         return Err(DbError::Internal(
             "aggregate accumulator has the wrong width".to_string(),
         ));
+    }
+    // One ordinary aggregate has no later slot or DISTINCT admission to fail.
+    // Stage its replacement locally, then publish only after validation succeeds.
+    if aggs.len() == 1 && !aggs[0].is_distinct() && !vec_staging_forced() {
+        if let Some(staged) = next_acc(&acc[0], seen[0].as_ref(), row, &aggs[0])? {
+            let Staged::Replace(numbers) = staged else {
+                unreachable!("ordinary aggregates only stage replacements");
+            };
+            acc[0] = numbers;
+        }
+        return Ok(());
     }
     // Checked arithmetic finishes before any slot changes. Distinct clones and
     // bucket reservations finish next. Only then are numbers and membership
@@ -27218,6 +27276,201 @@ mod tests {
         println!("milestone64 samples=5 warmup=1");
         for rows in [1_000, 10_000, 100_000] {
             milestone64_profile(rows, 5);
+        }
+    }
+
+    #[test]
+    fn single_aggregate_staging_matches_errors_and_preserves_state() {
+        let states = [
+            AccValue::Count(0),
+            AccValue::Count(i64::MAX),
+            AccValue::Sum(None),
+            AccValue::Sum(Some(i64::MAX)),
+            AccValue::Sum(Some(i64::MIN)),
+            AccValue::Avg {
+                sum: i128::MAX,
+                count: 1,
+            },
+            AccValue::Avg {
+                sum: 0,
+                count: i64::MAX,
+            },
+            AccValue::Avg { sum: 0, count: 0 },
+            AccValue::Extreme(None),
+            AccValue::Extreme(Some(Value::Text("héllo".into()))),
+        ];
+        let inputs = [
+            vec![],
+            vec![Value::Null],
+            vec![Value::Integer(1)],
+            vec![Value::Integer(-1)],
+            vec![Value::Integer(i64::MAX)],
+            vec![Value::Integer(i64::MIN)],
+            vec![Value::Text("世界".into())],
+            vec![Value::Boolean(true)],
+        ];
+        for agg in [
+            AggFn::CountStar,
+            AggFn::CountColumn(0),
+            AggFn::Sum(0),
+            AggFn::Avg(0),
+            AggFn::Min(0),
+            AggFn::Max(0),
+        ] {
+            for state in &states {
+                for input in &inputs {
+                    for row in [InputRow::One(input), InputRow::Pair(&[], input)] {
+                        let mut fast = vec![state.clone()];
+                        let mut old = fast.clone();
+                        let actual =
+                            update_acc(&mut fast, &mut [None], row, std::slice::from_ref(&agg));
+                        let expected = {
+                            let _guard = VecStaging::new();
+                            update_acc(&mut old, &mut [None], row, std::slice::from_ref(&agg))
+                        };
+                        assert_eq!(
+                            actual.as_ref().err().map(ToString::to_string),
+                            expected.as_ref().err().map(ToString::to_string)
+                        );
+                        assert_eq!(fast, old);
+                        if actual.is_err() {
+                            assert_eq!(fast, vec![state.clone()]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn milestone65_queries() -> [(&'static str, &'static str); 12] {
+        [
+            (
+                "text-extrema-distinct",
+                "SELECT name, MIN(name), MAX(name), AVG(id), COUNT(DISTINCT bucket), SUM(DISTINCT id) FROM users GROUP BY name ORDER BY name;",
+            ),
+            (
+                "empty-scalar",
+                "SELECT COUNT(*), SUM(id), AVG(id), MIN(name), MAX(name) FROM users WHERE id < 0;",
+            ),
+            (
+                "hidden-having",
+                "SELECT name FROM users GROUP BY name HAVING COUNT(*) > 1 ORDER BY name;",
+            ),
+            (
+                "left-join-all",
+                "SELECT * FROM users LEFT JOIN labels ON users.bucket = labels.bucket ORDER BY users.id;",
+            ),
+            (
+                "text-group",
+                "SELECT name, COUNT(*) FROM users GROUP BY name ORDER BY name;",
+            ),
+            (
+                "text-group-limit",
+                "SELECT name, COUNT(*) FROM users GROUP BY name ORDER BY name LIMIT 10;",
+            ),
+            (
+                "text-group-reordered",
+                "SELECT COUNT(*), name FROM users GROUP BY name ORDER BY name;",
+            ),
+            (
+                "text-group-duplicate",
+                "SELECT name AS first_name, name AS other_name, COUNT(*) FROM users GROUP BY name ORDER BY first_name;",
+            ),
+            (
+                "bucket-group",
+                "SELECT bucket, COUNT(*) FROM users GROUP BY bucket ORDER BY bucket;",
+            ),
+            (
+                "having",
+                "SELECT name, COUNT(*) FROM users GROUP BY name HAVING COUNT(*) > 1 ORDER BY name;",
+            ),
+            (
+                "scalar",
+                "SELECT COUNT(*), SUM(id), AVG(id), MIN(name), MAX(name) FROM users;",
+            ),
+            (
+                "join-all",
+                "SELECT * FROM users JOIN labels ON users.bucket = labels.bucket ORDER BY users.id;",
+            ),
+        ]
+    }
+
+    fn milestone65_profile(rows: i64, samples: usize) {
+        let (_dir, base) = seed_delete_db("m65-base", rows, 0x3100);
+        let mut setup = Database::open(&base).unwrap();
+        setup.execute("CREATE TABLE labels (bucket INT, tag TEXT); INSERT INTO labels VALUES (0, 'a'),(1, 'b'),(2, 'c'),(3, 'd'); CREATE INDEX idx_labels_bucket ON labels(bucket);").unwrap();
+        drop(setup);
+        let bytes = db_file(&base);
+        let _phases = crate::storage::enable_phases();
+        let recording = std::env::var("RUSTDB_PROFILE_ENABLED").as_deref() == Ok("1");
+        let reference = milestone54_model("count", rows).0;
+        let expected_groups = milestone60_read_model("text-group", &reference).1;
+        for (kind, sql) in milestone65_queries() {
+            for sample in 0..samples {
+                let run = |copy: bool| {
+                    let _guard = copy.then(VecStaging::new);
+                    crate::storage::set_phases_enabled(false);
+                    let (_dir, path, mut db) =
+                        open_copy(&base, &format!("m65-{kind}-{sample}-{copy}"));
+                    db.execute(sql).unwrap();
+                    crate::storage::reset_phases();
+                    crate::storage::set_phases_enabled(recording);
+                    let started = std::time::Instant::now();
+                    let result = db.execute(sql).unwrap();
+                    let wall = started.elapsed().as_nanos();
+                    let p = crate::storage::take_phases();
+                    if kind == "text-group" {
+                        let StatementResult::Query(query) = &result[0] else {
+                            panic!("expected query");
+                        };
+                        assert_eq!(query.rows, expected_groups);
+                    }
+                    crate::storage::set_phases_enabled(false);
+                    println!(
+                        "milestone65 kind={kind} rows={rows} sample={sample} copy={copy} recording={recording} wall_ns={wall} collect_ns={} materialize_ns={} sort_ns={} project_ns={} hash_ns={} lookup_ns={} prepare_ns={} update_ns={} publish_ns={}",
+                        p.group_collect.as_nanos(),
+                        p.group_materialize.as_nanos(),
+                        p.result_sort.as_nanos(),
+                        p.result_project.as_nanos(),
+                        p.group_hash.as_nanos(),
+                        p.group_lookup.as_nanos(),
+                        p.group_prepare.as_nanos(),
+                        p.group_update.as_nanos(),
+                        p.group_publish.as_nanos()
+                    );
+                    assert_eq!(db_file(&path), bytes);
+                    assert_eq!(wal_len(&path), 0);
+                    assert_checksums(&path);
+                    if !recording {
+                        assert_eq!(p, crate::storage::Profile::default());
+                    }
+                    assert_eq!(p.wal_bytes, 0);
+                    result
+                };
+                let (fast, old) = if sample % 2 == 0 {
+                    (run(false), run(true))
+                } else {
+                    let old = run(true);
+                    (run(false), old)
+                };
+                assert_eq!(fast, old, "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn milestone65_queries_match_vec_staging() {
+        milestone65_profile(24, 1);
+        let _collision = ForceHashCollision::new();
+        milestone65_profile(24, 1);
+    }
+
+    #[test]
+    #[ignore = "release single aggregate staging comparison"]
+    fn profile_milestone65() {
+        println!("milestone65 samples=5 warmup=1");
+        for rows in [1_000, 10_000, 100_000] {
+            milestone65_profile(rows, 5);
         }
     }
 
