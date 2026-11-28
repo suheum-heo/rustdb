@@ -3798,3 +3798,103 @@ RUSTDB_PROFILE_ENABLED=1 cargo test --release --locked --lib executor::tests::pr
 Next: attribute remaining collection cost between key construction, map lookup
 and staged accumulator updates. Preserve row-update atomicity and DISTINCT
 failure guarantees in any subsequent experiment.
+
+## Milestone 65 — local staging for one ordinary aggregate
+
+Decision: merge. M64 was verified merged as PR #60 at
+`67732e622547ecf44a284d674e37e158613a7e9b`; local main was clean and matched
+origin/main before creating this branch.
+
+### Measurement and choice
+
+Test-only timers split collection into hashing, candidate lookup/full-key
+comparison, new-key/accumulator preparation, accumulator update, and publication
+of new groups into the vector/map. The unchanged baseline was measured first;
+both labels ran the same M64 implementation. At 100k text-group rows, pooled
+medians were 2.731 ms hashing, 3.534 lookup, 4.060 preparation, 3.873 update and
+5.286 publication. Collection was 30.441 ms and wall 37.124 ms.
+
+Per-row clocks materially perturb this workload: these are instrumented
+attribution measurements, not estimates of production time or additive phase
+accounting. This profile and inspection identified per-row staging allocation
+as a narrow opportunity: even one COUNT allocates a temporary Vec. Publication
+is another sizable phase, but changing it would require a separate experiment.
+
+### Change and correctness
+
+For exactly one non-DISTINCT aggregate, compute the replacement locally through
+the existing next_acc validation and publish it only after success. No later
+aggregate or DISTINCT reservation can fail in this case. Keep the existing
+vector staging for multiple aggregates and all DISTINCT aggregates. Width
+validation still occurs first. COUNT, SUM, AVG, MIN/MAX, NULL handling, overflow
+checks and text ownership are unchanged. No page/WAL format, recovery, grouping
+hash/equality or synchronization changes; no rejected experiment is restored.
+
+A scoped test guard forces the original vector staging. New tests make 960
+comparisons across six aggregate forms, ten valid/invalid accumulator states,
+eight input shapes and both single/joined row views. They compare exact error
+messages, final state and unchanged state on failure. Twelve SQL shapes compare
+complete results with normal and forced-collision hashing, with an independent
+model for the primary text-group query. Existing multi-aggregate atomicity,
+DISTINCT allocation failures, overflow and recovery tests remain in the suite.
+
+Formatting, strict all-target Clippy, locked all-target build and the full locked
+test suite passed: **651 passed, 0 failed, 62 ignored**, including the doctest.
+The baseline and three candidate release benchmark runs passed.
+
+### Paired results
+
+Apple M5, rustc 1.100.0, release-test build. Each run covers twelve workloads at
+1k/10k/100k inputs, five alternating pairs of fresh database copies and one
+warmup per copy. Two candidate runs disable recording; a third records phases.
+The separate instrumented baseline adds another run: 1,440 timed queries total.
+No builds or other tests overlap timing. Every copy verifies database bytes,
+page checksums and an empty WAL outside timing. `copy=true` selects original
+vector staging only in candidate runs; baseline labels both used original code.
+
+100k-row wall medians in milliseconds, local / vector staging:
+
+| Workload | Pass 1 | Pass 2 |
+| --- | ---: | ---: |
+| text-extrema-distinct | 53.721 / 53.623 | 53.239 / 52.917 |
+| empty-scalar | 0.018 / 0.018 | 0.017 / 0.017 |
+| hidden-having | 15.297 / 17.573 | 15.537 / 17.585 |
+| left-join-all | 6.815 / 6.835 | 6.821 / 6.817 |
+| text-group | 15.510 / 17.839 | 15.615 / 18.208 |
+| text-group-limit | 17.003 / 19.259 | 16.977 / 19.103 |
+| text-group-reordered | 18.882 / 20.931 | 19.048 / 21.354 |
+| text-group-duplicate | 19.849 / 22.095 | 19.860 / 21.603 |
+| bucket-group | 3.014 / 5.049 | 3.016 / 4.854 |
+| having | 15.942 / 18.227 | 15.563 / 17.669 |
+| scalar | 4.253 / 4.266 | 4.238 / 4.214 |
+| join-all | 5.980 / 6.058 | 6.068 / 5.960 |
+
+Text grouping improves 13.1–14.2%, LIMIT grouping 11.1–11.7%, reordered output
+9.8–10.8%, duplicate output 8.1–10.2%, and bucket grouping 37.9–40.3%. The latter
+still updates one aggregate per input even though few groups are returned.
+Multi-aggregate and join controls show mixed differences, including small slower
+candidate medians; there is no universal speedup claim. Five warm samples do not
+establish cold-cache performance or tail latency. All samples and ranges are
+retained in the evidence archive.
+
+Recorded text-group update falls from 4.073 to 2.611 ms; collection is 31.006 /
+29.501 ms (vector / local). Hashing, lookup, preparation and publication remain
+similar (local: 2.771, 3.590, 4.132, 5.300 ms; vector: 2.793, 3.583, 4.116,
+5.371 ms). Recorded wall is 35.886 / 37.575 ms (local / vector). These clocks
+inflate total runtime substantially; the main speed claims use only recording-off
+pairs. Production contains neither these timers nor the comparison guard.
+
+The repeatable unrecorded gains, update-phase reduction and narrow atomicity
+proof justify merging. This does not remove staging allocations from multiple
+aggregates or DISTINCT and does not change how extrema themselves own text.
+
+```sh
+cargo test --locked --lib single_aggregate_staging_matches_errors_and_preserves_state
+cargo test --locked --lib milestone65_queries_match_vec_staging
+cargo test --release --locked --lib executor::tests::profile_milestone65 -- --ignored --nocapture --exact
+RUSTDB_PROFILE_ENABLED=1 cargo test --release --locked --lib executor::tests::profile_milestone65 -- --ignored --nocapture --exact
+```
+
+Next: investigate new-group publication/map growth with recording-off paired
+measurements. Avoid extrapolating instrumented per-row timer percentages into
+production speedups or weakening multi-aggregate/DISTINCT failure guarantees.
